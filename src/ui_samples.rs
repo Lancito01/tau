@@ -52,6 +52,19 @@ pub fn render(name: &str, out: &Path) -> Result<(), String> {
             Field::Slider("Gap (pixels)", 0, 80, 12),
             Field::Color("Background", "#FFFFFF".into()),
         ], "Create", out),
+        "background" => {
+            let names: Vec<String> = crate::fade::DIRECTIONS.iter().map(|(n, _)| n.to_string()).collect();
+            let fields = [
+                Field::Colors("Colours. Two or more fade in this order", vec!["#2563EB".to_string(), "#E11D48".to_string(), "#F2EFE8".to_string()]),
+                Field::Choice("Fade direction", names, 0),
+                Field::Slider("Margin (% of the longest side)", 0, 50, 8),
+            ];
+            let base = sample_photo(800, 500);
+            form::render_with_preview("Add background", "holiday.jpg", &fields, "Apply", Box::new(move |v| {
+                let stops: Vec<[u8; 4]> = v[0].split(',').map(crate::image::parse_color).collect();
+                Some(crate::tools::with_background(&base, &stops, crate::fade::direction_named(&v[1]), v[2].parse().unwrap_or(0)))
+            }), out)
+        }
         "settings" => crate::settings::render(out),
         "menu" => {
             let items = vec![MenuItem::new("Settings", glyph::SETTINGS), MenuItem::new("Check for updates", glyph::SYNC), MenuItem::separator(), MenuItem::new("Quit Tau", glyph::POWER)];

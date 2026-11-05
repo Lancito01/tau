@@ -14,6 +14,8 @@ pub enum Field {
     Check(&'static str, bool),
     Slider(&'static str, i32, i32, i32),
     Color(&'static str, String),
+    /// An ordered list of colours that can grow, shrink and be rearranged. Comes back joined by commas.
+    Colors(&'static str, Vec<String>),
     Note(String),
     Heading(&'static str),
     /// A row of found / not found chips.
@@ -38,7 +40,9 @@ const MIN_WITH_STAGE: f32 = 520.0;
 /// Draws the result for a form's current values, cheaply enough to run as they change.
 pub type Render = Box<dyn FnMut(&[String]) -> Option<Bmp>>;
 
-struct Value { text: String, sel: usize, on: bool, num: f32 }
+struct Value { text: String, sel: usize, on: bool, num: f32, list: Vec<String> }
+
+enum ListEdit { Remove(usize), Swap(usize, usize), Add }
 
 pub struct Form {
     title: String,
@@ -69,12 +73,13 @@ fn color_of(s: &str) -> u32 {
 impl Form {
     pub fn new(title: &str, sub: &str, fields: &[Field], ok: &str) -> Form {
         let values = fields.iter().map(|f| {
-            let mut v = Value { text: String::new(), sel: 0, on: false, num: 0.0 };
+            let mut v = Value { text: String::new(), sel: 0, on: false, num: 0.0, list: vec![] };
             match f {
                 Field::Text(_, s) | Field::Color(_, s) => v.text = s.clone(),
                 Field::Choice(_, _, d) | Field::ChoiceIf(_, _, _, d) => v.sel = *d,
                 Field::Check(_, b) => v.on = *b,
                 Field::Slider(_, _, _, d) => v.num = *d as f32,
+                Field::Colors(_, l) => v.list = l.clone(),
                 _ => {}
             }
             v
@@ -90,6 +95,7 @@ impl Form {
             Field::Choice(_, o, _) | Field::ChoiceIf(_, _, o, _) => o.get(v.sel).cloned().unwrap_or_default(),
             Field::Check(..) => if v.on { "1".into() } else { "0".into() },
             Field::Slider(..) => format!("{}", v.num as i32),
+            Field::Colors(..) => v.list.join(","),
             _ => String::new(),
         }).collect()
     }
@@ -210,6 +216,43 @@ impl Form {
                     ui.text_input(&key, r(sx + 8.0, y + 22.0, x + w - sx - 8.0, 38.0), &mut self.values[i].text, "#RRGGBB");
                     y += 72.0;
                 }
+                Field::Colors(l, _) => {
+                    ui.text(l, r(x, y, w, 18.0), 12.5, 500, MUTED, Align::Left);
+                    y += 24.0;
+                    let mut edit = None;
+                    let count = self.values[i].list.len();
+                    for row in 0..count {
+                        let rk = format!("{key}/{row}");
+                        let col = color_of(&self.values[i].list[row]);
+                        let mut sx = x;
+                        for (si, c) in SWATCHES.iter().enumerate() {
+                            let q = r(sx, y, 28.0, 34.0);
+                            let (hover, _, clicked) = ui.hit(ui::id(&format!("{rk}/s{si}")), q);
+                            if clicked { self.values[i].list[row] = c.to_string(); }
+                            let chip = r(sx + 3.0, y + 6.0, 22.0, 22.0);
+                            ui.fill(chip, 5.0, color_of(c), 1.0);
+                            ui.stroke(chip, 5.0, 0xFFFFFF, 0.14, 1.0);
+                            if col == color_of(c) { ui.stroke(chip.inset(-2.0), 7.0, ACCENT, 1.0, 1.5); } else if hover { ui.stroke(chip.inset(-2.0), 7.0, TEXT, 0.3, 1.0); }
+                            sx += 28.0;
+                        }
+                        ui.text_input(&rk, r(sx + 6.0, y, x + w - sx - 6.0 - 90.0, 34.0), &mut self.values[i].list[row], "#RRGGBB");
+                        let bx = x + w - 84.0;
+                        if ui.icon_button_if(&format!("{rk}/up"), 0xE70E, r(bx, y + 3.0, 28.0, 28.0), 10.0, row > 0) { edit = Some(ListEdit::Swap(row, row - 1)); }
+                        if ui.icon_button_if(&format!("{rk}/dn"), ui::glyph::CHEVRON, r(bx + 28.0, y + 3.0, 28.0, 28.0), 10.0, row + 1 < count) { edit = Some(ListEdit::Swap(row, row + 1)); }
+                        if ui.icon_button_if(&format!("{rk}/x"), ui::glyph::CLOSE, r(bx + 56.0, y + 3.0, 28.0, 28.0), 9.0, count > 1) { edit = Some(ListEdit::Remove(row)); }
+                        y += 40.0;
+                    }
+                    if ui.icon_label_button(&format!("{key}/add"), ui::glyph::ADD, "Add colour", r(x, y, 130.0, 32.0), Style::Secondary, true) { edit = Some(ListEdit::Add); }
+                    y += 44.0;
+                    let list = &mut self.values[i].list;
+                    match edit {
+                        Some(ListEdit::Remove(n)) => { list.remove(n); }
+                        Some(ListEdit::Swap(a, b)) => list.swap(a, b),
+                        // Starts from the last colour, since a fade usually moves on from there.
+                        Some(ListEdit::Add) => { let last = list.last().cloned().unwrap_or_else(|| "#000000".to_string()); list.push(last); }
+                        None => {}
+                    }
+                }
             }
         }
         y
@@ -262,6 +305,13 @@ pub fn show_with_preview(title: &str, fields: &[Field], ok_label: &str, render: 
     page.render = Some(render);
     let f = ui::run_modal(page, title, None)?;
     (f.result == Some(true)).then(|| f.output())
+}
+
+/// A form with its live result as a PNG, for design review.
+pub fn render_with_preview(title: &str, sub: &str, fields: &[Field], ok: &str, render: Render, out: &std::path::Path) -> Result<(), String> {
+    let mut page = Form::new(title, sub, fields, ok);
+    page.render = Some(render);
+    ui::render_png(&mut page, 1.0, None, out)
 }
 
 /// The form as a PNG, for design review.

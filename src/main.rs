@@ -8,6 +8,7 @@ mod convert;
 mod detect;
 mod docs;
 mod explorer;
+mod fade;
 mod form;
 mod gfx;
 mod gif;

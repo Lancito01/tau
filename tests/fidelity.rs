@@ -6,6 +6,9 @@
 //! Exactness is checked against crops of the untouched source in its native pixel format, never against the
 //! source run through the same filter. A filter that silently converts formats would fool that comparison.
 //! Encoders missing from the local ffmpeg build are reported and skipped.
+#[path = "../src/fade.rs"]
+#[allow(dead_code)]
+mod fade;
 #[path = "../src/gif.rs"]
 #[allow(dead_code)]
 mod gif;
