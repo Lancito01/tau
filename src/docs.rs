@@ -27,7 +27,10 @@ try {
   for ($i = 1; ; $i++) {
     try {
       $d = $w.Documents.Open($env:OR_IN, $false, $true, $false)
-      $d.SaveAs2($env:OR_OUT, [int]$env:OR_FMT)
+      # Asks for print quality outright. A plain save to PDF uses whichever option was last chosen in Word.
+      if ($env:OR_FMT -eq '17') {
+        try { $d.ExportAsFixedFormat($env:OR_OUT, 17, $false, 0) } catch { $d.SaveAs2($env:OR_OUT, 17) }
+      } else { $d.SaveAs2($env:OR_OUT, [int]$env:OR_FMT) }
       $d.Close(0)
       break
     } catch {
@@ -58,6 +61,18 @@ $p = New-Object -ComObject PowerPoint.Application
 try {
   $d = $p.Presentations.Open($env:OR_IN, -1, 0, 0)
   $d.SaveAs($env:OR_OUT, [int]$env:OR_FMT)
+  $d.Close()
+} finally { $p.Quit() }
+"#;
+
+/// Writes a folder of slides at 4K width. A plain save as images gives only about 1280 pixels.
+const SLIDES_EXPORT: &str = r#"
+$p = New-Object -ComObject PowerPoint.Application
+try {
+  $d = $p.Presentations.Open($env:OR_IN, -1, 0, 0)
+  $w = 3840
+  $h = [int]($w * $d.PageSetup.SlideHeight / $d.PageSetup.SlideWidth)
+  $d.Export($env:OR_OUT, 'PNG', $w, $h)
   $d.Close()
 } finally { $p.Quit() }
 "#;
@@ -530,8 +545,27 @@ pub fn convert_slides(job: &Job, input: &Path, target: &str) -> Result<PathBuf, 
     match target {
         "pdf" => { let o = sibling(input, "", "pdf"); run(&o, 32)?; Ok(o) }
         "pptx" => { let o = sibling(input, "", "pptx"); run(&o, 24)?; Ok(o) }
-        // PowerPoint writes a folder of slides when saving as an image type.
-        "jpg" | "png" => { let o = sibling(input, " slides", ""); run(&o, if target == "jpg" { 17 } else { 18 })?; Ok(o) }
+        "jpg" | "png" => {
+            let o = sibling(input, " slides", "");
+            let export = powershell(job, SLIDES_EXPORT, &[("OR_IN", input.display().to_string()), ("OR_OUT", o.display().to_string())]);
+            if export.is_err() {
+                if job.cancelled() { return Err("Cancelled".into()); }
+                // An older PowerPoint may refuse those sizes. Saving as an image type still writes a folder of slides.
+                let _ = std::fs::remove_dir_all(&o);
+                run(&o, if target == "jpg" { 17 } else { 18 })?;
+                return Ok(o);
+            }
+            if target == "jpg" {
+                // PowerPoint's own JPEG quality is fixed, so PNGs go through our top-quality encoder.
+                for f in std::fs::read_dir(&o).map_err(rerr)?.flatten() {
+                    let png = f.path();
+                    if ext_of(&png) != "png" { continue; }
+                    crate::image::save(&crate::image::load(&png)?, &png.with_extension("jpg"), &crate::image::SaveOpts::default())?;
+                    std::fs::remove_file(&png).map_err(rerr)?;
+                }
+            }
+            Ok(o)
+        }
         _ => Err(format!("Cannot make {target} from slides")),
     }
 }
@@ -599,7 +633,7 @@ pub fn convert_pdf(job: &Job, input: &Path, target: &str) -> Result<PathBuf, Str
             Ok(out)
         }
         "pptx" => {
-            let imgs = crate::pdf::to_images(job, input, "png")?;
+            let imgs = crate::pdf::to_slide_images(job, input)?;
             // The script reads a folder of pages, so a lone page moves into a scratch folder first.
             let scratch = TempDir::new()?;
             let dir = if imgs.is_dir() { imgs.clone() } else {

@@ -38,6 +38,18 @@ Tau includes support for common image formats (JPG, PNG, TIFF, BMP, HEIC), PDF, 
 
 Some document conversions use Microsoft Word, Excel, or PowerPoint, and HTML-to-PDF uses Microsoft Edge. HEIC output depends on the Windows HEIF/HEVC codecs. Options that need unavailable software remain visible but disabled.
 
+## Quality
+
+Tau keeps as much of the original as the target format allows, in this order:
+
+1. **Copy the original data.** When the codecs already fit the target, video and audio move across bit for bit (MKV to MP4, AAC from a video to M4A, a JPEG into a PDF).
+2. **Lossless encode, for edits that keep the format.** Redact, crop, trim, split, speed and join keep every other pixel exactly as decoded from the source, along with its bit depth, HDR tags, and all audio and subtitle tracks. An image redaction saves as PNG when the source format is lossy.
+3. **The top setting of the target format, when converting to something lossy by nature.** Resolution, frame rate and bit depth are kept (GIF stops at the 50 fps the format can show). Lossless audio stays lossless wherever the target can hold it.
+
+Only **Compress** gives quality away, by the amount you choose.
+
+Lossless H.264 uses a profile that the default Windows player and many editors and phones cannot decode, so redacted, cropped and trimmed videos may need VLC or mpv, and they are much larger than the original. AVI, WMV and sources H.264 cannot store exactly are saved as MKV with FFV1 instead. Lossless editing also needs `ffprobe.exe`, which comes with ffmpeg, next to `ffmpeg.exe`, and ffmpeg 5.1 or newer.
+
 ## Install
 
 Download the latest `Tau-*.msi` from the project’s **Releases** page and run it. The installer is per-user and does not require administrator access.
@@ -51,6 +63,14 @@ cargo build --release --locked
 ```
 
 The executable is written to `target/release/tau.exe`. A local build does not include the GitHub release settings used by the automatic updater.
+
+## Fidelity tests
+
+`tests/fidelity.rs` puts the arguments Tau builds through a real ffmpeg and measures the output frame by frame. It covers only platform-independent code, so it also runs on macOS and Linux without building the app:
+
+```sh
+rustc --edition 2021 --test tests/fidelity.rs -o target/fidelity && target/fidelity --test-threads=4
+```
 
 ## Command line
 

@@ -1,0 +1,611 @@
+//! Puts the arguments the app builds through a real ffmpeg and measures what comes out. The two modules it
+//! covers have no Win32 in them, so this runs on any OS, without building the app:
+//!
+//!     rustc --edition 2021 --test tests/fidelity.rs -o target/fidelity && target/fidelity --test-threads=4
+//!
+//! Exactness is checked against crops of the untouched source in its native pixel format, never against the
+//! source run through the same filter. A filter that silently converts formats would fool that comparison.
+//! Encoders missing from the local ffmpeg build are reported and skipped.
+#[path = "../src/gif.rs"]
+#[allow(dead_code)]
+mod gif;
+#[path = "../src/quality.rs"]
+#[allow(dead_code)]
+mod quality;
+
+use quality::*;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const BOX: (u32, u32, u32, u32) = (100, 60, 120, 80);
+
+struct Dir(PathBuf);
+impl Dir {
+    fn new() -> Dir {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!("tau-fidelity-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&d).unwrap();
+        Dir(d)
+    }
+    fn p(&self, n: &str) -> PathBuf { self.0.join(n) }
+}
+impl Drop for Dir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+fn ff(args: &[String]) -> Result<Vec<u8>, String> {
+    let o = Command::new("ffmpeg").args(["-y", "-hide_banner", "-nostdin", "-loglevel", "error"]).args(args).output().map_err(|e| e.to_string())?;
+    if o.status.success() { Ok(o.stdout) } else { Err(String::from_utf8_lossy(&o.stderr).to_string()) }
+}
+fn ffs(args: &[&str]) -> Vec<u8> {
+    let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    ff(&a).unwrap_or_else(|e| panic!("ffmpeg {args:?}: {e}"))
+}
+fn have_ffmpeg() -> bool { Command::new("ffmpeg").arg("-version").output().is_ok() }
+fn has_encoder(name: &str) -> bool {
+    let o = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().unwrap();
+    String::from_utf8_lossy(&o.stdout).lines().any(|l| l.split_whitespace().nth(1) == Some(name))
+}
+fn probe(p: &Path) -> Probe {
+    let o = Command::new("ffprobe").args(probe_args(&p.display().to_string())).output().unwrap();
+    parse_probe(&String::from_utf8_lossy(&o.stdout))
+}
+fn field(p: &Path, stream: &str, entry: &str) -> String {
+    let o = Command::new("ffprobe").args(["-v", "error", "-select_streams", stream, "-show_entries", entry, "-of", "default=nw=1:nk=1", &p.display().to_string()]).output().unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+/// What media.rs does: inputs, the app's arguments, then the output.
+fn run_app_args(input: &Path, args: &[String], out: &Path) -> Result<(), String> {
+    let mut a = vec!["-i".to_string(), input.display().to_string()];
+    a.extend_from_slice(args);
+    a.push(out.display().to_string());
+    ff(&a).map(|_| ())
+}
+/// Same, with options before the input.
+fn run_seek(seek: &[String], input: &Path, args: &[String], out: &Path) -> Result<(), String> {
+    let mut a = seek.to_vec();
+    a.extend(["-i".to_string(), input.display().to_string()]);
+    a.extend_from_slice(args);
+    a.push(out.display().to_string());
+    ff(&a).map(|_| ())
+}
+/// One decoded frame's luma range per frame of a region.
+fn luma_ranges(p: &Path, c: (u32, u32, u32, u32)) -> Vec<(u32, u32)> {
+    let o = ff(&["-i".to_string(), p.display().to_string(), "-vf".to_string(), format!("crop={}:{}:{}:{},format=gray,signalstats,metadata=print:file=-", c.2, c.3, c.0, c.1), "-f".to_string(), "null".to_string(), "-".to_string()]).unwrap();
+    let t = String::from_utf8_lossy(&o).to_string();
+    let vals = |k: &str| -> Vec<u32> { t.lines().filter_map(|l| l.split_once(k).map(|(_, v)| v.trim().parse().unwrap())).collect() };
+    vals("signalstats.YMIN=").into_iter().zip(vals("signalstats.YMAX=")).collect()
+}
+/// First attempt that succeeds, like media::attempts.
+fn run_attempts(input: &Path, attempts: &[Vec<String>], out: &Path) -> usize {
+    let mut last = String::new();
+    for (i, a) in attempts.iter().enumerate() {
+        match run_app_args(input, a, out) { Ok(()) => return i, Err(e) => last = e }
+    }
+    panic!("every attempt failed for {}: {last}", out.display());
+}
+/// One hash per frame of a region, decoded in the file's own pixel format with no frames dropped or repeated.
+fn region(p: &Path, crop: Option<(u32, u32, u32, u32)>, pix: Option<&str>) -> Vec<String> {
+    let mut a = vec!["-i".to_string(), p.display().to_string(), "-map".into(), "0:V:0".into(), "-fps_mode".into(), "passthrough".into()];
+    let mut chain = vec![];
+    if let Some(f) = pix { chain.push(format!("format={f}")); }
+    if let Some((x, y, w, h)) = crop { chain.push(format!("crop={w}:{h}:{x}:{y}")); }
+    if !chain.is_empty() { a.extend(["-vf".to_string(), chain.join(",")]); }
+    a.extend(["-f".to_string(), "framemd5".to_string(), "-".to_string()]);
+    let o = ff(&a).unwrap_or_else(|e| panic!("hash {}: {e}", p.display()));
+    String::from_utf8_lossy(&o).lines().filter(|l| !l.starts_with('#')).map(|l| l.rsplit(',').next().unwrap().trim().to_string()).collect()
+}
+/// The four strips around BOX, each a hash per frame.
+fn outside_box(p: &Path, w: u32, h: u32, pix: Option<&str>) -> Vec<Vec<String>> {
+    let (bx, by, bw, bh) = BOX;
+    vec![
+        region(p, Some((0, 0, w, by)), pix),
+        region(p, Some((0, by, bx, bh)), pix),
+        region(p, Some((bx + bw, by, w - bx - bw, bh)), pix),
+        region(p, Some((0, by + bh, w, h - by - bh)), pix),
+    ]
+}
+fn psnr(a: &Path, b: &Path) -> f64 {
+    let o = Command::new("ffmpeg").args(["-hide_banner", "-nostdin", "-i"]).arg(a).arg("-i").arg(b)
+        .args(["-lavfi", "[0:v]settb=1/1000,setpts=N[a];[1:v]settb=1/1000,setpts=N[b];[a][b]psnr", "-f", "null", "-"]).output().unwrap();
+    let s = String::from_utf8_lossy(&o.stderr);
+    let v = s.rsplit("average:").next().unwrap().split_whitespace().next().unwrap();
+    if v == "inf" { f64::INFINITY } else { v.parse().unwrap_or_else(|_| panic!("psnr: {s}")) }
+}
+
+/// Encodes a test clip: moving colour detail, in the given format.
+fn clip(d: &Dir, name: &str, pix: &str, codec: &[&str], extra: &str) -> PathBuf {
+    let out = d.p(name);
+    let vf = format!("format={pix}{extra}");
+    let mut a = vec!["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-vf", &vf];
+    a.extend_from_slice(codec);
+    let s = out.display().to_string();
+    a.push(&s);
+    ffs(&a);
+    out
+}
+
+fn assert_redacted_exactly(src: &Path, ext: &str, label: &str) {
+    let d = Dir::new();
+    let p = probe(src);
+    let v = p.video.clone().unwrap();
+    let (w, h) = v.display_size();
+    let (x, y, bw, bh) = redact_box(BOX.0, BOX.1, BOX.2, BOX.3, w, h);
+    let f = redact_filter(&v.pix_fmt, v.full_range, &[(x, y, bw, bh)]).unwrap();
+    let l = lossless_args(&p, ext, Some(&f), None, false).unwrap();
+    let out = d.p(&format!("out.{}", l.ext));
+    run_app_args(src, &l.args, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+    // Compare in the source's planar form, which only rearranges samples.
+    let planar = planar_of(&v.pix_fmt).unwrap();
+    let want = outside_box(src, w, h, Some(&planar));
+    let got = outside_box(&out, w, h, Some(&planar));
+    assert_eq!(want[0].len(), got[0].len(), "{label}: frame count");
+    assert!(!want[0].is_empty(), "{label}: no frames");
+    assert_eq!(want, got, "{label}: pixels outside the box changed");
+    // Format is kept unless the encoder stores the same samples another way.
+    let out_fmt = field(&out, "v:0", "stream=pix_fmt");
+    assert_eq!(planar_of(&out_fmt).unwrap(), planar, "{label}: pixel format");
+    // And the box really is solid: one value per frame across the region.
+    let boxed = region(&out, Some((x, y, bw, bh)), None);
+    assert_eq!(boxed.iter().collect::<std::collections::HashSet<_>>().len(), 1, "{label}: box is not solid");
+    let sb = region(src, Some((x, y, bw, bh)), None);
+    assert_ne!(boxed[0], sb[0], "{label}: box region was not painted");
+    println!("{label}: {} frames exact outside the box, format {out_fmt}, container {}", want[0].len(), l.ext);
+}
+
+#[test]
+fn redact_is_exact_in_every_pixel_format() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let x264 = ["-c:v", "libx264", "-crf", "23"];
+    let ffv1 = ["-c:v", "ffv1"];
+    let cases: Vec<(&str, &str, &[&str], &str)> = vec![
+        ("yuv420p.mp4", "yuv420p", &x264, "mp4"),
+        ("yuv422p.mov", "yuv422p", &x264, "mov"),
+        ("yuv444p.mkv", "yuv444p", &x264, "mkv"),
+        ("yuv420p10.mp4", "yuv420p10le", &x264, "mp4"),
+        ("yuv422p10.mov", "yuv422p10le", &x264, "mov"),
+        ("yuv444p10.mkv", "yuv444p10le", &x264, "mkv"),
+        ("yuv420p12.mkv", "yuv420p12le", &ffv1, "mkv"),
+        ("yuva444p10.mkv", "yuva444p10le", &ffv1, "mkv"),
+        ("rgb.mkv", "bgr0", &ffv1, "mkv"),
+        ("gray.mkv", "gray", &ffv1, "mkv"),
+    ];
+    for (name, pix, codec, ext) in cases {
+        let s = clip(&d, name, pix, codec, "");
+        assert_redacted_exactly(&s, ext, &format!("{pix} in {ext}"));
+    }
+}
+
+#[test]
+fn redact_webm_is_exact_and_stays_webm() {
+    if !have_ffmpeg() || !has_encoder("libvpx-vp9") { println!("skipped: no libvpx-vp9"); return; }
+    let d = Dir::new();
+    let s = clip(&d, "a.webm", "yuv420p", &["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-cpu-used", "8"], "");
+    assert_redacted_exactly(&s, "webm", "vp9 webm");
+    let t = clip(&d, "b.webm", "yuv420p10le", &["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-cpu-used", "8"], "");
+    assert_redacted_exactly(&t, "webm", "10-bit vp9 webm");
+}
+
+#[test]
+fn redact_keeps_hdr_tags_full_range_and_every_track() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let tags = ",setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=tv";
+    let v = clip(&d, "hdr.mp4", "yuv420p10le", &["-c:v", "libx264", "-crf", "23"], tags);
+    let s = d.p("full.mkv");
+    let meta = d.p("ch.txt");
+    std::fs::write(&meta, ";FFMETADATA1\ntitle=Holiday\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Start\n").unwrap();
+    let srt = d.p("s.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:00,500\nHello\n").unwrap();
+    ffs(&["-i", &v.display().to_string(), "-f", "lavfi", "-i", "sine=f=440:r=48000:d=1", "-f", "lavfi", "-i", "sine=f=880:r=44100:d=1", "-i", &srt.display().to_string(), "-i", &meta.display().to_string(),
+        "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s", "-map_metadata", "4", "-map_chapters", "4", "-c:v", "copy", "-c:a", "flac", "-c:s", "srt", &s.display().to_string()]);
+    let p = probe(&s);
+    let info = p.video.clone().unwrap();
+    let f = redact_filter(&info.pix_fmt, info.full_range, &[BOX]).unwrap();
+    let l = lossless_args(&p, "mkv", Some(&f), None, false).unwrap();
+    let out = d.p("out.mkv");
+    run_app_args(&s, &l.args, &out).unwrap();
+    assert_eq!(field(&out, "v:0", "stream=color_transfer"), "smpte2084");
+    assert_eq!(field(&out, "v:0", "stream=color_primaries"), "bt2020");
+    assert_eq!(field(&out, "v:0", "stream=pix_fmt"), "yuv420p10le");
+    assert_eq!(field(&out, "a", "stream=codec_name").lines().count(), 2, "both audio tracks");
+    assert_eq!(field(&out, "a", "stream=codec_name").lines().next(), Some("flac"), "audio copied, not re-encoded");
+    assert_eq!(field(&out, "s", "stream=codec_name"), "subrip");
+    let chapters = Command::new("ffprobe").args(["-v", "error", "-show_chapters", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+    assert!(String::from_utf8_lossy(&chapters.stdout).contains("Start"), "chapters kept");
+    assert!(field(&out, "", "format_tags=title").contains("Holiday"), "tags kept");
+
+    // A full-range source blacks out at 0, not 16, and stays tagged full range.
+    let fr = clip(&d, "pc.mp4", "yuv420p", &["-c:v", "libx264", "-crf", "23"], ",setparams=range=pc");
+    let p = probe(&fr);
+    assert!(p.video.as_ref().unwrap().full_range);
+    assert_redacted_exactly(&fr, "mp4", "full range");
+    let i = p.video.unwrap();
+    let f = redact_filter(&i.pix_fmt, i.full_range, &[BOX]).unwrap();
+    let l = lossless_args(&probe(&fr), "mp4", Some(&f), None, false).unwrap();
+    let o2 = d.p("pc-out.mp4");
+    run_app_args(&fr, &l.args, &o2).unwrap();
+    assert_eq!(field(&o2, "v:0", "stream=color_range"), "pc");
+}
+
+#[test]
+fn redact_lands_where_the_user_marked_it_on_rotated_video() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = clip(&d, "a.mp4", "yuv420p", &["-c:v", "libx264", "-crf", "23"], "");
+    let rot = d.p("rot.mp4");
+    ffs(&["-display_rotation", "90", "-i", &s.display().to_string(), "-c", "copy", &rot.display().to_string()]);
+    let p = probe(&rot);
+    let v = p.video.clone().unwrap();
+    // A box near the bottom edge of the upright picture, which is outside the frame if stored size is used.
+    assert_eq!(v.display_size(), (360, 640));
+    let target = (40, 500, 120, 80);
+    let f = redact_filter(&v.pix_fmt, v.full_range, &[target]).unwrap();
+    let l = lossless_args(&p, "mp4", Some(&f), None, false).unwrap();
+    let out = d.p("out.mp4");
+    run_app_args(&rot, &l.args, &out).unwrap();
+    let boxed = region(&out, Some(target), None);
+    assert_eq!(boxed.iter().collect::<std::collections::HashSet<_>>().len(), 1, "box is on the marked spot");
+    // Elsewhere the upright output matches the upright source exactly.
+    assert_eq!(region(&rot, Some((0, 0, 360, 400)), None), region(&out, Some((0, 0, 360, 400)), None));
+}
+
+#[test]
+fn redact_gif_changes_only_the_box() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let rgba = "bgra";
+    for (name, filter, frames) in [
+        ("global.gif", "split[a][b];[a]palettegen=stats_mode=full[p];[b][p]paletteuse=dither=none", "global palette"),
+        ("local.gif", "split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=none", "local palettes"),
+        ("delta.gif", "split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=diff_mode=rectangle:dither=bayer", "partial frames"),
+    ] {
+        let s = d.p(name);
+        ffs(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=20:d=2", "-vf", filter, &s.display().to_string()]);
+        let bytes = std::fs::read(&s).unwrap();
+        assert_eq!(gif::screen_size(&bytes), Some((320, 180)));
+        let out = d.p(&format!("red-{name}"));
+        std::fs::write(&out, gif::redact(&bytes, &[BOX]).unwrap()).unwrap();
+        assert_eq!(outside_box(&s, 320, 180, Some(rgba)), outside_box(&out, 320, 180, Some(rgba)), "{frames}: pixels outside the box changed");
+        let want_frames = region(&s, None, Some(rgba)).len();
+        assert_eq!(region(&out, None, Some(rgba)).len(), want_frames, "{frames}: frame count");
+        assert_eq!(field(&s, "v:0", "stream=r_frame_rate"), field(&out, "v:0", "stream=r_frame_rate"), "{frames}: timing");
+        assert_eq!(field(&s, "", "format=duration"), field(&out, "", "format=duration"), "{frames}: duration");
+        let ranges = luma_ranges(&out, BOX);
+        assert_eq!(ranges.len(), want_frames, "{frames}: every frame measured");
+        for (lo, hi) in ranges { assert!(lo == hi && hi < 48, "{frames}: box must be one dark colour, was {lo}..{hi}"); }
+        println!("{frames}: {want_frames} frames exact outside the box");
+    }
+    // A frame missed by the box is copied byte for byte: redacting nothing changes nothing.
+    let s = d.p("global.gif");
+    let b = std::fs::read(&s).unwrap();
+    assert_eq!(gif::redact(&b, &[]).unwrap(), b);
+}
+
+#[test]
+fn matching_codecs_copy_with_no_change_at_all() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mp4");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=641x361:r=30000/1001:d=2", "-f", "lavfi", "-i", "sine=r=48000:d=2", "-f", "lavfi", "-i", "sine=f=880:r=44100:d=2",
+        "-vf", "format=yuv444p10le", "-c:v", "libx264", "-crf", "20", "-c:a", "aac", "-map", "0:v", "-map", "1:a", "-map", "2:a", &s.display().to_string()]);
+    let p = probe(&s);
+    let want = region(&s, None, None);
+    for t in ["mkv", "mov"] {
+        let out = d.p(&format!("o.{t}"));
+        assert_eq!(run_attempts(&s, &convert_attempts(&p, t), &out), 0, "{t}: stream copy worked first time");
+        assert_eq!(region(&out, None, None), want, "{t}: frames");
+        assert_eq!(field(&out, "a", "stream=codec_name").lines().count(), 2, "{t}: tracks");
+        assert_eq!(field(&out, "v:0", "stream=pix_fmt"), "yuv444p10le", "{t}: format");
+    }
+    let m4a = d.p("o.m4a");
+    run_attempts(&s, &convert_attempts(&p, "m4a"), &m4a);
+    let aud = |f: &Path| { let o = ff(&["-i".into(), f.display().to_string(), "-map".into(), "0:a:0".into(), "-c".into(), "copy".into(), "-f".into(), "md5".into(), "-".into()]).unwrap(); String::from_utf8_lossy(&o).to_string() };
+    assert_eq!(aud(&s), aud(&m4a), "aac in mp4 moves into m4a bit for bit");
+}
+
+#[test]
+fn reencoding_conversions_keep_format_size_and_tracks() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    let tags = "format=yuv422p10le,setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=tv";
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-f", "lavfi", "-i", "sine=r=48000:d=1", "-vf", tags, "-c:v", "ffv1", "-c:a", "flac", &s.display().to_string()]);
+    let p = probe(&s);
+    let m = d.p("o.mp4");
+    run_attempts(&s, &convert_attempts(&p, "mp4"), &m);
+    assert_eq!(field(&m, "v:0", "stream=pix_fmt"), "yuv422p10le", "10-bit 4:2:2 kept");
+    assert_eq!(field(&m, "v:0", "stream=color_transfer"), "smpte2084", "HDR tag kept");
+    assert_eq!(field(&m, "a:0", "stream=codec_name"), "alac", "lossless audio stays lossless");
+    assert_eq!((field(&m, "v:0", "stream=width"), field(&m, "v:0", "stream=height")), ("640".to_string(), "360".to_string()));
+    assert!(psnr(&m, &s) > 45.0, "psnr {}", psnr(&m, &s));
+
+    let lq = clip(&d, "plain.mkv", "yuv420p", &["-c:v", "ffv1"], "");
+    let lqp = probe(&lq);
+    for (t, min) in [("mp4", 45.0), ("mov", 45.0), ("avi", 40.0), ("wmv", 40.0)] {
+        let out = d.p(&format!("q.{t}"));
+        run_attempts(&lq, &convert_attempts(&lqp, t), &out);
+        let v = psnr(&out, &lq);
+        assert!(v > min, "{t}: psnr {v}");
+        println!("{t}: {v:.1} dB");
+    }
+    if has_encoder("libvpx-vp9") {
+        let out = d.p("q.webm");
+        run_attempts(&lq, &convert_attempts(&lqp, "webm"), &out);
+        let v = psnr(&out, &lq);
+        assert!(v > 45.0, "webm: psnr {v}");
+        println!("webm: {v:.1} dB");
+    }
+}
+
+#[test]
+fn odd_sizes_are_padded_not_resampled() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("odd.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=800x600:r=30:d=1", "-vf", "format=yuv444p,crop=641:361:0:0", "-c:v", "ffv1", &s.display().to_string()]);
+    assert_eq!(field(&s, "v:0", "stream=width"), "641", "fixture");
+    let p = probe(&s);
+    // 4:4:4 stores odd sizes as they are.
+    let m = d.p("o.mp4");
+    run_attempts(&s, &convert_attempts(&p, "mp4"), &m);
+    assert_eq!(field(&m, "v:0", "stream=width"), "641");
+    // 4:2:0 cannot, so a row and a column of padding go on, and the picture itself is not resampled.
+    let a = d.p("o.wmv");
+    run_attempts(&s, &convert_attempts(&p, "wmv"), &a);
+    assert_eq!((field(&a, "v:0", "stream=width"), field(&a, "v:0", "stream=height")), ("642".to_string(), "362".to_string()));
+    let o = Command::new("ffmpeg").args(["-hide_banner", "-nostdin", "-i"]).arg(&a).arg("-i").arg(&s)
+        .args(["-lavfi", "[0:v]crop=640:360:0:0,format=yuv420p,settb=1/1000,setpts=N[a];[1:v]format=yuv444p,crop=640:360:0:0,format=yuv420p,settb=1/1000,setpts=N[b];[a][b]psnr", "-f", "null", "-"]).output().unwrap();
+    let t = String::from_utf8_lossy(&o.stderr);
+    let v: f64 = t.rsplit("average:").next().unwrap().split_whitespace().next().unwrap().parse().unwrap();
+    assert!(v > 38.0, "psnr {v}");
+}
+
+#[test]
+fn gif_keeps_full_size_and_frame_rate() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-vf", "format=yuv420p", "-c:v", "ffv1", &s.display().to_string()]);
+    let out = d.p("o.gif");
+    run_attempts(&s, &convert_attempts(&probe(&s), "gif"), &out);
+    assert_eq!(field(&out, "v:0", "stream=width"), "1280");
+    assert_eq!(region(&out, None, None).len(), region(&s, None, None).len(), "every frame kept");
+    let v = d.p("fast.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=60:d=1", "-c:v", "ffv1", &v.display().to_string()]);
+    let g = d.p("fast.gif");
+    run_attempts(&v, &convert_attempts(&probe(&v), "gif"), &g);
+    assert_eq!(region(&g, None, None).len(), 50, "60 fps caps at the 50 GIF can show");
+}
+
+#[test]
+fn audio_keeps_depth_rate_and_cover_art() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let w = d.p("s.wav");
+    ffs(&["-f", "lavfi", "-i", "sine=f=997:r=96000:d=1", "-c:a", "pcm_s24le", &w.display().to_string()]);
+    let f = d.p("s.flac");
+    let p = probe(&w);
+    run_attempts(&w, &convert_attempts(&p, "flac"), &f);
+    assert_eq!(field(&f, "a:0", "stream=sample_rate"), "96000");
+    assert_eq!(field(&f, "a:0", "stream=bits_per_raw_sample"), "24");
+    let pcm = |a: &Path| { let o = ff(&["-i".into(), a.display().to_string(), "-map".into(), "0:a:0".into(), "-f".into(), "s32le".into(), "-c:a".into(), "pcm_s32le".into(), "-".into()]).unwrap(); o };
+    assert_eq!(pcm(&w), pcm(&f), "wav to flac is bit exact");
+    let back = d.p("b.wav");
+    run_attempts(&f, &convert_attempts(&probe(&f), "wav"), &back);
+    assert_eq!(field(&back, "a:0", "stream=codec_name"), "pcm_s24le", "24-bit stays 24-bit, the old code cut it to 16");
+    assert_eq!(pcm(&w), pcm(&back));
+    let a = d.p("s.aiff");
+    run_attempts(&w, &convert_attempts(&p, "aiff"), &a);
+    assert_eq!(field(&a, "a:0", "stream=codec_name"), "pcm_s24be");
+    assert_eq!(pcm(&w), pcm(&a));
+    let m = d.p("s.m4a");
+    run_attempts(&w, &convert_attempts(&p, "m4a"), &m);
+    assert_eq!(field(&m, "a:0", "stream=codec_name"), "alac");
+    assert_eq!(pcm(&w), pcm(&m), "m4a from a lossless source is lossless");
+
+    // Lossy targets at their top settings, with resampling where the format needs it.
+    let mp3 = d.p("s.mp3");
+    run_attempts(&w, &convert_attempts(&p, "mp3"), &mp3);
+    assert_eq!(field(&mp3, "a:0", "stream=bit_rate"), "320000");
+    assert_eq!(field(&mp3, "a:0", "stream=sample_rate"), "48000");
+    let wma = d.p("s.wma");
+    run_attempts(&w, &convert_attempts(&p, "wma"), &wma);
+    assert_eq!(field(&wma, "a:0", "stream=sample_rate"), "48000");
+    if has_encoder("libopus") {
+        let o = d.p("s.opus");
+        run_attempts(&w, &convert_attempts(&p, "opus"), &o);
+        assert_eq!(field(&o, "a:0", "stream=sample_rate"), "48000");
+        // Stereo and surround have higher ceilings than mono.
+        let st = d.p("st.flac");
+        ffs(&["-f", "lavfi", "-i", "sine=r=48000:d=1", "-af", "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0", &st.display().to_string()]);
+        let so = d.p("st.opus");
+        run_attempts(&st, &convert_attempts(&probe(&st), "opus"), &so);
+        assert_eq!(field(&so, "a:0", "stream=channels"), "6");
+    }
+
+    // Cover art survives.
+    let jpg = d.p("c.jpg");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=64x64:d=1", "-frames:v", "1", &jpg.display().to_string()]);
+    let tagged = d.p("t.flac");
+    ffs(&["-i", &f.display().to_string(), "-i", &jpg.display().to_string(), "-map", "0:a", "-map", "1:v", "-c", "copy", "-disposition:v", "attached_pic", "-metadata", "title=Song", &tagged.display().to_string()]);
+    let tp = probe(&tagged);
+    assert!(tp.cover);
+    for t in ["mp3", "m4a"] {
+        let o = d.p(&format!("cover.{t}"));
+        assert_eq!(run_attempts(&tagged, &convert_attempts(&tp, t), &o), 0, "{t}: cover attempt worked");
+        assert!(probe(&o).cover, "{t}: cover kept");
+        assert!(field(&o, "", "format_tags=title").contains("Song"), "{t}: tags kept");
+    }
+}
+
+#[test]
+fn audio_edits_keep_the_format_at_its_best() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mp3");
+    ffs(&["-f", "lavfi", "-i", "sine=f=440:r=44100:d=2", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "320k", &s.display().to_string()]);
+    let p = probe(&s);
+    let o = d.p("o.mp3");
+    run_app_args(&s, &audio_edit_args(&p, "mp3", "loudnorm=I=-16:TP=-1.5:LRA=11"), &o).unwrap();
+    assert_eq!(field(&o, "a:0", "stream=bit_rate"), "320000", "not the default 128k");
+    assert_eq!(field(&o, "a:0", "stream=sample_rate"), "44100", "not the 192 kHz loudnorm leaves behind");
+    let w = d.p("s.wav");
+    ffs(&["-f", "lavfi", "-i", "sine=f=440:r=48000:d=2", "-ac", "2", "-c:a", "pcm_s24le", &w.display().to_string()]);
+    let o2 = d.p("o.wav");
+    run_app_args(&w, &audio_edit_args(&probe(&w), "wav", "pan=stereo|c0=c1|c1=c0"), &o2).unwrap();
+    assert_eq!(field(&o2, "a:0", "stream=codec_name"), "pcm_s24le");
+    assert_eq!(field(&o2, "a:0", "stream=sample_rate"), "48000");
+}
+
+#[test]
+fn speed_and_crop_stay_lossless() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mp4");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2", "-f", "lavfi", "-i", "sine=r=48000:d=2", "-vf", "format=yuv420p10le", "-c:v", "libx264", "-crf", "20", "-c:a", "aac", &s.display().to_string()]);
+    let p = probe(&s);
+    let c = lossless_args(&p, "mp4", Some("crop=320:180:100:60"), None, false).unwrap();
+    let o = d.p("c.mp4");
+    run_app_args(&s, &c.args, &o).unwrap();
+    assert_eq!(region(&s, Some((100, 60, 320, 180)), None), region(&o, None, None), "cropped pixels are the original pixels");
+    assert_eq!(field(&o, "v:0", "stream=pix_fmt"), "yuv420p10le");
+
+    let sp = lossless_args(&p, "mp4", Some("setpts=PTS/2"), Some("atempo=2.0000"), true).unwrap();
+    let o = d.p("sp.mp4");
+    run_app_args(&s, &sp.args, &o).unwrap();
+    assert_eq!(region(&s, None, None), region(&o, None, None), "every frame kept, only faster");
+    let dur: f64 = field(&o, "v:0", "stream=duration").parse().unwrap();
+    assert!((dur - 1.0).abs() < 0.05, "duration {dur}");
+    let br: u32 = field(&o, "a:0", "stream=bit_rate").parse().unwrap();
+    assert!(br > 100_000, "audio bitrate {br}");
+}
+
+#[test]
+fn trim_from_a_keyframe_copies_and_elsewhere_stays_lossless() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mp4");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4", "-f", "lavfi", "-i", "sine=r=48000:d=4", "-vf", "format=yuv420p", "-c:v", "libx264", "-crf", "20", "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-c:a", "aac", &s.display().to_string()]);
+    let all = region(&s, None, None);
+    let p = probe(&s);
+    let fps = p.video.as_ref().unwrap().fps;
+    let packets = |t: f64| { let o = Command::new("ffprobe").args(keyframe_probe_args(&s.display().to_string(), t)).output().unwrap(); String::from_utf8_lossy(&o.stdout).to_string() };
+    assert!(is_keyframe_at(&packets(1.0), 1.0, fps), "{}", packets(1.0));
+    assert!(!is_keyframe_at(&packets(1.5), 1.5, fps));
+    // Copy from a keyframe: the frames are the original frames, at no cost at all.
+    let o = d.p("copy.mp4");
+    // Only a cut running to the end of the file can copy: see trim_can_copy, and the frames counted here.
+    let cp = |a: f64, b: f64, o: &Path| run_seek(&seek_args(a, b), &s, &copy_attempts(&[], &trim_copy_tail()).remove(0), o).unwrap();
+    cp(1.0, 4.0, &o);
+    assert_eq!(&all[30..], &region(&o, None, None)[..], "copied frames are exactly the originals");
+    // From the very start too, where seeking after the input loses the first group of pictures.
+    let o0 = d.p("copy0.mp4");
+    cp(0.0, 4.0, &o0);
+    assert_eq!(all, region(&o0, None, None), "the first frame is the first frame");
+    // Audio cuts: lossy copies whole frames, lossless lands on the sample.
+    let w = d.p("a.wav");
+    ffs(&["-f", "lavfi", "-i", "sine=r=48000:d=4", "-c:a", "pcm_s24le", &w.display().to_string()]);
+    let wo = d.p("cut.wav");
+    run_seek(&seek_args(1.0, 2.0), &w, &audio_trim_args(&probe(&w), "wav"), &wo).unwrap();
+    assert_eq!(field(&wo, "a:0", "stream=codec_name"), "pcm_s24le");
+    assert_eq!(field(&wo, "a:0", "stream=duration_ts"), "48000", "exact samples");
+    let m = d.p("a.mp3");
+    ffs(&["-f", "lavfi", "-i", "sine=r=44100:d=4", "-c:a", "libmp3lame", "-b:a", "320k", &m.display().to_string()]);
+    let mo = d.p("cut.mp3");
+    run_seek(&seek_args(1.0, 2.0), &m, &audio_trim_args(&probe(&m), "mp3"), &mo).unwrap();
+    assert_eq!(field(&mo, "a:0", "stream=bit_rate"), "320000", "copied, not re-encoded");
+    let cut: f64 = field(&mo, "a:0", "stream=duration").parse().unwrap();
+    assert!((cut - 1.0).abs() < 0.06, "{cut}");
+    // From anywhere else: exact frames, through a lossless encode.
+    let l = lossless_args(&p, "mp4", None, None, false).unwrap();
+    let o = d.p("exact.mp4");
+    run_seek(&seek_args(1.5, 2.5), &s, &l.args, &o).unwrap();
+    let got = region(&o, None, None);
+    assert_eq!(&all[45..75], &got[..], "the exact range, pixel for pixel");
+}
+
+#[test]
+fn join_copies_when_it_can_and_loses_nothing_when_it_cannot() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mp4");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4", "-f", "lavfi", "-i", "sine=r=48000:d=4", "-vf", "format=yuv420p", "-c:v", "libx264", "-crf", "20", "-g", "30", "-c:a", "aac", &s.display().to_string()]);
+    let probes = [probe(&s), probe(&s)];
+    let exts = ["mp4".to_string(), "mp4".to_string()];
+    assert!(can_concat_copy(&probes, &exts), "{:?}", probes);
+    let list = d.p("list.txt");
+    std::fs::write(&list, concat_list(&[s.display().to_string(), s.display().to_string()])).unwrap();
+    let o = d.p("joined.mp4");
+    ffs(&["-f", "concat", "-safe", "0", "-i", &list.display().to_string(), "-map", "0", "-c", "copy", "-map_metadata", "0", &o.display().to_string()]);
+    let one = region(&s, None, None);
+    let twice: Vec<String> = one.iter().chain(&one).cloned().collect();
+    assert_eq!(region(&o, None, None), twice, "joined without a single changed frame");
+
+    // Different clips: nothing is shrunk, slowed or flattened to match the first.
+    let small = clip(&d, "small.mp4", "yuv420p", &["-c:v", "libx264", "-crf", "20"], "");
+    let big = d.p("big.mp4");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=60:d=1", "-vf", "format=yuv420p10le", "-c:v", "libx264", "-crf", "20", &big.display().to_string()]);
+    let probes = [probe(&small), probe(&big)];
+    let spec = join_spec(&probes);
+    assert_eq!((spec.size, spec.pix.as_str()), ((1280, 720), "yuv420p10le"));
+    let silent = [Some(1.0), Some(1.0)];
+    let (ext, tail) = join_output_args(&spec, &probes);
+    let o = d.p(&format!("mixed.{ext}"));
+    let mut args = vec!["-i".to_string(), small.display().to_string(), "-i".to_string(), big.display().to_string(), "-filter_complex".to_string(), join_filter(&spec, &silent)];
+    args.extend(tail);
+    args.push(o.display().to_string());
+    ff(&args).unwrap();
+    assert_eq!(field(&o, "v:0", "stream=pix_fmt"), "yuv420p10le");
+    assert_eq!(field(&o, "v:0", "stream=width"), "1280");
+    assert_eq!(field(&o, "v:0", "stream=r_frame_rate"), "60/1");
+    // The 720p clip passes through without being resampled: the second half is pixel for pixel the original.
+    let got = region(&o, None, Some("yuv420p10le"));
+    let want = region(&big, None, Some("yuv420p10le"));
+    assert_eq!(&got[got.len() - want.len()..], &want[..], "matching clip is untouched");
+}
+
+#[test]
+fn compress_spends_only_what_was_chosen() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=800x600:r=30:d=1", "-f", "lavfi", "-i", "sine=r=48000:d=1", "-vf", "format=yuv444p10le,crop=641:360:0:0,format=yuv420p10le", "-c:v", "ffv1", "-c:a", "aac", &s.display().to_string()]);
+    assert_eq!(field(&s, "v:0", "stream=width"), "641", "fixture");
+    let o = d.p("o.mp4");
+    run_app_args(&s, &compress_video_args(&probe(&s), "23", None), &o).unwrap();
+    assert_eq!(field(&o, "v:0", "stream=pix_fmt"), "yuv420p10le", "HDR-capable depth kept");
+    assert_eq!(field(&o, "v:0", "stream=width"), "642", "padded, not resampled");
+    let o = d.p("h.mp4");
+    run_app_args(&s, &compress_video_args(&probe(&s), "23", Some(180)), &o).unwrap();
+    assert_eq!(field(&o, "v:0", "stream=height"), "180");
+}
+
+#[test]
+fn edited_jpegs_save_at_top_quality_with_full_colour() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.png");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:d=1", "-frames:v", "1", &s.display().to_string()]);
+    let mut a = vec!["-vf".to_string(), "hflip,hflip".to_string(), "-frames:v".to_string(), "1".to_string(), "-update".to_string(), "1".to_string()];
+    a.extend(image_encode_args("jpg"));
+    let o = d.p("o.jpg");
+    run_app_args(&s, &a, &o).unwrap();
+    let f = field(&o, "v:0", "stream=pix_fmt");
+    assert!(f.contains("444"), "chroma not subsampled: {f}");
+    let v = psnr(&o, &s);
+    assert!(v > 40.0, "psnr {v}");
+    println!("jpeg edit: {v:.1} dB, {f}");
+    let info = jpeg_info(&std::fs::read(&o).unwrap()).unwrap();
+    assert_eq!((info.w, info.h, info.comps), (640, 360, 3));
+}
+
+#[test]
+fn snapshot_of_deep_video_stays_deep() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = clip(&d, "s.mp4", "yuv420p10le", &["-c:v", "libx264", "-crf", "20"], "");
+    let o = d.p("f.png");
+    ffs(&["-i", &s.display().to_string(), "-frames:v", "1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", &o.display().to_string()]);
+    assert_eq!(field(&o, "v:0", "stream=pix_fmt"), "rgb48be");
+}

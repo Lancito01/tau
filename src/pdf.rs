@@ -44,21 +44,34 @@ fn render_page(doc: &PdfDocument, i: u32, dpi: f64, stream: &InMemoryRandomAcces
 
 pub fn page_count(p: &Path) -> std::result::Result<u32, String> { open(p)?.PageCount().map_err(es) }
 
-/// PNG or JPEG at 300 DPI: one file for a single page, a folder for several.
-pub fn to_images(job: &Job, input: &Path, ext: &str) -> std::result::Result<PathBuf, String> {
+/// PNG or JPEG at 600 DPI: one file for a single page, a folder for several.
+pub fn to_images(job: &Job, input: &Path, ext: &str) -> std::result::Result<PathBuf, String> { images_at(job, input, ext, 600.0) }
+
+/// Slides fill a screen and PowerPoint recompresses what it is given, so 300 DPI already holds all of it.
+pub fn to_slide_images(job: &Job, input: &Path) -> std::result::Result<PathBuf, String> { images_at(job, input, "png", 300.0) }
+
+fn images_at(job: &Job, input: &Path, ext: &str, dpi: f64) -> std::result::Result<PathBuf, String> {
     let doc = open(input)?;
     let n = doc.PageCount().map_err(es)?;
-    let enc = if ext == "png" { BitmapEncoder::PngEncoderId() } else { BitmapEncoder::JpegEncoderId() }.map_err(es)?;
+    // Always rendered to PNG. The Windows JPEG encoder here has no quality setting, so our own does that step.
+    let enc = BitmapEncoder::PngEncoderId().map_err(es)?;
     let dir = if n > 1 { Some(sibling_dir(input, " pages")?) } else { None };
     let mut last = PathBuf::new();
     for i in 0..n {
         if job.cancelled() { return Err("Cancelled".into()); }
         job.set_frac(i as f32 / n as f32);
         let st = InMemoryRandomAccessStream::new().map_err(es)?;
-        render_page(&doc, i, 300.0, &st, Some(enc))?;
+        render_page(&doc, i, dpi, &st, Some(enc))?;
         let bytes = read_stream(&st)?;
         last = match &dir { Some(d) => d.join(format!("page-{:03}.{ext}", i + 1)), None => sibling(input, "", ext) };
-        std::fs::write(&last, bytes).map_err(|e| e.to_string())?;
+        if ext == "png" {
+            std::fs::write(&last, bytes).map_err(|e| e.to_string())?;
+        } else {
+            let t = TempDir::new()?;
+            let png = t.file("page.png");
+            std::fs::write(&png, bytes).map_err(|e| e.to_string())?;
+            image::save(&image::load(&png)?, &last, &image::SaveOpts::default())?;
+        }
     }
     Ok(dir.unwrap_or(last))
 }
@@ -126,25 +139,51 @@ pub fn text_to_markdown(pages: &[String]) -> String {
 
 // ---- writing ----
 
-/// One PDF, one page per image, JPEG embedded directly.
+/// The bytes of a JPEG that a PDF can hold as they are, with its size and colour space. A rotated one cannot, since
+/// the PDF would show it sideways, and neither can CMYK, which needs more than a colour space name.
+fn embeddable_jpeg(input: &Path) -> Option<(Vec<u8>, u32, u32, &'static str)> {
+    if !matches!(crate::catalog::ext_of(input).as_str(), "jpg" | "jpeg") { return None; }
+    let bytes = std::fs::read(input).ok()?;
+    let info = crate::quality::jpeg_info(&bytes)?;
+    let space = crate::quality::pdf_color_space(&info)?;
+    if image::jpeg_orientation(&bytes) != 1 { return None; }
+    Some((bytes, info.w, info.h, space))
+}
+
+/// One PDF, one page per image. JPEGs go in byte for byte, and everything else goes in without loss.
 pub fn images_to_pdf(job: &Job, inputs: &[PathBuf], out: &Path) -> std::result::Result<(), String> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let mut kids = vec![];
-    let t = TempDir::new()?;
     for (i, input) in inputs.iter().enumerate() {
         if job.cancelled() { return Err("Cancelled".into()); }
         job.set_frac(i as f32 / inputs.len() as f32);
-        let bmp: Bmp = image::load(input)?;
-        let tmp = t.file(&format!("{i}.jpg"));
-        image::save(&bmp, &tmp, &image::SaveOpts { quality: 0.92 })?;
-        let jpeg = std::fs::read(&tmp).map_err(|e| e.to_string())?;
-        let img = doc.add_object(Stream::new(dictionary! {
-            "Type" => "XObject", "Subtype" => "Image", "Width" => bmp.w as i64, "Height" => bmp.h as i64,
-            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
-        }, jpeg).with_compression(false));
+        let (img, w, h) = match embeddable_jpeg(input) {
+            Some((jpeg, w, h, space)) => (doc.add_object(Stream::new(dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+                "ColorSpace" => space, "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+            }, jpeg).with_compression(false)), w, h),
+            None => {
+                let bmp: Bmp = image::load(input)?;
+                let mut rgb = Vec::with_capacity(bmp.px.len() / 4 * 3);
+                for p in bmp.px.chunks_exact(4) { rgb.extend_from_slice(&[p[2], p[1], p[0]]); }
+                let mut d = dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => bmp.w as i64, "Height" => bmp.h as i64,
+                    "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+                };
+                if bmp.has_alpha() {
+                    let alpha: Vec<u8> = bmp.px.chunks_exact(4).map(|p| p[3]).collect();
+                    let mask = doc.add_object(Stream::new(dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image", "Width" => bmp.w as i64, "Height" => bmp.h as i64,
+                        "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                    }, alpha));
+                    d.set("SMask", mask);
+                }
+                (doc.add_object(Stream::new(d, rgb)), bmp.w, bmp.h)
+            }
+        };
         // 96 px per inch: a sensible default page size for photos and screenshots alike.
-        let (pw, ph) = (bmp.w as f32 * 0.75, bmp.h as f32 * 0.75);
+        let (pw, ph) = (w as f32 * 0.75, h as f32 * 0.75);
         let content = doc.add_object(Stream::new(dictionary! {}, format!("q {pw} 0 0 {ph} 0 0 cm /I0 Do Q").into_bytes()));
         let page = doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id,
@@ -154,6 +193,8 @@ pub fn images_to_pdf(job: &Job, inputs: &[PathBuf], out: &Path) -> std::result::
         });
         kids.push(Object::Reference(page));
     }
+    // Flate on the pixel streams, which is lossless. The JPEG streams opted out above.
+    doc.compress();
     finish_doc(doc, pages_id, kids, out)
 }
 

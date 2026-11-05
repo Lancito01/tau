@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::Foundation::GENERIC_ACCESS_RIGHTS;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Variant::VARIANT;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -27,16 +28,6 @@ impl Bmp {
             for c in &mut p[..3] { *c = ((*c as u32 * a + 255 * (255 - a)) / 255) as u8; }
             p[3] = 255;
         }
-    }
-    pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> Bmp {
-        let (x, y) = (x.min(self.w - 1), y.min(self.h - 1));
-        let (w, h) = (w.min(self.w - x).max(1), h.min(self.h - y).max(1));
-        let mut px = Vec::with_capacity((w * h * 4) as usize);
-        for row in y..y + h {
-            let s = ((row * self.w + x) * 4) as usize;
-            px.extend_from_slice(&self.px[s..s + (w * 4) as usize]);
-        }
-        Bmp { w, h, px }
     }
     pub fn scaled(&self, w: u32, h: u32) -> std::result::Result<Bmp, String> {
         unsafe {
@@ -62,14 +53,6 @@ impl Bmp {
                 let a = src.px[s + 3] as u32;
                 for c in 0..3 { self.px[d + c] = ((src.px[s + c] as u32 * a + self.px[d + c] as u32 * (255 - a)) / 255) as u8; }
                 self.px[d + 3] = (a + self.px[d + 3] as u32 * (255 - a) / 255).min(255) as u8;
-            }
-        }
-    }
-    pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, bgra: [u8; 4]) {
-        for row in y.max(0)..(y + h).min(self.h as i32) {
-            for col in x.max(0)..(x + w).min(self.w as i32) {
-                let d = ((row * self.w as i32 + col) * 4) as usize;
-                self.px[d..d + 4].copy_from_slice(&bgra);
             }
         }
     }
@@ -132,36 +115,38 @@ pub fn load(p: &Path) -> std::result::Result<Bmp, String> {
             };
             let t = TempDir::new()?;
             let tmp = t.file("in.png");
-            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), tmp.display().to_string()], None)
+            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), tmp.display().to_string()], None)
                 .map_err(|e| format!("Could not read {}: {e}", p.file_name().unwrap_or_default().to_string_lossy()))?;
             wic_load(&tmp).map_err(es)
         }
     }
 }
 
+/// Quality 1.0 is the top of the scale, and it means truly lossless for formats that can be.
 pub struct SaveOpts { pub quality: f32 }
-impl Default for SaveOpts { fn default() -> Self { SaveOpts { quality: 0.92 } } }
+impl Default for SaveOpts { fn default() -> Self { SaveOpts { quality: 1.0 } } }
 
-fn property(bag: &IPropertyBag2Wrap, name: PCWSTR, v: f32) { bag.write(name, v); }
+fn property(bag: &IPropertyBag2Wrap, name: PCWSTR, v: f32) { bag.write(name, VARIANT::from(v)); }
 
 struct IPropertyBag2Wrap(windows::Win32::System::Com::StructuredStorage::IPropertyBag2);
 impl IPropertyBag2Wrap {
-    fn write(&self, name: PCWSTR, v: f32) {
+    fn write(&self, name: PCWSTR, val: VARIANT) {
         use windows::Win32::System::Com::StructuredStorage::*;
-        use windows::Win32::System::Variant::*;
         unsafe {
             let opt = PROPBAG2 { pstrName: PWSTR(name.0 as *mut u16), ..Default::default() };
-            let val = VARIANT::from(v);
-            let _ = val.vt() == VT_R4;
             let _ = self.0.Write(1, &opt, &val);
         }
     }
 }
 
-/// Encodes to a stream target via WIC. The container comes from the extension.
-fn wic_save(b: &Bmp, out: &Path, ext: &str, o: &SaveOpts) -> Result<()> {
+/// A colour profile and print resolution to carry across, when there are any.
+#[derive(Clone, Default)]
+struct Carry { color: Option<IWICColorContext>, dpi: (f64, f64) }
+
+/// Encodes any WIC source via WIC, at the source's own depth when the format has room for it.
+/// The container comes from the extension.
+fn wic_encode(f: &IWICImagingFactory, src: &IWICBitmapSource, out: &Path, ext: &str, o: &SaveOpts, carry: &Carry) -> Result<()> {
     unsafe {
-        let f = factory()?;
         let guid = match ext {
             "png" => GUID_ContainerFormatPng,
             "jpg" | "jpeg" => GUID_ContainerFormatJpeg,
@@ -179,67 +164,286 @@ fn wic_save(b: &Bmp, out: &Path, ext: &str, o: &SaveOpts) -> Result<()> {
         let mut bag = None;
         enc.CreateNewFrame(&mut frame, &mut bag)?;
         let frame = frame.unwrap();
-        if matches!(ext, "jpg" | "jpeg" | "heic" | "heif") {
-            if let Some(b) = bag.clone() { property(&IPropertyBag2Wrap(b), w!("ImageQuality"), o.quality); }
+        if let Some(b) = bag.clone() {
+            let b = IPropertyBag2Wrap(b);
+            if matches!(ext, "jpg" | "jpeg" | "heic" | "heif") { property(&b, w!("ImageQuality"), o.quality); }
+            // WIC halves JPEG colour resolution unless told otherwise. Only the smallest compress setting wants that.
+            if matches!(ext, "jpg" | "jpeg") && o.quality >= 0.7 { b.write(w!("JpegYCrCbSubsampling"), VARIANT::from(WICJpegYCrCbSubsampling444.0 as u8)); }
         }
         frame.Initialize(bag.as_ref())?;
-        frame.SetSize(b.w, b.h)?;
-        // JPEG has no alpha; BMP and GIF readers handle 24-bit best.
-        let source = f.CreateBitmapFromMemory(b.w, b.h, &GUID_WICPixelFormat32bppBGRA, b.w * 4, &b.px)?;
-        let mut fmt = if matches!(ext, "jpg" | "jpeg" | "bmp") { GUID_WICPixelFormat24bppBGR } else { GUID_WICPixelFormat32bppBGRA };
+        let (mut w, mut h) = (0, 0);
+        src.GetSize(&mut w, &mut h)?;
+        frame.SetSize(w, h)?;
+        if carry.dpi.0 > 0.0 && carry.dpi.1 > 0.0 { let _ = frame.SetResolution(carry.dpi.0, carry.dpi.1); }
+        let src_fmt = src.GetPixelFormat()?;
+        // JPEG has no alpha; BMP readers handle 24-bit best. Grey stays grey. Everything else offers its own
+        // format, and the encoder answers with the closest it can write.
+        let grey = src_fmt == GUID_WICPixelFormat8bppGray || src_fmt == GUID_WICPixelFormat16bppGray;
+        let mut fmt = if matches!(ext, "jpg" | "jpeg" | "bmp") && !grey { GUID_WICPixelFormat24bppBGR } else { src_fmt };
         frame.SetPixelFormat(&mut fmt)?;
-        let conv: IWICBitmapSource = WICConvertBitmapSource(&fmt, &source)?;
-        frame.WriteSource(&conv, std::ptr::null())?;
+        // Not every format can hold a profile, and a picture is still worth saving without.
+        if let Some(c) = &carry.color { let _ = frame.SetColorContexts(&[Some(c.clone())]); }
+        if fmt == src_fmt {
+            frame.WriteSource(src, std::ptr::null())?;
+        } else {
+            let conv: IWICBitmapSource = WICConvertBitmapSource(&fmt, src)?;
+            frame.WriteSource(&conv, std::ptr::null())?;
+        }
         frame.Commit()?;
         enc.Commit()?;
         Ok(())
     }
 }
 
-/// Saves a bitmap, flattening alpha where the format has none. Output must not exist yet.
-pub fn save(b: &Bmp, out: &Path, o: &SaveOpts) -> std::result::Result<(), String> {
+fn wic_save(b: &Bmp, out: &Path, ext: &str, o: &SaveOpts, carry: &Carry) -> Result<()> {
+    unsafe {
+        let f = factory()?;
+        let source = f.CreateBitmapFromMemory(b.w, b.h, &GUID_WICPixelFormat32bppBGRA, b.w * 4, &b.px)?;
+        wic_encode(&f, &source.cast()?, out, ext, o, carry)
+    }
+}
+
+/// WebP and AVIF through ffmpeg, from a PNG that holds everything the picture has.
+fn ffmpeg_still(png: &Path, out: &Path, ext: &str, o: &SaveOpts) -> std::result::Result<(), String> {
+    let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
+    let lossless = o.quality >= 1.0;
+    let aom = |crf: i32| -> Vec<String> { vec!["-c:v".into(), "libaom-av1".into(), "-still-picture".into(), "1".into(), "-crf".into(), crf.to_string(), "-pix_fmt".into(), "yuv444p".into(), "-cpu-used".into(), "4".into()] };
+    let encoders: Vec<Vec<String>> = match (ext, lossless) {
+        ("webp", true) => vec![crate::quality::image_encode_args("webp")],
+        ("webp", false) => vec![vec!["-c:v".into(), "libwebp".into(), "-quality".into(), ((o.quality * 100.0) as i32).to_string()]],
+        // A build that refuses RGB AVIF still gets the closest thing to lossless it can do.
+        (_, true) => vec![crate::quality::image_encode_args("avif"), aom(0)],
+        (_, false) => vec![aom(((1.0 - o.quality) * 63.0) as i32 + 8)],
+    };
+    let mut last = Err("Nothing to do".to_string());
+    for enc in encoders {
+        let mut a: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-i".into(), png.display().to_string()];
+        a.extend(enc);
+        a.extend(["-frames:v".into(), "1".into(), out.display().to_string()]);
+        last = run(None, &ff, &a, None).map(|_| ());
+        if last.is_ok() { break; }
+    }
+    last
+}
+
+fn heic_error(out: &Path) -> String {
+    let _ = std::fs::remove_file(out);
+    "HEIC output needs the HEIF Image and HEVC Video Extensions from the Microsoft Store".to_string()
+}
+
+fn save_carrying(b: &Bmp, out: &Path, o: &SaveOpts, carry: &Carry) -> std::result::Result<(), String> {
     let ext = crate::catalog::ext_of(out);
     let ext = ext.split('.').next_back().unwrap_or("").to_string();
     let mut tmp;
     let b = if matches!(ext.as_str(), "jpg" | "jpeg" | "bmp") && b.has_alpha() { tmp = b.clone(); tmp.flatten_white(); &tmp } else { b };
     match ext.as_str() {
         "webp" | "avif" => {
-            let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
             let t = TempDir::new()?;
             let png = t.file("in.png");
-            wic_save(b, &png, "png", &SaveOpts::default()).map_err(es)?;
-            let q = (o.quality * 100.0) as i32;
-            let mut a: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-i".into(), png.display().to_string()];
-            if ext == "webp" {
-                a.extend(["-c:v".into(), "libwebp".into(), "-quality".into(), q.to_string()]);
-            } else {
-                let crf = ((1.0 - o.quality) * 63.0) as i32 + 8;
-                a.extend(["-c:v".into(), "libaom-av1".into(), "-still-picture".into(), "1".into(), "-crf".into(), crf.to_string(), "-cpu-used".into(), "6".into()]);
-            }
-            a.extend(["-frames:v".into(), "1".into(), out.display().to_string()]);
-            run(None, &ff, &a, None).map(|_| ())
+            wic_save(b, &png, "png", &SaveOpts::default(), carry).map_err(es)?;
+            ffmpeg_still(&png, out, &ext, o)
         }
-        "heic" | "heif" => wic_save(b, out, &ext, o).map_err(|_| {
-            let _ = std::fs::remove_file(out);
-            "HEIC output needs the HEIF Image and HEVC Video Extensions from the Microsoft Store".to_string()
-        }),
-        _ => wic_save(b, out, &ext, o).map_err(es),
+        "heic" | "heif" => wic_save(b, out, &ext, o, carry).map_err(|_| heic_error(out)),
+        _ => wic_save(b, out, &ext, o, carry).map_err(es),
     }
+}
+
+/// Saves a bitmap, flattening alpha where the format has none. Output must not exist yet.
+pub fn save(b: &Bmp, out: &Path, o: &SaveOpts) -> std::result::Result<(), String> {
+    save_carrying(b, out, o, &Carry::default())
+}
+
+// ---- pictures at their stored depth ----
+
+/// Layout of a pixel format that can be edited in place: bytes per pixel, and the offset of alpha if there is any.
+fn layout(fmt: &GUID) -> Option<(usize, Option<usize>)> {
+    Some(match *fmt {
+        f if f == GUID_WICPixelFormat8bppGray => (1, None),
+        f if f == GUID_WICPixelFormat16bppGray => (2, None),
+        f if f == GUID_WICPixelFormat24bppBGR || f == GUID_WICPixelFormat24bppRGB => (3, None),
+        f if f == GUID_WICPixelFormat32bppBGR => (4, None),
+        f if f == GUID_WICPixelFormat32bppBGRA || f == GUID_WICPixelFormat32bppRGBA => (4, Some(3)),
+        f if f == GUID_WICPixelFormat48bppRGB || f == GUID_WICPixelFormat48bppBGR => (6, None),
+        f if f == GUID_WICPixelFormat64bppRGBA || f == GUID_WICPixelFormat64bppBGRA => (8, Some(6)),
+        _ => return None,
+    })
+}
+
+/// A picture as decoded, upright, without the trip through 8-bit BGRA: 16-bit stays 16-bit, grey stays grey.
+pub struct Native { bmp: IWICBitmap, carry: Carry }
+
+/// The embedded ICC profile. Without it, wide-gamut pictures shift colour when saved.
+fn profile_of(f: &IWICImagingFactory, frame: &IWICBitmapFrameDecode) -> Option<IWICColorContext> {
+    unsafe {
+        let mut n = 0u32;
+        frame.GetColorContexts(&mut [], &mut n).ok()?;
+        if n == 0 { return None; }
+        let mut all: Vec<Option<IWICColorContext>> = (0..n).map(|_| f.CreateColorContext().ok()).collect();
+        frame.GetColorContexts(&mut all, &mut n).ok()?;
+        all.into_iter().flatten().find(|c| c.GetType().is_ok_and(|t| t == WICColorContextProfile))
+    }
+}
+
+/// Indexed, CMYK and more exotic formats convert to a form with enough depth to hold them.
+fn editable(f: &IWICImagingFactory, src: IWICBitmapSource) -> Result<IWICBitmapSource> {
+    unsafe {
+        let fmt = src.GetPixelFormat()?;
+        if layout(&fmt).is_some() { return Ok(src); }
+        let info: IWICPixelFormatInfo = f.CreateComponentInfo(&fmt)?.cast()?;
+        let per_channel = info.GetBitsPerPixel()? / info.GetChannelCount()?.max(1);
+        let to = if per_channel > 8 { GUID_WICPixelFormat64bppRGBA } else { GUID_WICPixelFormat32bppBGRA };
+        WICConvertBitmapSource(&to, &src)
+    }
+}
+
+fn orientation_transform(orient: u32) -> WICBitmapTransformOptions {
+    match orient {
+        2 => WICBitmapTransformFlipHorizontal,
+        3 => WICBitmapTransformRotate180,
+        4 => WICBitmapTransformFlipVertical,
+        5 => WICBitmapTransformOptions(WICBitmapTransformRotate90.0 | WICBitmapTransformFlipHorizontal.0),
+        6 => WICBitmapTransformRotate90,
+        7 => WICBitmapTransformOptions(WICBitmapTransformRotate270.0 | WICBitmapTransformFlipHorizontal.0),
+        8 => WICBitmapTransformRotate270,
+        _ => WICBitmapTransformRotate0,
+    }
+}
+
+fn wic_native(p: &Path) -> Result<Native> {
+    unsafe {
+        let f = factory()?;
+        let dec = f.CreateDecoderFromFilename(&HSTRING::from(p.as_os_str()), None, GENERIC_ACCESS_RIGHTS(GENERIC_READ), WICDecodeMetadataCacheOnDemand)?;
+        let frame = dec.GetFrame(0)?;
+        let orient = exif_orientation(&frame);
+        let color = profile_of(&f, &frame);
+        let (mut dx, mut dy) = (0.0, 0.0);
+        let _ = frame.GetResolution(&mut dx, &mut dy);
+        if matches!(orient, 5..=8) { std::mem::swap(&mut dx, &mut dy); }
+        let src = editable(&f, frame.cast()?)?;
+        let rot = f.CreateBitmapFlipRotator()?;
+        rot.Initialize(&src, orientation_transform(orient))?;
+        // In memory, because the source file may be a temporary and the pixels are about to be edited.
+        let bmp = f.CreateBitmapFromSource(&rot, WICBitmapCacheOnLoad)?;
+        Ok(Native { bmp, carry: Carry { color, dpi: (dx, dy) } })
+    }
+}
+
+/// Decodes at the stored depth through WIC, then ffmpeg for what has no codec installed.
+pub fn load_native(p: &Path) -> std::result::Result<Native, String> {
+    match wic_native(p) {
+        Ok(n) => Ok(n),
+        Err(wic_err) => {
+            let Some(ff) = crate::ffmpeg() else { return Err(format!("{}: no decoder ({})", p.display(), es(wic_err))); };
+            let t = TempDir::new()?;
+            let tmp = t.file("in.png");
+            // ffmpeg writes a deep source as 16-bit PNG by itself.
+            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), tmp.display().to_string()], None)
+                .map_err(|e| format!("Could not read {}: {e}", p.file_name().unwrap_or_default().to_string_lossy()))?;
+            wic_native(&tmp).map_err(es)
+        }
+    }
+}
+
+impl Native {
+    pub fn size(&self) -> (u32, u32) {
+        let (mut w, mut h) = (0, 0);
+        unsafe { let _ = self.bmp.GetSize(&mut w, &mut h); }
+        (w, h)
+    }
+    /// Solid black over a rectangle, in the picture's own format. Nothing else is touched.
+    pub fn blacken(&self, x: u32, y: u32, w: u32, h: u32) -> std::result::Result<(), String> {
+        unsafe {
+            let fmt = self.bmp.GetPixelFormat().map_err(es)?;
+            let (bytes, alpha) = layout(&fmt).ok_or("Unsupported pixel format")?;
+            let rect = WICRect { X: x as i32, Y: y as i32, Width: w as i32, Height: h as i32 };
+            let lock = self.bmp.Lock(&rect, WICBitmapLockWrite.0 as u32).map_err(es)?;
+            let stride = lock.GetStride().map_err(es)? as usize;
+            let (mut size, mut data) = (0u32, std::ptr::null_mut());
+            lock.GetDataPointer(&mut size, &mut data).map_err(es)?;
+            let buf = std::slice::from_raw_parts_mut(data, size as usize);
+            for row in 0..h as usize {
+                let start = row * stride;
+                let line = buf.get_mut(start..start + w as usize * bytes).ok_or("Pixel buffer too small")?;
+                for px in line.chunks_exact_mut(bytes) {
+                    px.fill(0);
+                    if let Some(a) = alpha { px[a..].fill(0xFF); }
+                }
+            }
+            Ok(())
+        }
+    }
+    pub fn cropped(&self, x: u32, y: u32, w: u32, h: u32) -> std::result::Result<Native, String> {
+        unsafe {
+            let f = factory().map_err(es)?;
+            let clip = f.CreateBitmapClipper().map_err(es)?;
+            let rect = WICRect { X: x as i32, Y: y as i32, Width: w as i32, Height: h as i32 };
+            clip.Initialize(&self.bmp, &rect).map_err(es)?;
+            let bmp = f.CreateBitmapFromSource(&clip, WICBitmapCacheOnLoad).map_err(es)?;
+            Ok(Native { bmp, carry: self.carry.clone() })
+        }
+    }
+    fn to_bmp(&self) -> std::result::Result<Bmp, String> {
+        unsafe {
+            let (w, h) = self.size();
+            let conv = WICConvertBitmapSource(&GUID_WICPixelFormat32bppBGRA, &self.bmp).map_err(es)?;
+            let mut px = vec![0u8; (w * h * 4) as usize];
+            conv.CopyPixels(std::ptr::null(), w * 4, &mut px).map_err(es)?;
+            Ok(Bmp { w, h, px })
+        }
+    }
+}
+
+/// Saves at the picture's own depth, as far as the format allows. Output must not exist yet.
+pub fn save_native(n: &Native, out: &Path, o: &SaveOpts) -> std::result::Result<(), String> {
+    let ext = crate::catalog::ext_of(out);
+    let ext = ext.split('.').next_back().unwrap_or("").to_string();
+    let fmt = unsafe { n.bmp.GetPixelFormat() }.map_err(es)?;
+    let has_alpha_channel = layout(&fmt).is_some_and(|(_, a)| a.is_some());
+    // Transparency has to be flattened by hand, or converting away the channel reveals what was under it.
+    if matches!(ext.as_str(), "jpg" | "jpeg" | "bmp") && has_alpha_channel {
+        return save_carrying(&n.to_bmp()?, out, o, &n.carry);
+    }
+    let f = factory().map_err(es)?;
+    let src: IWICBitmapSource = n.bmp.cast().map_err(es)?;
+    match ext.as_str() {
+        "webp" | "avif" => {
+            let t = TempDir::new()?;
+            let png = t.file("in.png");
+            wic_encode(&f, &src, &png, "png", &SaveOpts::default(), &n.carry).map_err(es)?;
+            ffmpeg_still(&png, out, &ext, o)
+        }
+        "heic" | "heif" => wic_encode(&f, &src, out, &ext, o, &n.carry).map_err(|_| heic_error(out)),
+        _ => wic_encode(&f, &src, out, &ext, o, &n.carry).map_err(es),
+    }
+}
+
+/// EXIF orientation of a JPEG, 1 when it has none. Reads headers only.
+pub fn jpeg_orientation(b: &[u8]) -> u16 {
+    let mut i = 2;
+    while let (Some(0xFF), Some(&m)) = (b.get(i), b.get(i + 1)) {
+        if m == 0xDA || m == 0xD9 { break; }
+        let Some(len) = b.get(i + 2..i + 4).map(|l| u16::from_be_bytes([l[0], l[1]]) as usize) else { break };
+        if m == 0xE1 {
+            if let Some(o) = b.get(i + 4..i + 2 + len).and_then(exif_orientation_in) { return o; }
+        }
+        i += 2 + len;
+    }
+    1
 }
 
 pub fn write_rgba_png(rgba: &[u8], w: u32, h: u32, out: &Path) -> std::result::Result<(), String> {
     let mut px = rgba.to_vec();
     for p in px.chunks_exact_mut(4) { p.swap(0, 2); }
     let _ = std::fs::remove_file(out);
-    wic_save(&Bmp { w, h, px }, out, "png", &SaveOpts::default()).map_err(es)
+    wic_save(&Bmp { w, h, px }, out, "png", &SaveOpts::default(), &Carry::default()).map_err(es)
 }
 
 pub fn convert(job: &Job, input: &Path, target: &str) -> std::result::Result<PathBuf, String> {
-    let bmp = load(input)?;
+    let n = load_native(input)?;
     if job.cancelled() { return Err("Cancelled".into()); }
     job.set_frac(0.5);
     let out = sibling(input, "", target);
-    atomically(&out, |tmp| save(&bmp, tmp, &SaveOpts::default()))
+    atomically(&out, |tmp| save_native(&n, tmp, &SaveOpts::default()))
 }
 
 /// Removes metadata without touching the pixels. Returns None for anything it cannot walk safely.
@@ -329,8 +533,6 @@ mod tests {
     use super::*;
     #[test]
     fn color_parses() { assert_eq!(parse_color("#102030"), [0x30, 0x20, 0x10, 255]); }
-    #[test]
-    fn crop_clamps_to_bounds() { let b = Bmp::new(10, 10, [0, 0, 0, 255]); let c = b.crop(8, 8, 50, 50); assert_eq!((c.w, c.h), (2, 2)); }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::form::{self, choice, text, Field};
 use crate::image::{self, Bmp, SaveOpts};
 use crate::job::*;
 use crate::media::{self, s as sv};
+use crate::quality;
 use crate::timeline;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -273,7 +274,7 @@ fn only_if_smaller(j: &Job, input: &Path, res: Result<PathBuf, String>) -> Resul
 }
 
 pub fn quality_of(s: &str) -> f32 { match s { "Smaller file" => 0.6, "Higher quality" => 0.9, _ => 0.78 } }
-fn crf_of(s: &str) -> &'static str { match s { "Smaller file" => "30", "Higher quality" => "20", _ => "25" } }
+fn crf_of(s: &str) -> &'static str { match s { "Smaller file" => "28", "Higher quality" => "18", _ => "23" } }
 
 /// Output format for compression: opaque lossless formats become JPEG, since that is where the saving is.
 pub fn compress_ext(input_ext: &str, has_alpha: bool) -> String {
@@ -300,17 +301,19 @@ pub fn collage(imgs: &[Bmp], cols: usize, gap: u32, bg: [u8; 4]) -> Result<Bmp, 
     if imgs.is_empty() { return Err("No images".into()); }
     let cols = cols.clamp(1, imgs.len());
     let rows = imgs.len().div_ceil(cols);
-    let tile: u32 = 800;
-    let (tw, th) = (tile, tile * 3 / 4);
+    // Tiles fit the largest picture, so nothing is shrunk to make the sheet.
+    let sizes: Vec<(u32, u32)> = imgs.iter().map(|i| (i.w, i.h)).collect();
+    let (tw, th) = quality::collage_tile(&sizes, cols as u32, rows as u32, gap);
     let mut out = Bmp::new(cols as u32 * (tw + gap) + gap, rows as u32 * (th + gap) + gap, bg);
     for (i, im) in imgs.iter().enumerate() {
-        let f = (tw as f64 / im.w as f64).min(th as f64 / im.h as f64);
+        let f = (tw as f64 / im.w as f64).min(th as f64 / im.h as f64).min(1.0);
         let (nw, nh) = (((im.w as f64 * f) as u32).max(1), ((im.h as f64 * f) as u32).max(1));
-        let sc = im.scaled(nw, nh)?;
+        let scaled;
+        let sc = if (nw, nh) == (im.w, im.h) { im } else { scaled = im.scaled(nw, nh)?; &scaled };
         let (c, r) = ((i % cols) as u32, (i / cols) as u32);
         let x = gap + c * (tw + gap) + (tw - nw) / 2;
         let y = gap + r * (th + gap) + (th - nh) / 2;
-        out.blit(&sc, x as i32, y as i32);
+        out.blit(sc, x as i32, y as i32);
     }
     Ok(out)
 }
@@ -334,6 +337,7 @@ fn edit_filter(o: &Opts) -> Vec<String> {
     f
 }
 
+/// Tags to change. The streams themselves are copied by `quality::copy_attempts`.
 fn metadata_args(o: &Opts) -> Vec<String> {
     let mut a = vec![];
     if get(o, "strip", "0") == "1" { a.extend(sv(&["-map_metadata", "-1"])); }
@@ -341,18 +345,58 @@ fn metadata_args(o: &Opts) -> Vec<String> {
         let v = get(o, k, "").trim();
         if !v.is_empty() { a.push("-metadata".into()); a.push(format!("{k}={v}")); }
     }
-    a.extend(sv(&["-c", "copy"]));
     a
 }
 
-fn trim_args(cat: Cat, a: f64, b: f64, ext: &str) -> Vec<String> {
-    let mut v = sv(&["-ss", &format!("{a:.3}"), "-to", &format!("{b:.3}")]);
-    if cat == Cat::Video {
-        // Re-encoding cuts on the exact frame; stream copy could only cut at keyframes.
-        v.extend(sv(&["-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p"]));
-        if ext == "webm" { v = sv(&["-ss", &format!("{a:.3}"), "-to", &format!("{b:.3}"), "-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"]); }
+const NO_LOSSLESS: &str = "Could not read this video's format, so it cannot be edited without loss. Put ffprobe.exe next to ffmpeg.exe";
+
+fn tell(j: &Job, msg: String) { if j.total == 1 { *j.note.lock().unwrap() = Some(msg); } }
+
+/// An edit that must leave every other pixel as it is. A GIF has no lossless path through a filter, since its palette
+/// is rebuilt, but keeps as many colours per frame as the format holds.
+fn lossless_edit(j: &Job, p: &Path, suffix: &str, filter: Option<&str>, audio: Option<&str>, drop_timed: bool) -> Result<PathBuf, String> {
+    let e = ext_of(p);
+    if e == "gif" { return media::transform(j, p, suffix, None, quality::gif_edit_args(filter)); }
+    let l = quality::lossless_args(&media::probe(p), &e, filter, audio, drop_timed).ok_or(NO_LOSSLESS)?;
+    if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
+    media::transform(j, p, suffix, Some(&l.ext), l.args)
+}
+
+/// Cuts a range of video exactly. Copies the original bits when the range allows that, otherwise encodes losslessly.
+fn cut_video(j: &Job, p: &Path, a: f64, b: f64, out: impl Fn(&str) -> PathBuf) -> Result<PathBuf, String> {
+    let e = ext_of(p);
+    let seek = quality::seek_args(a, b);
+    let total = b - a;
+    if e == "gif" {
+        let o = out("gif");
+        return atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &quality::gif_edit_args(None), tmp, total));
     }
-    v
+    let pr = media::probe(p);
+    let fps = pr.video.as_ref().map(|v| v.fps).unwrap_or(0.0);
+    if quality::trim_can_copy(media::is_keyframe(p, a, fps), b, media::duration(p), fps) {
+        let o = out(&e);
+        for args in quality::copy_attempts(&[], &quality::trim_copy_tail()) {
+            match atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &args, tmp, total)) {
+                Ok(r) => return Ok(r),
+                Err(x) if j.cancelled() => return Err(x),
+                Err(_) => {}
+            }
+        }
+    }
+    let l = quality::lossless_args(&pr, &e, None, None, false).ok_or(NO_LOSSLESS)?;
+    if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
+    let o = out(&l.ext);
+    atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &l.args, tmp, total))
+}
+
+/// Two clips from the same encode join without touching a frame.
+fn join_by_copy(j: &Job, ps: &[PathBuf], total: f64) -> Option<PathBuf> {
+    let t = TempDir::new().ok()?;
+    let list = t.file("list.txt");
+    let names: Vec<String> = ps.iter().map(|p| p.display().to_string()).collect();
+    std::fs::write(&list, quality::concat_list(&names)).ok()?;
+    let out = sibling(&ps[0], " joined", &ext_of(&ps[0]));
+    atomically(&out, |tmp| media::ffmpeg_from(j, &sv(&["-f", "concat", "-safe", "0"]), &[list.as_path()], &sv(&["-map", "0", "-c", "copy", "-map_metadata", "0"]), tmp, total)).ok()
 }
 
 pub fn channels_filter(mode: &str) -> &'static str {
@@ -363,22 +407,6 @@ pub fn channels_filter(mode: &str) -> &'static str {
         "Right only" => "pan=mono|c0=c1",
         _ => "pan=mono|c0=0.5*c0+0.5*c1",
     }
-}
-
-pub fn join_filter(sizes: (u32, u32), audio: &[Option<f64>]) -> String {
-    let (w, h) = (sizes.0 & !1, sizes.1 & !1);
-    let mut f = String::new();
-    let mut tail = String::new();
-    for (i, a) in audio.iter().enumerate() {
-        f.push_str(&format!("[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{i}];"));
-        match a {
-            // A clip with no sound still needs a silent track of its own length, or concat fails.
-            Some(d) => f.push_str(&format!("anullsrc=r=48000:cl=stereo,atrim=duration={d:.3}[a{i}];")),
-            None => f.push_str(&format!("[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{i}];")),
-        }
-        tail.push_str(&format!("[v{i}][a{i}]"));
-    }
-    format!("{f}{tail}concat=n={}:v=1:a=1[v][a]", audio.len())
 }
 
 /// Runs a tool. Returns the job so callers can wait on it.
@@ -406,12 +434,14 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
                 j.set_frac(0.5);
                 return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|x| x.to_string()));
             }
-            // Decoding and saving again carries no metadata across.
-            let b = image::load(p)?;
-            save_new(&b, sibling(p, " clean", &e), &SaveOpts { quality: 0.95 })
+            // Decoding and saving again carries no metadata across, only the colour profile.
+            let n = image::load_native(p)?;
+            atomically(&out, |tmp| image::save_native(&n, tmp, &SaveOpts::default()))
         }),
         "img.edit" => each("Editing", paths, move |j, p| {
-            media::transform(j, p, " edited", None, vec!["-vf".into(), edit_filter(&o).join(","), "-frames:v".into(), "1".into(), "-update".into(), "1".into()])
+            let mut a = vec!["-vf".to_string(), edit_filter(&o).join(","), "-frames:v".to_string(), "1".to_string(), "-update".to_string(), "1".to_string()];
+            a.extend(quality::image_encode_args(&ext_of(p)));
+            media::transform(j, p, " edited", None, a)
         }),
         "img.background" => each("Adding background", paths, move |_, p| {
             let src = image::load(p)?;
@@ -421,23 +451,33 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         }),
         "img.crop" => each("Cropping", paths, move |_, p| {
             let sh = shapes.first().ok_or("Nothing selected to crop")?;
-            let b = image::load(p)?;
-            let (x, y, w, h) = crop_px(sh, b.w, b.h, false);
-            save_new(&b.crop(x, y, w, h), sibling(p, " cropped", &ext_of(p)), &SaveOpts::default())
+            let n = image::load_native(p)?;
+            let (fw, fh) = n.size();
+            let (x, y, w, h) = crop_px(sh, fw, fh, false);
+            let c = n.cropped(x, y, w, h)?;
+            let out = sibling(p, " cropped", &ext_of(p));
+            atomically(&out, |tmp| image::save_native(&c, tmp, &SaveOpts::default()))
         }),
-        "img.redact" => each("Redacting", paths, move |_, p| {
-            let mut b = image::load(p)?;
+        "img.redact" => each("Redacting", paths, move |j, p| {
+            let n = image::load_native(p)?;
+            let (fw, fh) = n.size();
             for sh in &shapes {
-                let (x, y, w, h) = crop_px(sh, b.w, b.h, false);
+                let (x, y, w, h) = crop_px(sh, fw, fh, false);
                 // Solid black, not blur: nothing remains to be recovered.
-                b.fill_rect(x as i32, y as i32, w as i32, h as i32, [0, 0, 0, 255]);
+                n.blacken(x, y, w, h)?;
             }
-            save_new(&b, sibling(p, " redacted", &ext_of(p)), &SaveOpts { quality: 0.95 })
+            // Saving a JPEG again would change every pixel, so anything lossy becomes PNG. Metadata does not
+            // carry over, and with it goes any embedded thumbnail of the unredacted picture.
+            let e = ext_of(p);
+            let keep = quality::lossless_image_ext(&e);
+            if keep != e { tell(j, format!("Saved as {} so nothing else changes", keep.to_ascii_uppercase())); }
+            let out = sibling(p, " redacted", keep);
+            atomically(&out, |tmp| image::save_native(&n, tmp, &SaveOpts::default()))
         }),
         "img.annotate" => each("Annotating", paths, move |_, p| {
             let mut b = image::load(p)?;
             canvas::apply_annotations(&mut b, &shapes)?;
-            save_new(&b, sibling(p, " annotated", &ext_of(p)), &SaveOpts { quality: 0.95 })
+            save_new(&b, sibling(p, " annotated", &ext_of(p)), &SaveOpts::default())
         }),
         "img.collage" => together("Creating collage", paths, move |j, ps| {
             let mut imgs = vec![];
@@ -453,48 +493,68 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         }),
 
         "vid.compress" => each("Compressing", paths, move |j, p| {
-            let mut a = sv(&["-c:v", "libx264", "-preset", "medium", "-crf", crf_of(get(&o, "quality", "")), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]);
-            let mut resized = false;
-            if let Ok(h) = get(&o, "height", "").parse::<u32>() {
-                a.push("-vf".into());
-                a.push(format!("scale=-2:'min({h},ih)'"));
-                resized = media::size(p).is_some_and(|(_, sh)| sh > h);
-            }
+            let pr = media::probe(p);
+            let h = get(&o, "height", "").parse::<u32>().ok();
+            let a = quality::compress_video_args(&pr, crf_of(get(&o, "quality", "")), h);
+            let resized = match (h, &pr.video) { (Some(h), Some(v)) => v.display_size().1 > h, _ => false };
             let res = media::transform(j, p, " compressed", Some("mp4"), a);
             if resized { res } else { only_if_smaller(j, p, res) }
         }),
-        "vid.metadata" | "aud.metadata" => each("Saving metadata", paths, move |j, p| media::transform(j, p, " edited", None, metadata_args(&o))),
-        "vid.mute" => each("Muting", paths, |j, p| media::transform(j, p, " muted", None, sv(&["-an", "-c:v", "copy"]))),
+        "vid.metadata" | "aud.metadata" => each("Saving metadata", paths, move |j, p| {
+            media::attempts(j, p, " edited", &ext_of(p), &quality::copy_attempts(&[], &metadata_args(&o)))
+        }),
+        "vid.mute" => each("Muting", paths, |j, p| {
+            let sets = [sv(&["-map", "0", "-map", "-0:a", "-c", "copy"]), sv(&["-map", "0:v", "-map", "0:s?", "-c", "copy"])];
+            media::attempts(j, p, " muted", &ext_of(p), &sets)
+        }),
         "vid.speed" => each("Changing speed", paths, move |j, p| {
             let f: f64 = get(&o, "speed", "2").parse().map_err(|_| "Bad speed")?;
             if f <= 0.0 { return Err("Bad speed".into()); }
-            let mut a = vec!["-vf".to_string(), format!("setpts=PTS/{f}")];
-            if media::has_audio(p) { a.push("-af".into()); a.push(media::atempo_chain(f)); } else { a.push("-an".into()); }
-            media::transform(j, p, &format!(" {f}x"), None, a)
+            // Every frame stays, however fast, and subtitles and chapters would no longer line up.
+            let filter = format!("setpts=PTS/{f}");
+            let tempo = media::atempo_chain(f);
+            lossless_edit(j, p, &format!(" {f}x"), Some(&filter), Some(&tempo), true)
         }),
         "vid.crop" => each("Cropping", paths, move |j, p| {
             let sh = shapes.first().ok_or("Nothing selected to crop")?;
             let (w, h) = media::size(p).ok_or("Could not read the video size")?;
             let (x, y, cw, ch) = crop_px(sh, w, h, true);
-            media::transform(j, p, " cropped", None, vec!["-vf".into(), format!("crop={cw}:{ch}:{x}:{y}"), "-c:a".into(), "copy".into()])
+            lossless_edit(j, p, " cropped", Some(&format!("crop={cw}:{ch}:{x}:{y}")), None, false)
         }),
         "vid.redact" => each("Redacting", paths, move |j, p| {
-            let (w, h) = media::size(p).ok_or("Could not read the video size")?;
-            let f: Vec<String> = shapes.iter().map(|sh| { let (x, y, cw, ch) = crop_px(sh, w, h, false); format!("drawbox=x={x}:y={y}:w={cw}:h={ch}:color=black:t=fill") }).collect();
-            if f.is_empty() { return Err("Nothing marked to redact".into()); }
-            media::transform(j, p, " redacted", None, vec!["-vf".into(), f.join(","), "-c:a".into(), "copy".into()])
+            if shapes.is_empty() { return Err("Nothing marked to redact".into()); }
+            if ext_of(p) == "gif" {
+                // In place, so palettes, timing and everything outside the boxes stay as they are.
+                let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+                let (w, h) = crate::gif::screen_size(&bytes).ok_or("Could not read this GIF")?;
+                let boxes: Vec<_> = shapes.iter().map(|sh| crop_px(sh, w, h, false)).collect();
+                let clean = crate::gif::redact(&bytes, &boxes)?;
+                let out = sibling(p, " redacted", "gif");
+                return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|e| e.to_string()));
+            }
+            let pr = media::probe(p);
+            let v = pr.video.as_ref().ok_or(NO_LOSSLESS)?;
+            let (w, h) = v.display_size();
+            let boxes: Vec<_> = shapes.iter().map(|sh| { let (x, y, cw, ch) = crop_px(sh, w, h, false); quality::redact_box(x, y, cw, ch, w, h) }).collect();
+            let f = quality::redact_filter(&v.pix_fmt, v.full_range, &boxes).ok_or(NO_LOSSLESS)?;
+            let e = ext_of(p);
+            let l = quality::redact_args(&pr, &e, &f).ok_or(NO_LOSSLESS)?;
+            if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
+            media::transform(j, p, " redacted", Some(&l.ext), l.args)
         }),
         "vid.trim" | "aud.trim" => each("Trimming", paths, move |j, p| {
             let (a, b) = match marks[..] { [a, b, ..] => (a, b), _ => return Err("Needs a start and an end".into()) };
-            let e = ext_of(p);
-            let out = sibling(p, " trimmed", &e);
-            let args = trim_args(classify(p), a, b, &e);
-            atomically(&out, |tmp| media::ffmpeg(j, &[p], &args, tmp, b))
+            if classify(p) == Cat::Audio {
+                let e = ext_of(p);
+                let out = sibling(p, " trimmed", &e);
+                let args = quality::audio_trim_args(&media::probe(p), &e);
+                return atomically(&out, |tmp| media::ffmpeg_from(j, &quality::seek_args(a, b), &[p], &args, tmp, b - a));
+            }
+            cut_video(j, p, a, b, |e| sibling(p, " trimmed", e))
         }),
         "vid.split" => each("Splitting", paths, move |j, p| {
             let dur = media::duration(p);
             let dir = sibling_dir(p, " parts")?;
-            let e = ext_of(p);
             let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
             let mut cuts = vec![0.0];
             cuts.extend(marks.iter().copied().filter(|m| *m > 0.0 && *m < dur));
@@ -502,8 +562,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             for (i, w) in cuts.windows(2).enumerate() {
                 if j.cancelled() { return Err("Cancelled".into()); }
                 j.set_frac(i as f32 / (cuts.len() - 1) as f32);
-                let out = dir.join(format!("{stem} part {}.{e}", i + 1));
-                media::ffmpeg(j, &[p], &trim_args(Cat::Video, w[0], w[1], &e), &out, 0.0)?;
+                cut_video(j, p, w[0], w[1], |e| dir.join(format!("{stem} part {}.{e}", i + 1)))?;
             }
             Ok(dir)
         }),
@@ -514,17 +573,26 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             for (i, t) in marks.iter().enumerate() {
                 j.set_frac(i as f32 / marks.len() as f32);
                 last = match &dir { Some(d) => d.join(format!("frame-{:03}.png", i + 1)), None => sibling(p, " snapshot", "png") };
-                run(Some(j), &ff, &sv(&["-y", "-hide_banner", "-ss", &format!("{t:.3}"), "-i", &p.display().to_string(), "-frames:v", "1", &last.display().to_string()]), None)?;
+                run(Some(j), &ff, &sv(&["-y", "-hide_banner", "-ss", &format!("{t:.3}"), "-i", &p.display().to_string(), "-frames:v", "1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", &last.display().to_string()]), None)?;
             }
             Ok(dir.unwrap_or(last))
         }),
         "vid.join" => together("Joining videos", paths, |j, ps| {
-            let sz = media::size(&ps[0]).ok_or("Could not read the video size")?;
-            let audio: Vec<Option<f64>> = ps.iter().map(|p| if media::has_audio(p) { None } else { Some(media::duration(p)) }).collect();
+            let probes: Vec<quality::Probe> = ps.iter().map(|p| media::probe(p)).collect();
+            let exts: Vec<String> = ps.iter().map(|p| ext_of(p)).collect();
             let total: f64 = ps.iter().map(|p| media::duration(p)).sum();
+            if quality::can_concat_copy(&probes, &exts) {
+                if let Some(done) = join_by_copy(j, ps, total) { return Ok(done); }
+                if j.cancelled() { return Err("Cancelled".into()); }
+            }
+            // Otherwise the richest clip sets the format, so nothing is shrunk, slowed or flattened to match the first.
+            let spec = quality::join_spec(&probes);
+            let silent: Vec<Option<f64>> = ps.iter().zip(&probes).map(|(p, pr)| if pr.audio.is_empty() { Some(media::duration(p)) } else { None }).collect();
+            let (ext, tail) = quality::join_output_args(&spec, &probes);
+            let mut a = vec!["-filter_complex".to_string(), quality::join_filter(&spec, &silent)];
+            a.extend(tail);
             let inputs: Vec<&Path> = ps.iter().map(PathBuf::as_path).collect();
-            let a = vec!["-filter_complex".into(), join_filter(sz, &audio), "-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-c:v".into(), "libx264".into(), "-crf".into(), "20".into(), "-c:a".into(), "aac".into()];
-            let out = sibling(&ps[0], " joined", "mp4");
+            let out = sibling(&ps[0], " joined", &ext);
             atomically(&out, |tmp| media::ffmpeg(j, &inputs, &a, tmp, total))
         }),
 
@@ -532,16 +600,25 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let ext = match ext_of(p).as_str() { e @ ("mp3" | "m4a" | "ogg" | "opus" | "aac" | "wma") => e.to_string(), _ => "mp3".to_string() };
             only_if_smaller(j, p, media::transform(j, p, " compressed", Some(&ext), vec!["-vn".into(), "-b:a".into(), format!("{}k", get(&o, "bitrate", "128"))]))
         }),
-        "aud.normalize" => each("Normalizing", paths, |j, p| media::transform(j, p, " normalized", None, sv(&["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]))),
+        "aud.normalize" => each("Normalizing", paths, |j, p| {
+            media::transform(j, p, " normalized", None, quality::audio_edit_args(&media::probe(p), &ext_of(p), "loudnorm=I=-16:TP=-1.5:LRA=11"))
+        }),
         "aud.visualize" => each("Rendering video", paths, |j, p| {
-            let a = sv(&["-filter_complex", "[0:a]showwaves=s=1280x720:mode=cline:rate=30:colors=0xC8F135,format=yuv420p[v]", "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest"]);
+            let mut a = sv(&["-filter_complex", "[0:a]showwaves=s=1280x720:mode=cline:rate=30:colors=0xC8F135,format=yuv420p[v]", "-map", "[v]", "-c:v", "libx264", "-preset", "slow", "-crf", quality::CONVERT_X264_CRF, "-shortest"]);
+            a.extend(quality::audio_target_args(&media::probe(p), "mp4", false));
             media::transform(j, p, " visualized", Some("mp4"), a)
         }),
-        "aud.channels" => each("Changing channels", paths, move |j, p| media::transform(j, p, " channels", None, vec!["-af".into(), channels_filter(get(&o, "mode", "Mono")).into()])),
+        "aud.channels" => each("Changing channels", paths, move |j, p| {
+            media::transform(j, p, " channels", None, quality::audio_edit_args(&media::probe(p), &ext_of(p), channels_filter(get(&o, "mode", "Mono"))))
+        }),
         "aud.bleep" => each("Bleeping", paths, move |j, p| {
             let ranges: Vec<(f64, f64)> = marks.chunks_exact(2).map(|c| (c[0], c[1])).collect();
             if ranges.is_empty() { return Err("Mark at least one range".into()); }
-            media::transform(j, p, " bleeped", None, vec!["-filter_complex".into(), media::bleep_filter(&ranges), "-map".into(), "[out]".into()])
+            let pr = media::probe(p);
+            let rate = pr.audio.first().map(|a| a.rate).filter(|r| *r > 0).unwrap_or(48000);
+            let mut a = vec!["-filter_complex".to_string(), media::bleep_filter(&ranges, rate), "-map".to_string(), "[out]".to_string()];
+            a.extend(quality::audio_graph_args(&pr, &ext_of(p)));
+            media::transform(j, p, " bleeped", None, a)
         }),
 
         "pdf.compress" => each("Compressing", paths, move |j, p| only_if_smaller(j, p, crate::pdf::compress(j, p, get(&o, "dpi", "").parse().ok()))),
@@ -595,14 +672,9 @@ mod tests {
         let imgs = vec![Bmp::new(100, 50, [0, 0, 255, 255]), Bmp::new(50, 100, [0, 255, 0, 255]), Bmp::new(10, 10, [255, 0, 0, 255])];
         crate::job::com_init();
         let c = collage(&imgs, 2, 10, [255, 255, 255, 255]).unwrap();
-        assert_eq!(c.w, 2 * 810 + 10);
-        assert_eq!(c.h, 2 * 610 + 10);
+        assert_eq!(c.w, 2 * 110 + 10, "tiles fit the largest picture");
+        assert_eq!(c.h, 2 * 110 + 10);
     }
     #[test]
     fn columns_are_square_ish() { assert_eq!(auto_columns(4), 2); assert_eq!(auto_columns(5), 3); }
-    #[test]
-    fn join_fills_silence_for_clips_without_sound() {
-        let f = join_filter((1280, 720), &[None, Some(2.5)]);
-        assert!(f.contains("[0:a]aformat") && f.contains("anullsrc") && f.contains("duration=2.500") && f.ends_with("concat=n=2:v=1:a=1[v][a]"));
-    }
 }
