@@ -158,7 +158,6 @@ fn wic_encode(f: &IWICImagingFactory, src: &IWICBitmapSource, out: &Path, ext: &
             "tif" | "tiff" => GUID_ContainerFormatTiff,
             "bmp" => GUID_ContainerFormatBmp,
             "gif" => GUID_ContainerFormatGif,
-            "heic" | "heif" => GUID_ContainerFormatHeif,
             _ => return Err(Error::new(windows::Win32::Foundation::E_INVALIDARG, "format")),
         };
         let stream = f.CreateStream()?;
@@ -171,7 +170,7 @@ fn wic_encode(f: &IWICImagingFactory, src: &IWICBitmapSource, out: &Path, ext: &
         let frame = frame.unwrap();
         if let Some(b) = bag.clone() {
             let b = IPropertyBag2Wrap(b);
-            if matches!(ext, "jpg" | "jpeg" | "heic" | "heif") { property(&b, w!("ImageQuality"), o.quality); }
+            if matches!(ext, "jpg" | "jpeg") { property(&b, w!("ImageQuality"), o.quality); }
             // WIC halves JPEG colour resolution unless told otherwise. Only the smallest compress setting wants that.
             if matches!(ext, "jpg" | "jpeg") && o.quality >= 0.7 { b.write(w!("JpegYCrCbSubsampling"), VARIANT::from(WICJpegYCrCbSubsampling444.0 as u8)); }
         }
@@ -235,10 +234,49 @@ fn ffmpeg_still(png: &Path, out: &Path, ext: &str, o: &SaveOpts) -> std::result:
     last
 }
 
-fn heic_error(out: &Path) -> String {
-    let _ = std::fs::remove_file(out);
-    "HEIC output needs the HEIF Image and HEVC Video Extensions from the Microsoft Store".to_string()
+/// HEIC through ffmpeg's x265, so that it needs nothing from the Store. A lossy source takes the best setting that does
+/// not outgrow it, as with WebP and AVIF.
+fn save_heic(b: &Bmp, out: &Path, o: &SaveOpts, carry: &Carry) -> std::result::Result<(), String> {
+    let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
+    let t = TempDir::new()?;
+    let png = t.file("in.png");
+    wic_save(b, &png, "png", &SaveOpts::default(), &Carry::default()).map_err(es)?;
+    let size = crate::heif::size_for(b.w, b.h);
+    let icc = carry.color.as_ref().and_then(profile_bytes);
+    let encode = |crf: u32, alpha: bool| -> std::result::Result<crate::heif::Stream, String> {
+        let f = t.file(if alpha { "a.hevc" } else { "p.hevc" });
+        let path = f.display().to_string();
+        let args = if alpha { crate::heif::alpha_args(size, crf, &path) } else { crate::heif::picture_args(size, crf, &path) };
+        let mut a: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-i".into(), png.display().to_string()];
+        a.extend(args);
+        run(None, &ff, &a, None).map_err(|e| if e.contains("libx265") { "This ffmpeg has no HEVC encoder (libx265), which HEIC needs".to_string() } else { e })?;
+        crate::heif::parse_stream(&std::fs::read(&f).map_err(es_io)?)
+    };
+    // Transparency has only flat edges to store, and softening them shows, so it stays near the top of the scale.
+    let alpha = if b.has_alpha() { Some(encode(10, true)?) } else { None };
+    let top = 12 + ((1.0 - o.quality.clamp(0.0, 1.0)) * 30.0) as u32;
+    let ladder: Vec<u32> = if o.fit.is_some() { vec![14, 18, 22, 26, 30] } else { vec![top] };
+    let mut file = vec![];
+    for crf in ladder {
+        file = crate::heif::mux(&encode(crf, false)?, alpha.as_ref(), size, icc.as_deref())?;
+        if o.fit.is_none_or(|limit| file.len() as u64 <= limit) { break; }
+    }
+    std::fs::write(out, file).map_err(es_io)
 }
+
+/// The bytes of a colour profile that came from a file, rather than one Windows knows by name.
+fn profile_bytes(c: &IWICColorContext) -> Option<Vec<u8>> {
+    unsafe {
+        if c.GetType().ok()? != WICColorContextProfile { return None; }
+        let mut n = 0;
+        c.GetProfileBytes(&mut [], &mut n).ok()?;
+        let mut b = vec![0u8; n as usize];
+        c.GetProfileBytes(&mut b, &mut n).ok()?;
+        (!b.is_empty()).then_some(b)
+    }
+}
+
+fn es_io(e: std::io::Error) -> String { e.to_string() }
 
 fn save_carrying(b: &Bmp, out: &Path, o: &SaveOpts, carry: &Carry) -> std::result::Result<(), String> {
     let ext = crate::catalog::ext_of(out);
@@ -252,7 +290,7 @@ fn save_carrying(b: &Bmp, out: &Path, o: &SaveOpts, carry: &Carry) -> std::resul
             wic_save(b, &png, "png", &SaveOpts::default(), carry).map_err(es)?;
             ffmpeg_still(&png, out, &ext, o)
         }
-        "heic" | "heif" => wic_save(b, out, &ext, o, carry).map_err(|_| heic_error(out)),
+        "heic" | "heif" => save_heic(b, out, o, carry),
         _ => wic_save(b, out, &ext, o, carry).map_err(es),
     }
 }
@@ -434,7 +472,7 @@ pub fn save_native(n: &Native, out: &Path, o: &SaveOpts) -> std::result::Result<
             wic_encode(&f, &src, &png, "png", &SaveOpts::default(), &n.carry).map_err(es)?;
             ffmpeg_still(&png, out, &ext, o)
         }
-        "heic" | "heif" => wic_encode(&f, &src, out, &ext, o, &n.carry).map_err(|_| heic_error(out)),
+        "heic" | "heif" => save_heic(&n.to_bmp()?, out, o, &n.carry),
         _ => wic_encode(&f, &src, out, &ext, o, &n.carry).map_err(es),
     }
 }

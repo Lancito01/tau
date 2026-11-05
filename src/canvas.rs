@@ -3,7 +3,7 @@
 use crate::form;
 use crate::gfx::{cursor_pos, dpi_scale_at, wide, work_area_at, ACCENT, BORDER, MUTED, ON_ACCENT, RAISED, SURFACE, TEXT};
 use crate::image::Bmp;
-use crate::timeline::fmt_time;
+use crate::timeline::{snap, timecode};
 use crate::ui::{self, glyph, id, r, Align, Page, Style, Ui, FOOT_H, PAD, R, TITLE_H};
 use std::sync::{Arc, Mutex};
 use windows::core::*;
@@ -293,11 +293,16 @@ const SCRUB_H: f32 = 56.0;
 const ROW: f32 = 46.0;
 const GRAB: f32 = 10.0;
 const PREVIEW_MAX: u32 = 2400;
+/// Redacting repaints the picture as marks move, so it works on a copy no bigger than a window can show.
+const REDACT_PREVIEW_MAX: u32 = 1600;
+/// What a selected redaction's row adds for its own settings.
+const ROW_FEATHER: f32 = 48.0;
 const STAGE_BG: u32 = 0x0A0B0C;
 
 /// Lets the video editors fetch other frames while the window is open.
 pub struct FrameSource {
     pub dur: f64,
+    pub fps: f64,
     pub load: Arc<dyn Fn(f64) -> std::result::Result<Bmp, String> + Send + Sync>,
 }
 
@@ -345,17 +350,23 @@ struct Editor {
     /// The picture with the redactions painted in, by the code that paints the saved file.
     shown: Bmp,
     shown_for: Option<Vec<Shape>>,
+    shown_marks: Vec<crate::redact::Mark>,
+    /// Where changed areas are painted before being copied into `shown`, kept to avoid a large allocation per change.
+    scratch: Vec<u8>,
     shown_gen: u64,
+    /// The selection the list last scrolled to.
+    list_sel: Option<usize>,
     aspect: usize,
     scrub: Option<Scrub>,
     start_size: (f32, f32),
     result: Option<bool>,
 }
 
-fn shrink(b: Bmp) -> Bmp {
+fn shrink(b: Bmp, mode: Mode) -> Bmp {
     let long = b.w.max(b.h);
-    if long <= PREVIEW_MAX { return b; }
-    let f = PREVIEW_MAX as f64 / long as f64;
+    let max = if mode == Mode::Redact { REDACT_PREVIEW_MAX } else { PREVIEW_MAX };
+    if long <= max { return b; }
+    let f = max as f64 / long as f64;
     let (w, h) = (((b.w as f64 * f) as u32).max(1), ((b.h as f64 * f) as u32).max(1));
     match b.scaled(w, h) { Ok(s) => s, Err(_) => b }
 }
@@ -368,7 +379,7 @@ fn size_label(s: &Shape, full: (u32, u32)) -> String {
 impl Editor {
     fn new(title: &str, bmp: Bmp, mode: Mode, initial: Vec<Shape>, ok: &str, scrub: Option<FrameSource>) -> Editor {
         let full = (bmp.w, bmp.h);
-        let preview = shrink(bmp);
+        let preview = shrink(bmp, mode);
         let mut items: Vec<Item> = initial.into_iter().map(|shape| Item { shape, detected: true }).collect();
         let mut sel = None;
         if mode == Mode::Crop {
@@ -384,7 +395,7 @@ impl Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
             pen: if mode == Mode::Redact { 0 } else { COLORS[0] }, fx: Fx::default(), oval: false, aspect: 0,
-            pending_text: None, pending_color: false, slider_open: false, shown: preview, shown_for: None, shown_gen: 0, scrub, start_size, result: None,
+            pending_text: None, pending_color: false, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, start_size, result: None,
         }
     }
 
@@ -574,20 +585,34 @@ impl Editor {
         }
     }
 
-    /// Paints the redactions into the preview with the same code as the saved file. A blur waits for the mouse button,
-    /// since it is too slow to redo for every pixel of a drag; the outline follows meanwhile.
+    /// Paints the redactions into the preview with the same code as the saved file, redoing only the part that changed.
+    /// A mark being drawn shows as it grows. A blur waits for the mouse button, since it is too slow to redo for every
+    /// pixel of a drag; the outline follows meanwhile.
     fn refresh_shown(&mut self, ui: &mut Ui) {
-        let now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).collect();
+        use crate::redact::{apply, apply_within, change_between, Layout};
+        let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).collect();
+        if let Some(Drag::New(s)) = &self.drag { if !s.fx.blur { now.push(s.clone()); } }
         if self.shown_for.as_ref() == Some(&now) { return; }
-        if ui.down && self.shown_for.is_some() && now.iter().any(|s| s.fx.blur) { return; }
-        let mut b = self.preview.clone();
-        let marks = marks_for(&now, b.w, b.h, false);
-        let l = crate::redact::Layout { w: b.w, h: b.h, stride: b.w as usize * 4, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
-        crate::redact::apply(&mut b.px, &l, &marks);
-        ui.forget_image(id(&format!("ed.shown{}", self.shown_gen)));
-        self.shown_gen += 1;
-        self.shown = b;
+        let (w, h) = (self.preview.w, self.preview.h);
+        let marks = marks_for(&now, w, h, false);
+        let l = Layout { w, h, stride: w as usize * 4, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
+        if self.shown_for.is_none() {
+            let mut b = self.preview.clone();
+            apply(&mut b.px, &l, &marks);
+            ui.forget_image(id(&format!("ed.shown{}", self.shown_gen)));
+            self.shown_gen += 1;
+            self.shown = b;
+        } else if let Some(c) = change_between(&self.shown_marks, &marks, w, h) {
+            if ui.down && c.blur { return; }
+            if self.scratch.len() != self.preview.px.len() { self.scratch = self.preview.px.clone(); }
+            let row = |y: u32, a: (u32, u32, u32, u32)| (y as usize * w as usize + a.0 as usize) * 4..(y as usize * w as usize + a.2 as usize) * 4;
+            for y in c.work.1..c.work.3 { self.scratch[row(y, c.work)].copy_from_slice(&self.preview.px[row(y, c.work)]); }
+            apply_within(&mut self.scratch, &l, &marks, c.work);
+            for y in c.shown.1..c.shown.3 { self.shown.px[row(y, c.shown)].copy_from_slice(&self.scratch[row(y, c.shown)]); }
+            ui.update_image(id(&format!("ed.shown{}", self.shown_gen)), &self.shown, c.shown);
+        }
         self.shown_for = Some(now);
+        self.shown_marks = marks;
     }
 
     fn paint_shape(&self, ui: &mut Ui, s: &Shape, v: R, thick: f32, selected: bool, lit: bool) {
@@ -804,12 +829,6 @@ impl Editor {
             y += 38.0;
         }
 
-        let mut v = fx.feather;
-        ui.text("Feather", r(x, y, w - 50.0, 18.0), 12.5, 500, MUTED, Align::Left);
-        ui.text(&format!("{}", v as i32), r(x + w - 50.0, y, 50.0, 18.0), 12.5, 600, MUTED, Align::Right);
-        ui.slider("ed.feather", r(x - 9.0, y + 18.0, w + 18.0, 28.0), 0.0, 100.0, 0.0, &mut v);
-        if v != fx.feather { self.restyle(|f| f.feather = v); }
-        y += 50.0;
         if !ui.down { self.slider_open = false; }
 
         if fx.blur {
@@ -835,19 +854,32 @@ impl Editor {
             ui.wrapped(msg, r(q.x + PAD, q.y + 4.0, q.w - PAD * 2.0, 60.0), 12.5, 400, MUTED);
             return;
         }
-        let off = ui.scroll_area("ed.list", q, self.items.len() as f32 * ROW);
+        // The selected redaction's row opens to hold the settings that belong to that mark alone.
+        let redact = self.mode == Mode::Redact;
+        let extra = move |sel: Option<usize>, i: usize| if redact && sel == Some(i) { ROW_FEATHER } else { 0.0 };
+        let top_of = move |sel: Option<usize>, i: usize| (0..i).map(|n| ROW + extra(sel, n)).sum::<f32>();
+        let content = top_of(self.sel, self.items.len());
+        if self.sel != self.list_sel {
+            self.list_sel = self.sel;
+            if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
+                let top = top_of(self.sel, i);
+                ui.scroll_into_view("ed.list", q.h, top, top + ROW + extra(self.sel, i));
+            }
+        }
+        let off = ui.scroll_area("ed.list", q, content);
         let real = ui.mouse;
         if !q.has(real) { ui.mouse = (-1000.0, -1000.0); }
         let mut remove = None;
         for i in 0..self.items.len() {
-            let row = r(q.x + 10.0, q.y + i as f32 * ROW - off, q.w - 20.0, ROW - 4.0);
+            let row = r(q.x + 10.0, q.y + top_of(self.sel, i) - off, q.w - 20.0, ROW - 4.0 + extra(self.sel, i));
             let hovered = row.has(ui.mouse);
             let x_q = r(row.right() - 32.0, row.y + 8.0, 26.0, 26.0);
             if hovered {
                 self.hover_row = Some(i);
                 if ui.icon_button(&format!("ed.x{i}"), glyph::CLOSE, x_q, 9.0, false) { remove = Some(i); }
             }
-            let (_, _, clicked) = ui.hit(id(&format!("ed.row{i}")), row);
+            // Only the top of an open row selects, or its slider would have to fight for the press.
+            let (_, _, clicked) = ui.hit(id(&format!("ed.row{i}")), r(row.x, row.y, row.w, ROW - 4.0));
             if clicked { self.sel = Some(i); }
             let selected = self.sel == Some(i);
             let t = ui.anim(id(&format!("ed.hv{i}")), if hovered { 1.0 } else { 0.0 }, 22.0);
@@ -880,10 +912,22 @@ impl Editor {
             }
             let tw = row.w - 40.0 - 36.0;
             if detail.is_empty() {
-                ui.text(&name, r(row.x + 38.0, row.y, tw, row.h), 12.5, 500, TEXT, Align::Left);
+                ui.text(&name, r(row.x + 38.0, row.y, tw, ROW - 4.0), 12.5, 500, TEXT, Align::Left);
             } else {
                 ui.text(&name, r(row.x + 38.0, row.y + 4.0, tw, 18.0), 12.5, 500, TEXT, Align::Left);
                 ui.text(&detail, r(row.x + 38.0, row.y + 21.0, tw, 16.0), 11.0, 400, MUTED, Align::Left);
+            }
+            if extra(self.sel, i) > 0.0 {
+                let was = self.items[i].shape.fx.feather;
+                let mut v = was;
+                let (fx, fw, fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
+                ui.text("Feather", r(fx, fy, fw - 50.0, 18.0), 12.0, 500, MUTED, Align::Left);
+                ui.text(&format!("{}", v as i32), r(fx + fw - 50.0, fy, 50.0, 18.0), 12.0, 600, MUTED, Align::Right);
+                ui.slider(&format!("ed.feather{i}"), r(fx - 9.0, fy + 16.0, fw + 18.0, 28.0), 0.0, 100.0, 0.0, &mut v);
+                if v != was {
+                    if !self.slider_open { self.checkpoint(); self.slider_open = true; }
+                    self.items[i].shape.fx.feather = v;
+                }
             }
         }
         ui.mouse = real;
@@ -897,22 +941,23 @@ impl Editor {
         let Some(sc) = self.scrub.as_mut() else { return };
         ui.fill(q, 0.0, SURFACE, 0.6);
         ui.fill(r(q.x, q.y, q.w, 1.0), 0.0, BORDER, 0.7);
+        let fps = sc.source.fps;
         let t = (sc.pos / 1000.0) as f64 * sc.source.dur;
         ui.slider("ed.scrub", r(q.x + PAD - 9.0, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0, 28.0), 0.0, 1000.0, 0.0, &mut sc.pos);
-        let label = format!("{} / {}", fmt_time(t), fmt_time(sc.source.dur));
+        let label = format!("{} / {}", timecode(t, fps), timecode(sc.source.dur, fps));
         ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
 
         if let Some(res) = sc.slot.lock().unwrap().take() {
             sc.loading = false;
             match res {
-                Ok(b) => { sc.error = None; self.preview = shrink(b); self.shown_for = None; ui.forget_image(id("ed.image")); }
+                Ok(b) => { sc.error = None; self.preview = shrink(b, self.mode); self.shown_for = None; ui.forget_image(id("ed.image")); }
                 Err(e) => sc.error = Some(e),
             }
         }
         if !sc.loading && sc.pos != sc.requested {
             sc.requested = sc.pos;
             sc.loading = true;
-            let (load, slot, at) = (sc.source.load.clone(), sc.slot.clone(), (sc.pos / 1000.0) as f64 * sc.source.dur);
+            let (load, slot, at) = (sc.source.load.clone(), sc.slot.clone(), snap((sc.pos / 1000.0) as f64 * sc.source.dur, fps));
             std::thread::spawn(move || {
                 crate::job::com_init();
                 let res = load(at);
@@ -1025,7 +1070,7 @@ pub fn render(mode: Mode, bmp: Bmp, shapes: Vec<Shape>, sel: usize, video: Optio
         (Mode::Redact, true) => "Redact video",
         (Mode::Annotate, _) => "Annotate",
     };
-    let source = video.map(|dur| FrameSource { dur, load: Arc::new(|_| Err(String::new())) });
+    let source = video.map(|dur| FrameSource { dur, fps: 30.0, load: Arc::new(|_| Err(String::new())) });
     let mut e = Editor::new(title, bmp, mode, shapes, title, source);
     e.sub = "holiday.jpg".into();
     e.start_size = (1180.0, 720.0);

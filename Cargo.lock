@@ -546,7 +546,6 @@ dependencies = [
  "lopdf",
  "pulldown-cmark",
  "windows",
- "windows-collections",
  "windows-core",
  "windows-future",
  "windows-numerics",

@@ -92,9 +92,64 @@ fn blur(src: &[f32], w: usize, h: usize, k: &[f32]) -> Vec<f32> {
 
 /// Paints the marks in order. A sample is only written where a mark covers it, so the rest stay bit for bit.
 pub fn apply(buf: &mut [u8], l: &Layout, marks: &[Mark]) {
+    apply_within(buf, l, marks, (0, 0, l.w, l.h));
+}
+
+/// A part of a picture as x0, y0, x1, y1.
+pub type Area = (u32, u32, u32, u32);
+
+fn blur_pad(sigma: f64) -> u32 { (sigma.max(0.5) * 3.0).ceil() as u32 }
+
+fn grown(a: Area, by: u32, w: u32, h: u32) -> Area {
+    (a.0.saturating_sub(by), a.1.saturating_sub(by), (a.2 + by).min(w), (a.3 + by).min(h))
+}
+
+fn overlap(a: Area, b: Area) -> Option<Area> {
+    let o = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
+    (o.0 < o.2 && o.1 < o.3).then_some(o)
+}
+
+/// What going from one list of marks to another means for a painted picture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Change {
+    /// The only pixels whose final value can differ.
+    pub shown: Area,
+    /// What has to be painted again to get `shown` exactly right, since a blur reads what lies around it.
+    pub work: Area,
+    /// A blur is part of it, which is slow.
+    pub blur: bool,
+}
+
+/// `None` when the two lists paint the same picture.
+pub fn change_between(old: &[Mark], new: &[Mark], w: u32, h: u32) -> Option<Change> {
+    let mut shown: Option<Area> = None;
+    for i in 0..old.len().max(new.len()) {
+        if old.get(i) == new.get(i) { continue; }
+        for m in [old.get(i), new.get(i)].into_iter().flatten() {
+            let a = m.reach(w, h);
+            shown = Some(shown.map_or(a, |s| (s.0.min(a.0), s.1.min(a.1), s.2.max(a.2), s.3.max(a.3))));
+        }
+    }
+    let mut shown = shown?;
+    let (mut margin, mut blur) = (0, false);
+    // A blur spreads a change by its own radius, and each later one spreads that again.
+    for m in new {
+        let Fill::Blur(sigma) = m.fill else { continue };
+        let pad = blur_pad(sigma);
+        if let Some(o) = overlap(grown(shown, pad, w, h), m.reach(w, h)) {
+            shown = (shown.0.min(o.0), shown.1.min(o.1), shown.2.max(o.2), shown.3.max(o.3));
+            margin += pad;
+            blur = true;
+        }
+    }
+    Some(Change { shown, work: grown(shown, margin, w, h), blur })
+}
+
+/// The same, writing and reading only inside `clip`. Everything further than the blur radii from the edge of `clip` comes
+/// out exactly as painting the whole picture would.
+pub fn apply_within(buf: &mut [u8], l: &Layout, marks: &[Mark], clip: Area) {
     for m in marks {
-        let (x0, y0, x1, y1) = m.reach(l.w, l.h);
-        if x0 >= x1 || y0 >= y1 { continue; }
+        let Some((x0, y0, x1, y1)) = overlap(m.reach(l.w, l.h), clip) else { continue };
         match m.fill {
             Fill::Solid(rgb) => {
                 let scale = l.max() / 255.0;
@@ -118,8 +173,8 @@ pub fn apply(buf: &mut [u8], l: &Layout, marks: &[Mark]) {
             Fill::Blur(sigma) => {
                 // The blur gathers from past the mark, so nothing sharp can survive at its edge.
                 let sigma = sigma.max(0.5);
-                let pad = (sigma * 3.0).ceil() as u32;
-                let (rx0, ry0, rx1, ry1) = (x0.saturating_sub(pad), y0.saturating_sub(pad), (x1 + pad).min(l.w), (y1 + pad).min(l.h));
+                let pad = blur_pad(sigma);
+                let (rx0, ry0, rx1, ry1) = (x0.saturating_sub(pad).max(clip.0), y0.saturating_sub(pad).max(clip.1), (x1 + pad).min(clip.2), (y1 + pad).min(clip.3));
                 let (rw, rh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
                 let k = kernel(sigma);
                 for c in 0..l.channels {
@@ -143,6 +198,44 @@ pub fn apply(buf: &mut [u8], l: &Layout, marks: &[Mark]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painting_only_the_change_matches_painting_everything() {
+        let (w, h) = (160, 120);
+        let (base, l) = bgra(w, h);
+        let solid = |x, y, feather| Mark { x, y, w: 30, h: 24, ellipse: false, fill: Fill::Solid([200, 30, 40]), feather };
+        let soft = |x, y| Mark { x, y, w: 40, h: 30, ellipse: true, fill: Fill::Blur(4.0), feather: 3 };
+        let cases: Vec<(Vec<Mark>, Vec<Mark>)> = vec![
+            (vec![], vec![solid(10, 10, 0)]),
+            (vec![solid(10, 10, 0)], vec![solid(14, 12, 0)]),
+            (vec![solid(10, 10, 6), solid(80, 60, 0)], vec![solid(10, 10, 12), solid(80, 60, 0)]),
+            (vec![soft(30, 20), solid(60, 30, 0)], vec![soft(30, 20), solid(50, 34, 0)]),
+            (vec![solid(40, 30, 0), soft(30, 20)], vec![solid(44, 30, 0), soft(30, 20)]),
+            (vec![solid(40, 30, 0), soft(30, 20), soft(50, 30)], vec![solid(44, 30, 0), soft(30, 20), soft(50, 30)]),
+            (vec![solid(10, 10, 0), soft(90, 70)], vec![soft(90, 70)]),
+        ];
+        for (old, new) in cases {
+            let mut shown = base.clone();
+            apply(&mut shown, &l, &old);
+            let mut whole = base.clone();
+            apply(&mut whole, &l, &new);
+            let c = change_between(&old, &new, w, h).expect("these lists differ");
+            // A scratch copy with nothing painted in the work area, as the editor keeps one.
+            let mut scratch = base.clone();
+            apply_within(&mut scratch, &l, &new, c.work);
+            for y in c.shown.1..c.shown.3 {
+                for x in c.shown.0..c.shown.2 {
+                    let i = ((y * w + x) * 4) as usize;
+                    shown[i..i + 4].copy_from_slice(&scratch[i..i + 4]);
+                }
+            }
+            assert_eq!(shown, whole, "{old:?} to {new:?}");
+        }
+        assert_eq!(change_between(&[solid(1, 1, 0)], &[solid(1, 1, 0)], w, h), None);
+        let far = change_between(&[soft(100, 80)], &[soft(100, 80), solid(2, 2, 0)], w, h).unwrap();
+        assert!(!far.blur, "a blur nowhere near the change costs nothing");
+        assert!(change_between(&[soft(30, 20), solid(60, 30, 0)], &[soft(30, 20), solid(50, 34, 0)], w, h).unwrap().blur);
+    }
 
     fn bgra(w: u32, h: u32) -> (Vec<u8>, Layout) {
         let mut b = vec![0u8; (w * h * 4) as usize];

@@ -10,7 +10,6 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 windows-core = "0.62"
 windows-numerics = "0.3"
 windows-future = "0.3"
-windows-collections = "0.3"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
@@ -44,7 +43,6 @@ windows = { version = "0.62", features = [
   "Data_Pdf",
   "Foundation",
   "Foundation_Collections",
-  "ApplicationModel_DataTransfer",
   "Storage",
   "Storage_Search",
   "Storage_Streams",

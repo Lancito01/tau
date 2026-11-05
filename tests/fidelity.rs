@@ -50,6 +50,138 @@ fn ffs(args: &[&str]) -> Vec<u8> {
     let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     ff(&a).unwrap_or_else(|e| panic!("ffmpeg {args:?}: {e}"))
 }
+#[path = "../src/heif.rs"]
+mod heif;
+
+/// Encodes a PNG as a HEIC the way the app does.
+fn heic_from(d: &Dir, png: &Path, w: u32, h: u32, alpha: bool, name: &str) -> PathBuf {
+    let size = heif::size_for(w, h);
+    let stream = |args: Vec<String>, f: &str| {
+        let mut a = vec!["-i".to_string(), png.display().to_string()];
+        a.extend(args);
+        ff(&a).unwrap();
+        heif::parse_stream(&std::fs::read(f).unwrap()).unwrap()
+    };
+    let (pf, af) = (d.p(&format!("{name}.p.hevc")).display().to_string(), d.p(&format!("{name}.a.hevc")).display().to_string());
+    let picture = stream(heif::picture_args(size, 12, &pf), &pf);
+    let a = alpha.then(|| stream(heif::alpha_args(size, 10, &af), &af));
+    let out = d.p(&format!("{name}.heic"));
+    std::fs::write(&out, heif::mux(&picture, a.as_ref(), size, Some(b"not really a profile")).unwrap()).unwrap();
+    out
+}
+
+#[test]
+fn heic_decodes_to_the_same_picture_at_its_own_size() {
+    if !have_ffmpeg() || !has_encoder("libx265") { return; }
+    let d = Dir::new();
+    for (w, h) in [(640, 360), (641, 361), (5, 3)] {
+        let png = d.p(&format!("s{w}.png"));
+        ffs(&["-f", "lavfi", "-i", &format!("testsrc2=s={w}x{h}"), "-frames:v", "1", png.to_str().unwrap()]);
+        let heic = heic_from(&d, &png, w, h, false, &format!("s{w}"));
+        assert_eq!(field(&heic, "v:0", "stream=codec_name"), "hevc");
+        let back = d.p(&format!("b{w}.png"));
+        ffs(&["-i", heic.to_str().unwrap(), "-frames:v", "1", back.to_str().unwrap()]);
+        // ffmpeg's own crop stops at whole chroma samples, so an odd side reads one short here. Viewers crop exactly.
+        assert_eq!(field(&back, "v:0", "stream=width").parse::<u32>().unwrap(), w & !1, "{w}x{h}");
+        assert_eq!(field(&back, "v:0", "stream=height").parse::<u32>().unwrap(), h & !1, "{w}x{h}");
+        if w > 100 {
+            let q = psnr(&png, &back);
+            assert!(q > 34.0, "{w}x{h} came back at {q} dB");
+        }
+    }
+}
+
+#[test]
+fn heic_keeps_transparency_as_a_second_picture() {
+    if !have_ffmpeg() || !has_encoder("libx265") { return; }
+    let d = Dir::new();
+    let png = d.p("a.png");
+    ffs(&["-f", "lavfi", "-i", "color=red:s=64x64,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,32),255,0)'", "-frames:v", "1", png.to_str().unwrap()]);
+    let heic = heic_from(&d, &png, 64, 64, true, "a");
+    let bytes = std::fs::read(&heic).unwrap();
+    for kind in [&b"auxC"[..], b"auxl", b"urn:mpeg:hevc:2015:auxid:1"] { assert!(bytes.windows(kind.len()).any(|w| w == kind)); }
+    // The transparency item is its own stream, and reads back half full.
+    let back = d.p("alpha.png");
+    ffs(&["-i", heic.to_str().unwrap(), "-map", "0:v:1", "-frames:v", "1", back.to_str().unwrap()]);
+    let raw = ffs(&["-i", back.to_str().unwrap(), "-vf", "format=gray", "-f", "rawvideo", "pipe:1"]);
+    assert_eq!(raw.len(), 64 * 64);
+    assert!(raw[10 * 64 + 8] > 245 && raw[10 * 64 + 56] < 10, "{} {}", raw[10 * 64 + 8], raw[10 * 64 + 56]);
+}
+
+#[test]
+fn camcorder_footage_comes_out_whole_frames_at_the_right_shape() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    // An interlaced MPEG-2 file with non-square pixels and AC-3, as a tape camcorder writes one.
+    let src = d.p("MOV001.vob");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=720x480:r=60000/1001:d=1", "-f", "lavfi", "-i", "sine=d=1", "-vf", "setsar=8/9,tinterlace=interleave_top", "-c:v", "mpeg2video", "-flags", "+ildct+ilme", "-top", "1", "-b:v", "6M", "-c:a", "ac3", "-f", "vob", src.to_str().unwrap()]);
+    let info = probe(&src);
+    let v = info.video.clone().unwrap();
+    assert!(v.interlaced, "{v:?}");
+    assert!((v.pixel_aspect - 8.0 / 9.0).abs() < 0.001, "{v:?}");
+    assert_eq!(muxer_for("MOD"), Some("vob"));
+    assert_eq!(muxer_for("mts"), None, "ffmpeg knows this one");
+
+    let out = d.p("c.mp4");
+    run_attempts(&src, &convert_attempts(&info, "mp4"), &out);
+    assert_eq!(field(&out, "v:0", "stream=codec_name"), "h264", "MPEG-2 in MP4 would not play");
+    assert_eq!(field(&out, "v:0", "stream=field_order"), "progressive");
+    assert_eq!(field(&out, "a:0", "stream=codec_name"), "ac3");
+    assert_eq!(field(&out, "v:0", "stream=sample_aspect_ratio"), "8:9", "still shows at 4:3");
+    let rate: f64 = { let r = field(&out, "v:0", "stream=avg_frame_rate"); let (a, b) = r.split_once('/').unwrap(); a.parse::<f64>().unwrap() / b.parse::<f64>().unwrap() };
+    assert!((rate - 59.94).abs() < 1.0, "one picture per field: {rate}");
+
+    // A still is what a player would show: square pixels, not 720 wide.
+    let png = d.p("still.png");
+    ffs(&["-i", src.to_str().unwrap(), "-vf", &still_filter(&v).unwrap(), "-frames:v", "1", png.to_str().unwrap()]);
+    assert_eq!(field(&png, "v:0", "stream=width"), "640");
+    assert!(still_filter(&VideoInfo { pixel_aspect: 1.0, ..Default::default() }).is_none(), "ordinary video goes untouched");
+}
+
+/// The picture of each frame, in order, to find out which frame a cut or a still really begins on.
+fn frame_hashes(before: &[String], src: &Path, after: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = before.to_vec();
+    a.extend(["-i".to_string(), src.display().to_string()]);
+    a.extend_from_slice(after);
+    a.extend(["-map", "0:v:0", "-f", "framemd5", "-"].map(String::from));
+    let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+    let out = ffs(&refs);
+    String::from_utf8_lossy(&out).lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.rsplit(',').next()).map(|h| h.trim().to_string()).collect()
+}
+
+#[test]
+fn camcorder_containers_seek_to_the_exact_frame() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let fps = 30000.0 / 1001.0;
+    for (name, codec, format) in [("long.mts", "libx264", "mpegts"), ("long.mod", "mpeg2video", "vob")] {
+        let src = d.p(name);
+        ffs(&["-f", "lavfi", "-i", "testsrc2=s=160x90:r=30000/1001:d=20", "-c:v", codec, "-g", "15", "-bf", "2", "-f", format, src.to_str().unwrap()]);
+        let all = frame_hashes(&[], &src, &[]);
+        let ext = name.rsplit('.').next().unwrap();
+        assert!(seeks_loosely(ext));
+        for k in [0usize, 7, 40, 157, 302, 455, 590] {
+            let (before, mut after) = still_seek(ext, k as f64 / fps);
+            after.extend(["-frames:v", "1"].map(String::from));
+            assert_eq!(frame_hashes(&before, &src, &after), [all[k].clone()], "{name} frame {k}");
+        }
+        // A stretch from the middle holds exactly those frames.
+        let (a, b) = (157, 302);
+        let (before, after) = cut_seek(ext, a as f64 / fps, b as f64 / fps);
+        assert_eq!(frame_hashes(&before, &src, &after), all[a..b].to_vec(), "{name} cut");
+    }
+    // A clip with a single keyframe, the way a chopped AVCHD file can be, still has its later frames.
+    let src = d.p("short.mts");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=160x90:r=60000/1001:d=0.5", "-c:v", "libx264", "-g", "1000", "-bf", "0", "-f", "mpegts", src.to_str().unwrap()]);
+    let all = frame_hashes(&[], &src, &[]);
+    let (before, mut after) = still_seek("mts", 25.0 * 1001.0 / 60000.0);
+    after.extend(["-frames:v", "1"].map(String::from));
+    assert_eq!(frame_hashes(&before, &src, &after), [all[25].clone()]);
+    // Everything else keeps the fast seek, which is exact there.
+    assert_eq!(still_seek("mp4", 5.0).1.len(), 0);
+    assert!(!seeks_loosely("mkv"));
+}
+
 fn have_ffmpeg() -> bool { Command::new("ffmpeg").arg("-version").output().is_ok() }
 fn has_encoder(name: &str) -> bool {
     let o = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().unwrap();
@@ -721,12 +853,29 @@ fn compress_spends_only_what_was_chosen() {
     ffs(&["-f", "lavfi", "-i", "testsrc2=s=800x600:r=30:d=1", "-f", "lavfi", "-i", "sine=r=48000:d=1", "-vf", "format=yuv444p10le,crop=641:360:0:0,format=yuv420p10le", "-c:v", "ffv1", "-c:a", "aac", &s.display().to_string()]);
     assert_eq!(field(&s, "v:0", "stream=width"), "641", "fixture");
     let o = d.p("o.mp4");
-    run_app_args(&s, &compress_video_args(&probe(&s), "23", None), &o).unwrap();
+    run_app_args(&s, &compress_video_args(&probe(&s), &Squeeze { crf: 23, height: None, audio_kbps: None, fps: None }), &o).unwrap();
     assert_eq!(field(&o, "v:0", "stream=pix_fmt"), "yuv420p10le", "HDR-capable depth kept");
     assert_eq!(field(&o, "v:0", "stream=width"), "642", "padded, not resampled");
     let o = d.p("h.mp4");
-    run_app_args(&s, &compress_video_args(&probe(&s), "23", Some(180)), &o).unwrap();
+    run_app_args(&s, &compress_video_args(&probe(&s), &Squeeze { crf: 23, height: Some(180), audio_kbps: None, fps: None }), &o).unwrap();
     assert_eq!(field(&o, "v:0", "stream=height"), "180");
+    assert_eq!(field(&o, "a:0", "stream=codec_name"), "aac", "no allowance, so the audio is only copied");
+}
+
+#[test]
+fn custom_compress_squeezes_picture_and_audio_as_far_as_asked() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=800x600:r=30:d=2", "-f", "lavfi", "-i", "sine=r=48000:d=2", "-c:v", "libx264", "-crf", "12", "-c:a", "ac3", "-ac", "2", "-b:a", "192k", &s.display().to_string()]);
+    let o = d.p("o.mp4");
+    run_app_args(&s, &compress_video_args(&probe(&s), &Squeeze { crf: 51, height: Some(144), audio_kbps: Some(8), fps: Some(5) }), &o).unwrap();
+    assert_eq!(field(&o, "v:0", "stream=height"), "144");
+    assert_eq!(field(&o, "v:0", "stream=avg_frame_rate"), "5/1");
+    assert_eq!(field(&o, "a:0", "stream=codec_name"), "aac");
+    assert_eq!(field(&o, "a:0", "stream=channels"), "1");
+    assert_eq!(field(&o, "a:0", "stream=sample_rate"), "11025");
+    assert!(std::fs::metadata(&o).unwrap().len() < std::fs::metadata(&s).unwrap().len() / 20, "far smaller");
 }
 
 #[test]

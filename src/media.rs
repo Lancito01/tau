@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub fn s(v: &[&str]) -> Vec<String> { v.iter().map(|x| x.to_string()).collect() }
 
-fn ffprobe() -> Option<PathBuf> {
+pub fn ffprobe() -> Option<PathBuf> {
     let ff = crate::ffmpeg()?;
     let probe = ff.with_file_name("ffprobe.exe");
     Some(if probe.exists() { probe } else { PathBuf::from("ffprobe") })
@@ -41,6 +41,7 @@ pub fn ffmpeg_from(job: &Job, before: &[String], inputs: &[&Path], args: &[Strin
     a.extend_from_slice(before);
     for i in inputs { a.push("-i".into()); a.push(i.display().to_string()); }
     a.extend_from_slice(args);
+    if let Some(m) = quality::muxer_for(&crate::catalog::ext_of(out)) { a.push("-f".into()); a.push(m.into()); }
     a.push(out.display().to_string());
     let cb = |line: &str| {
         if let Some(v) = line.strip_prefix("out_time_us=") {

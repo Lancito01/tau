@@ -56,13 +56,52 @@ pub fn render(name: &str, out: &Path) -> Result<(), String> {
             let names: Vec<String> = crate::fade::DIRECTIONS.iter().map(|(n, _)| n.to_string()).collect();
             let fields = [
                 Field::Colors("Colours. Two or more fade in this order", vec!["#2563EB".to_string(), "#E11D48".to_string(), "#F2EFE8".to_string()]),
-                Field::Choice("Fade direction", names, 0),
+                Field::ChoiceIfMany(0, "Fade direction", names, 0),
                 Field::Slider("Margin (% of the longest side)", 0, 50, 8),
+                Field::Slider("Corner radius (% of the shortest side)", 0, 50, 12),
             ];
             let base = sample_photo(800, 500);
             form::render_with_preview("Add background", "holiday.jpg", &fields, "Apply", Box::new(move |v| {
                 let stops: Vec<[u8; 4]> = v[0].split(',').map(crate::image::parse_color).collect();
-                Some(crate::tools::with_background(&base, &stops, crate::fade::direction_named(&v[1]), v[2].parse().unwrap_or(0)))
+                Some(crate::tools::background_preview(&base, &stops, crate::fade::direction_named(&v[1]), v[2].parse().unwrap_or(0), v[3].parse().unwrap_or(0)))
+            }), out)
+        }
+        "metadata" => {
+            use crate::metadata::{Info, Section};
+            let rows = |r: &[(&str, &str)]| r.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+            let info = Info { editable: vec![], sections: vec![
+                Section { title: "Summary".into(), rows: rows(&[("Format", "JPG"), ("Dimensions", "6000 x 4000"), ("Camera make", "Canon"), ("Camera model", "EOS R6"), ("Date taken", "2024:06:14 18:22:07"), ("Location", "-34.60370, -58.38160")]) },
+                Section { title: "File".into(), rows: rows(&[("Name", "holiday.jpg"), ("Size", "6.2 MB (6500000 bytes)")]) },
+                Section { title: "Image".into(), rows: rows(&[("Camera make", "Canon"), ("Orientation", "Upright")]) },
+                Section { title: "Exposure".into(), rows: rows(&[("Exposure time", "1/250"), ("F-number", "2.8"), ("ISO", "400")]) },
+                Section { title: "GPS".into(), rows: rows(&[("Latitude", "34, 36, 13.3")]) },
+                Section { title: "XMP".into(), rows: rows(&[("Creator tool", "Lightroom")]) },
+            ] };
+            crate::metadata::render("holiday.jpg", info, &[], out)
+        }
+        "metadata-open" => {
+            use crate::metadata::{Info, Section};
+            let rows = |r: &[(&str, &str)]| r.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+            let info = Info { editable: vec![], sections: vec![
+                Section { title: "Summary".into(), rows: rows(&[("Format", "QuickTime / MOV"), ("Length", "3:12.04"), ("Video", "h264, 1920x1080, 29.97 fps")]) },
+                Section { title: "File".into(), rows: rows(&[("Name", "interview take 3.mp4"), ("Folder", "C:\\Users\\Someone\\Videos\\A folder with quite a long name that has to wrap somewhere"), ("Size", "84.0 MB")]) },
+                Section { title: "Video 1".into(), rows: rows(&[("Codec name", "h264"), ("Profile", "High"), ("Width", "1920"), ("Height", "1080"), ("Pix fmt", "yuv420p"), ("Color space", "bt709"), ("Language", "eng")]) },
+                Section { title: "Audio 1".into(), rows: rows(&[("Codec name", "aac")]) },
+            ] };
+            crate::metadata::render("interview take 3.mp4", info, &[1, 2], out)
+        }
+        "background-one" => {
+            let names: Vec<String> = crate::fade::DIRECTIONS.iter().map(|(n, _)| n.to_string()).collect();
+            let fields = [
+                Field::Colors("Colours. Two or more fade in this order", vec!["#F2EFE8".to_string()]),
+                Field::ChoiceIfMany(0, "Fade direction", names, 0),
+                Field::Slider("Margin (% of the longest side)", 0, 50, 5),
+                Field::Slider("Corner radius (% of the shortest side)", 0, 50, 0),
+            ];
+            let base = sample_photo(800, 500);
+            form::render_with_preview("Add background", "holiday.jpg", &fields, "Apply", Box::new(move |v| {
+                let stops: Vec<[u8; 4]> = v[0].split(',').map(crate::image::parse_color).collect();
+                Some(crate::tools::background_preview(&base, &stops, crate::fade::direction_named(&v[1]), v[2].parse().unwrap_or(0), v[3].parse().unwrap_or(0)))
             }), out)
         }
         "settings" => crate::settings::render(out),
@@ -85,19 +124,33 @@ pub fn render(name: &str, out: &Path) -> Result<(), String> {
             Shape { tool: Tool::Arrow, a: (0.7, 0.75), b: (0.5, 0.45), color: 0xFFCC00, text: String::new(), fx: Fx::default() },
             Shape { tool: Tool::Text, a: (0.5, 0.2), b: (0.5, 0.2), color: 0xFFFFFF, text: "Sunset here".into(), fx: Fx::default() },
         ], 1, None, out),
-        "timeline-range" => timeline::render(timeline::Mode::Range, Some(sample_strip()), vec![24.0, 140.0], out),
-        "timeline-points" => timeline::render(timeline::Mode::Points, Some(sample_strip()), vec![30.0, 95.0, 150.0], out),
-        "timeline-ranges" => timeline::render(timeline::Mode::Ranges, Some(sample_strip()), vec![12.0, 30.0, 70.0, 88.0, 150.0], out),
+        "timeline-range" => timeline::render(timeline::Mode::Range, Some(sample_strip()), vec![24.0, 140.0], 30.0, Some(sample_photo(800, 450)), out),
+        "timeline-points" => timeline::render(timeline::Mode::Points, Some(sample_strip()), vec![30.0, 95.0, 150.0], 29.97, Some(sample_photo(800, 450)), out),
+        "timeline-ranges" => timeline::render(timeline::Mode::Ranges, Some(sample_strip()), vec![12.0, 30.0, 70.0, 88.0, 150.0], 0.0, None, out),
         "photo" => crate::photo::render(photo(), out),
-        "compress" => {
+        "compress" | "compress-custom" => {
+            use crate::preview::{Control, Preset};
             let base = photo();
+            let level = |name: &str, values: Vec<i32>| Preset { name: name.to_string(), values };
+            let options = |o: &[(&str, i32)]| o.iter().map(|(n, v)| (n.to_string(), *v)).collect::<Vec<_>>();
             let spec = crate::preview::Spec {
                 title: "Compress video".into(), ok: "Compress".into(),
-                levels: ["Smaller file", "Balanced", "Higher quality"].iter().map(|s| s.to_string()).collect(), default: 1,
-                option_label: "Height".into(), options: ["Keep size", "1080", "720"].iter().map(|s| s.to_string()).collect(),
-                sampler: std::sync::Arc::new(move |i, _| Ok((base.clone(), [84_000_000, 12_000_000, 26_000_000, 51_000_000][i]))),
+                presets: vec![
+                    level("Very high quality", vec![94, 0, 0, 0]), level("High quality", vec![80, 0, 256, 0]),
+                    level("Medium quality", vec![66, 1080, 160, 0]), level("Low quality, 720p", vec![54, 720, 96, 0]),
+                ],
+                default: 1,
+                controls: vec![
+                    Control::Slider { label: "Picture quality".into(), min: 0, max: 100, unit: "%" },
+                    Control::Choice { label: "Resolution".into(), options: options(&[("Keep size", 0), ("720p", 720), ("480p", 480)]) },
+                    Control::Choice { label: "Audio".into(), options: options(&[("Keep as it is", 0), ("96 kbps", 96), ("8 kbps", 8)]) },
+                    Control::Choice { label: "Frame rate".into(), options: options(&[("Keep rate", 0), ("15 fps", 15)]) },
+                ],
+                custom_start: vec![40, 0, 0, 0], original_bytes: 84_000_000, dur: 192.0, fps: 29.97, visual: true, note: String::new(),
+                picture: std::sync::Arc::new(move |_, _| Ok(base.clone())),
+                size: std::sync::Arc::new(|v| Ok((v[0] as u64).pow(2) * 8000)),
             };
-            crate::preview::render(spec, out)
+            crate::preview::render(spec, if name == "compress" { 1 } else { 4 }, out)
         }
         _ => Err(format!("No sample called {name}")),
     }

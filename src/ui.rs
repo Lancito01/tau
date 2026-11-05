@@ -276,6 +276,23 @@ impl Ui {
     }
     pub fn forget_image(&mut self, key: u64) { self.bitmaps.remove(&key); }
 
+    /// Replaces part of a picture's GPU copy, which is far cheaper than a new one when little has changed.
+    pub fn update_image(&mut self, key: u64, bmp: &Bmp, (x0, y0, x1, y1): (u32, u32, u32, u32)) {
+        let Some(b) = self.bitmaps.get(&key) else { return };
+        if x0 >= x1 || y0 >= y1 { return; }
+        let row = (x1 - x0) as usize * 4;
+        let mut px = Vec::with_capacity(row * (y1 - y0) as usize);
+        for y in y0..y1 {
+            let at = (y as usize * bmp.w as usize + x0 as usize) * 4;
+            px.extend_from_slice(&bmp.px[at..at + row]);
+        }
+        for p in px.chunks_exact_mut(4) {
+            if p[3] != 255 { let a = p[3] as u32; for v in &mut p[..3] { *v = (*v as u32 * a / 255) as u8; } }
+        }
+        let area = D2D_RECT_U { left: x0, top: y0, right: x1, bottom: y1 };
+        unsafe { let _ = b.CopyFromMemory(Some(&area), px.as_ptr() as *const _, row as u32); }
+    }
+
     // ---- input ----
 
     pub fn key(&mut self, vk: VIRTUAL_KEY) -> bool {
@@ -549,6 +566,14 @@ impl Ui {
     }
 
     /// Scrollable body: clips to `q` and returns the offset to apply. Call `unclip` after drawing the rows.
+    /// Scrolls a `scroll_area` of height `h` just far enough to show this span of its content.
+    pub fn scroll_into_view(&mut self, key: &str, h: f32, top: f32, bottom: f32) {
+        let k = id(key) ^ 0x55;
+        let cur = self.anims.get(&k).copied().unwrap_or(0.0);
+        let next = if bottom > cur + h { bottom - h } else { cur };
+        self.anims.insert(k, if top < next { top } else { next });
+    }
+
     pub fn scroll_area(&mut self, key: &str, q: R, content: f32) -> f32 {
         let k = id(key) ^ 0x55;
         let max = (content - q.h).max(0.0);

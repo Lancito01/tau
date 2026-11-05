@@ -39,6 +39,10 @@ pub struct VideoInfo {
     pub color_space: String,
     /// Bits per second of this stream alone, 0 when the file does not say.
     pub bitrate: u64,
+    /// Camcorder footage often stores two half-pictures per frame.
+    pub interlaced: bool,
+    /// Width of a pixel over its height, 0 when the file does not say. DV and DVD pixels are not square.
+    pub pixel_aspect: f64,
 }
 
 impl VideoInfo {
@@ -77,7 +81,7 @@ pub struct Probe {
 /// ffprobe arguments whose output `parse_probe` reads.
 pub fn probe_args(path: &str) -> Vec<String> {
     sv(&["-v", "error", "-show_data_hash", "md5", "-show_entries",
-        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash,bit_rate,color_space:stream_disposition=attached_pic:stream_side_data=rotation:format=bit_rate",
+        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash,bit_rate,color_space,field_order,sample_aspect_ratio:stream_disposition=attached_pic:stream_side_data=rotation:format=bit_rate",
         "-of", "flat", path])
 }
 
@@ -118,6 +122,8 @@ pub fn parse_probe(flat: &str) -> Probe {
                     extradata: get("extradata_hash").into(),
                     color_space: get("color_space").into(),
                     bitrate: get("bit_rate").parse().unwrap_or(0),
+                    interlaced: matches!(get("field_order"), "tt" | "bb" | "tb" | "bt"),
+                    pixel_aspect: parse_rate(&get("sample_aspect_ratio").replace(':', "/")),
                 });
             }
             "audio" => p.audio.push(AudioInfo {
@@ -275,7 +281,7 @@ fn audio_fits(container: &str, codec: &str) -> bool {
         "aac" => codec == "aac",
         "wav" => matches!(codec, "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_f64le" | "pcm_u8"),
         "flac" => codec == "flac",
-        "ogg" => matches!(codec, "vorbis" | "opus" | "flac"),
+        "ogg" => matches!(codec, "vorbis" | "opus"),
         "opus" => codec == "opus",
         "aiff" | "aif" => matches!(codec, "pcm_s16be" | "pcm_s24be" | "pcm_s32be" | "pcm_f32be" | "pcm_f64be" | "pcm_s8"),
         _ => false,
@@ -565,8 +571,9 @@ pub fn redact_graph(pix: &str, color_space: &str, full_range: bool, w: u32, h: u
 
 fn video_fits(container: &str, codec: &str) -> bool {
     match container {
-        "mp4" | "m4v" => matches!(codec, "h264" | "hevc" | "av1" | "mpeg4" | "vp9" | "mpeg2video" | "mjpeg"),
-        "mov" => matches!(codec, "h264" | "hevc" | "prores" | "mjpeg" | "mpeg4" | "dvvideo" | "qtrle" | "png" | "mpeg2video"),
+        // MPEG-2 fits both on paper, but next to nothing plays it from there.
+        "mp4" | "m4v" => matches!(codec, "h264" | "hevc" | "av1" | "mpeg4" | "vp9" | "mjpeg"),
+        "mov" => matches!(codec, "h264" | "hevc" | "prores" | "mjpeg" | "mpeg4" | "dvvideo" | "qtrle" | "png"),
         "mkv" => !matches!(codec, "" | "gif"),
         "webm" => matches!(codec, "vp8" | "vp9" | "av1"),
         "avi" => matches!(codec, "mpeg4" | "msmpeg4v3" | "mjpeg" | "ffv1" | "huffyuv"),
@@ -631,6 +638,9 @@ fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
         (None, _) => true,
     };
     let mut chain = vec![];
+    // One picture per field, which keeps the motion that interlacing was there to carry. The new formats have no use
+    // for fields, and would otherwise show them as combing.
+    if v.is_some_and(|i| i.interlaced) { chain.push("bwdif=mode=send_field:deint=interlaced".to_string()); }
     if needs_pad { chain.push("pad=ceil(iw/2)*2:ceil(ih/2)*2".to_string()); }
     if let Some(f) = &fmt {
         chain.push(format!("format={f}"));
@@ -643,7 +653,8 @@ fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
 
 fn gif_args(v: Option<&VideoInfo>) -> Vec<String> {
     let cap = v.is_some_and(|i| i.fps > GIF_MAX_FPS);
-    let lead = if cap { format!("fps={GIF_MAX_FPS},") } else { String::new() };
+    let still = v.and_then(still_filter).map(|f| format!("{f},")).unwrap_or_default();
+    let lead = if cap { format!("{still}fps={GIF_MAX_FPS},") } else { still };
     vec!["-map".into(), "0:V:0".into(),
         "-vf".into(), format!("{lead}split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=floyd_steinberg"),
         "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), "-an".into()]
@@ -805,23 +816,77 @@ pub fn audio_trim_args(p: &Probe, ext: &str) -> Vec<String> {
     a
 }
 
+/// What Compress may give away. Everything left at `None` stays as it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Squeeze {
+    pub crf: u32,
+    /// Tallest picture to keep.
+    pub height: Option<u32>,
+    /// Bits to allow each audio track, in kbps for a stereo pair. A track already within that is copied untouched.
+    pub audio_kbps: Option<u32>,
+    /// Highest frame rate to keep.
+    pub fps: Option<u32>,
+}
+
+/// A picture quality from 0 to 100 as an x264 CRF: 100 is visually lossless, 0 is the worst x264 can do.
+pub fn crf_for(percent: i32) -> u32 { (51.0 - percent.clamp(0, 100) as f64 * 0.35).round() as u32 }
+
+/// Below these bitrates a full-band stereo signal only turns into noise, so the track gives up channels and bandwidth.
+/// `spec` is the stream the options apply to, such as ":a:0", and `target` the extension being written.
+pub fn audio_squeeze_args(spec: &str, target: &str, a: &AudioInfo, kbps: u32) -> Vec<String> {
+    let mut o = vec![];
+    if kbps < 48 && a.channels != 1 { o.extend([format!("-ac{spec}"), "1".to_string()]); }
+    let rate = match (target, kbps) {
+        // Opus picks its own bandwidth and takes only a few rates.
+        ("opus", _) => 0,
+        // Vorbis has no setup for so few bits at any higher rate.
+        ("ogg", 0..=11) => 8000,
+        (_, 0..=15) => 11025,
+        (_, 16..=31) => 22050,
+        _ => 0,
+    };
+    if rate > 0 && (a.rate == 0 || a.rate > rate) { o.extend([format!("-ar{spec}"), rate.to_string()]); }
+    o
+}
+
+/// WMA refuses to go under this many kbps, however little else it is asked to carry.
+pub const WMA_FLOOR_KBPS: u32 = 24;
+
+/// One audio track of a compressed video. An allowance of `None`, or a track already within it, is copied when the
+/// container can hold it, since re-encoding audio that small costs quality and saves nothing.
+fn compress_audio_args(i: usize, a: &AudioInfo, allowance: Option<u32>) -> Vec<String> {
+    let fits = audio_fits("mp4", &a.codec);
+    let total = allowance.map(|k| k * a.channels.max(2) / 2);
+    let within = total.is_some_and(|t| a.bitrate > 0 && a.bitrate <= t as u64 * 1000);
+    if fits && (total.is_none() || within) { return vec![format!("-c:a:{i}"), "copy".to_string()]; }
+    let mut o = vec![format!("-c:a:{i}"), "aac".to_string(), format!("-b:a:{i}"), format!("{}k", total.unwrap_or(256))];
+    if let Some(k) = allowance { o.extend(audio_squeeze_args(&format!(":a:{i}"), "mp4", a, k)); }
+    o
+}
+
 /// Compress is the one tool that spends quality on purpose, and only as much as was chosen.
-/// Depth, chroma and every track stay; audio is copied when it fits, since the saving is in the video.
-pub fn compress_video_args(p: &Probe, crf: &str, height: Option<u32>) -> Vec<String> {
-    let mut a = sv(&["-map", "0:V:0", "-c:v", "libx264", "-preset", "slow", "-crf", crf]);
+/// Depth, chroma and every track stay.
+pub fn compress_video_args(p: &Probe, s: &Squeeze) -> Vec<String> {
+    let mut a = sv(&["-map", "0:V:0", "-c:v", "libx264", "-preset", "slow", "-crf", &s.crf.to_string()]);
     let mut chain = vec![];
-    if let Some(h) = height { chain.push(format!("scale=-2:'min({h},ih)':flags=lanczos+accurate_rnd")); }
     if let Some(v) = &p.video {
         let f = x264_nearest(&v.pix_fmt);
         let (w, h) = v.display_size();
-        if height.is_none() && odd_for_chroma(&f, w, h) { chain.push("pad=ceil(iw/2)*2:ceil(ih/2)*2".into()); }
+        // Combing costs a lot of bits, and scaling would smear the two half-pictures together.
+        if v.interlaced { chain.push("bwdif=mode=send_frame:deint=interlaced".to_string()); }
+        if let Some(fps) = s.fps.filter(|n| v.fps <= 0.0 || v.fps > *n as f64) { chain.push(format!("fps={fps}")); }
+        match s.height.filter(|t| h > *t) {
+            Some(t) => chain.push(format!("scale=-2:{t}:flags=lanczos+accurate_rnd")),
+            None => if odd_for_chroma(&f, w, h) { chain.push("pad=ceil(iw/2)*2:ceil(ih/2)*2".into()); },
+        }
         chain.push(format!("format={f}"));
+    } else if let Some(t) = s.height {
+        chain.push(format!("scale=-2:'min({t},ih)':flags=lanczos+accurate_rnd"));
     }
     if !chain.is_empty() { a.extend(["-vf".to_string(), chain.join(",")]); }
     for (i, info) in p.audio.iter().enumerate() {
         a.extend(["-map".to_string(), format!("0:a:{i}")]);
-        if audio_fits("mp4", &info.codec) { a.extend([format!("-c:a:{i}"), "copy".to_string()]); }
-        else { a.extend([format!("-c:a:{i}"), "aac".to_string(), format!("-b:a:{i}"), "256k".to_string()]); }
+        a.extend(compress_audio_args(i, info, s.audio_kbps));
     }
     a.extend(sub_streams(p, "mp4"));
     a.extend(sv(&["-map_metadata", "0", "-map_chapters", "0"]));
@@ -853,6 +918,57 @@ pub fn is_keyframe_at(csv: &str, t: f64, fps: f64) -> bool {
 /// on long files, and still exact when re-encoding.
 pub fn seek_args(a: f64, b: f64) -> Vec<String> {
     sv(&["-ss", &format!("{a:.6}"), "-to", &format!("{b:.6}")])
+}
+
+/// Containers with no index to seek by. ffmpeg guesses a position from timestamps and can come up to a group of pictures
+/// late, or find nothing at all near the end. Camcorders and DVDs write these.
+pub fn seeks_loosely(ext: &str) -> bool {
+    matches!(ext.to_ascii_lowercase().as_str(), "mts" | "m2ts" | "m2t" | "ts" | "tod" | "mod" | "vob" | "mpg" | "mpeg")
+}
+
+/// Far more than a group of pictures in any of those, and little enough to decode quickly.
+const PRE_ROLL: f64 = 3.0;
+
+/// Options before and after -i that begin exactly at `t`: a jump to somewhere safely earlier, then decoding up to it.
+fn exact_seek(ext: &str, t: f64) -> (Vec<String>, Vec<String>) {
+    let t = frame_seek(t);
+    if !seeks_loosely(ext) { return (sv(&["-ss", &format!("{t:.6}")]), vec![]); }
+    let early = t - PRE_ROLL;
+    if early > 0.0 { return (sv(&["-ss", &format!("{early:.6}")]), sv(&["-ss", &format!("{PRE_ROLL:.6}")])); }
+    (vec![], if t > 0.0 { sv(&["-ss", &format!("{t:.6}")]) } else { vec![] })
+}
+
+/// Options before and after -i for a single picture at `t`.
+pub fn still_seek(ext: &str, t: f64) -> (Vec<String>, Vec<String>) { exact_seek(ext, t) }
+
+/// Options before and after -i for the stretch from `a` to `b`.
+pub fn cut_seek(ext: &str, a: f64, b: f64) -> (Vec<String>, Vec<String>) {
+    if !seeks_loosely(ext) { return (seek_args(frame_seek(a), frame_seek(b)), vec![]); }
+    let (before, mut after) = exact_seek(ext, a);
+    after.extend(sv(&["-t", &format!("{:.6}", frame_seek(b) - frame_seek(a))]));
+    (before, after)
+}
+
+/// A seek that lands on the frame starting at `t`. A frame's start is rarely a round number, so once written out it can
+/// fall just past the frame, and ffmpeg would then begin on the next one. A millisecond before is safe at any real rate.
+pub fn frame_seek(t: f64) -> f64 { (t - 0.001).max(0.0) }
+
+/// What a single picture of this video needs in order to look as it does when played: whole frames instead of two
+/// combed half-pictures, and square pixels, as an image has no other kind.
+pub fn still_filter(v: &VideoInfo) -> Option<String> {
+    let mut chain = vec![];
+    if v.interlaced { chain.push("bwdif=mode=send_frame:deint=interlaced"); }
+    if v.pixel_aspect > 0.0 && (v.pixel_aspect - 1.0).abs() > 0.001 { chain.push("scale=trunc(iw*sar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1"); }
+    (!chain.is_empty()).then(|| chain.join(","))
+}
+
+/// The muxer to name for an extension ffmpeg cannot place by itself: camcorders gave these their own.
+pub fn muxer_for(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "mod" => Some("vob"),
+        "tod" => Some("mpegts"),
+        _ => None,
+    }
 }
 
 /// A cut can copy the original bits only from a keyframe to the end of the file. Ending anywhere else overshoots
@@ -1022,6 +1138,44 @@ pub fn collage_tile(sizes: &[(u32, u32)], cols: u32, rows: u32, gap: u32) -> (u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compress_leaves_audio_alone_until_it_is_over_the_allowance() {
+        let ac3 = AudioInfo { codec: "ac3".into(), channels: 2, rate: 48000, bitrate: 192_000, ..Default::default() };
+        let copied = vec!["-c:a:0".to_string(), "copy".to_string()];
+        assert_eq!(compress_audio_args(0, &ac3, None), copied, "no allowance");
+        assert_eq!(compress_audio_args(0, &ac3, Some(192)), copied, "already within it");
+        let squeezed = compress_audio_args(0, &ac3, Some(64));
+        assert_eq!(&squeezed[..4], &sv(&["-c:a:0", "aac", "-b:a:0", "64k"])[..]);
+        assert_eq!(squeezed.len(), 4, "64 kbps is still full-band stereo");
+    }
+    #[test]
+    fn compress_gives_surround_its_share_and_starves_tracks_only_when_asked() {
+        let surround = AudioInfo { codec: "ac3".into(), channels: 6, rate: 48000, bitrate: 448_000, ..Default::default() };
+        assert_eq!(compress_audio_args(1, &surround, Some(192)), vec!["-c:a:1".to_string(), "copy".to_string()], "576 kbps allowed for six channels");
+        assert!(compress_audio_args(1, &surround, Some(96)).contains(&"288k".to_string()));
+        let tiny = compress_audio_args(0, &AudioInfo { codec: "aac".into(), channels: 2, rate: 48000, bitrate: 128_000, ..Default::default() }, Some(12));
+        assert!(tiny.windows(2).any(|w| w == ["-ac:a:0", "1"]), "{tiny:?}");
+        assert!(tiny.windows(2).any(|w| w == ["-ar:a:0", "11025"]), "{tiny:?}");
+        let mono = AudioInfo { channels: 1, rate: 48000, ..Default::default() };
+        assert!(audio_squeeze_args(":a", "mp3", &AudioInfo { rate: 8000, ..mono.clone() }, 8).is_empty(), "nothing left to take");
+        assert!(audio_squeeze_args(":a", "opus", &mono, 8).is_empty(), "opus keeps its own rate");
+        assert_eq!(audio_squeeze_args(":a", "ogg", &mono, 8), sv(&["-ar:a", "8000"]));
+    }
+    #[test]
+    fn compress_only_shrinks_and_never_stretches_a_small_picture() {
+        let p = Probe { video: Some(VideoInfo { pix_fmt: "yuv420p".into(), width: 640, height: 360, fps: 25.0, ..Default::default() }), ..Default::default() };
+        let vf = |s: Squeeze| { let a = compress_video_args(&p, &s); a[a.iter().position(|x| x == "-vf").unwrap() + 1].clone() };
+        let base = Squeeze { crf: 23, height: None, audio_kbps: None, fps: None };
+        assert!(!vf(Squeeze { height: Some(720), ..base.clone() }).contains("scale"));
+        assert!(vf(Squeeze { height: Some(240), ..base.clone() }).contains("scale=-2:240"));
+        assert!(!vf(Squeeze { fps: Some(30), ..base.clone() }).contains("fps="));
+        assert!(vf(Squeeze { fps: Some(10), ..base }).contains("fps=10"));
+    }
+    #[test]
+    fn picture_quality_covers_the_whole_crf_range() {
+        assert_eq!((crf_for(0), crf_for(100)), (51, 16));
+        assert_eq!(crf_for(80), 23);
+    }
 
     const FLAT: &str = r#"streams.stream.0.codec_name="hevc"
 streams.stream.0.codec_type="video"
