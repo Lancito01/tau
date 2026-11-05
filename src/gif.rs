@@ -1,6 +1,8 @@
-//! Redacts a GIF by rewriting palette indexes inside the file, so nothing outside the boxes is re-quantized.
-//! Palettes, timing, loop count and every frame that misses the boxes stay byte for byte.
+//! Redacts a GIF by rewriting palette indexes inside the file, so nothing outside the marks is re-quantized.
+//! Palettes, timing, loop count and every frame that misses the marks stay byte for byte.
 //! Pure logic with no Win32, covered by `tests/fidelity.rs`.
+//! Only hard-edged solid marks can work this way. A blur or feather needs colours the palette may not have.
+use crate::redact::{Fill, Mark};
 
 pub fn screen_size(b: &[u8]) -> Option<(u32, u32)> {
     if !matches!(b.get(..6)?, b"GIF87a" | b"GIF89a") { return None; }
@@ -144,9 +146,19 @@ fn darkest(table: &[u8], transparent: Option<u8>) -> Option<u8> {
         .map(|(i, _)| i as u8)
 }
 
-/// Paints the boxes, given in screen pixels, in every frame. Frames that miss them are copied byte for byte.
-/// Transparent pixels inside a box are painted too, since they would otherwise show an earlier frame through.
-pub fn redact(b: &[u8], boxes: &[(u32, u32, u32, u32)]) -> Result<Vec<u8>, String> {
+/// The closest palette entry to a colour, leaving out the transparent one.
+fn nearest(table: &[u8], transparent: Option<u8>, rgb: [u8; 3]) -> Option<u8> {
+    if rgb == [0, 0, 0] { return darkest(table, transparent); }
+    table.chunks_exact(3).enumerate()
+        .filter(|(i, _)| Some(*i as u8) != transparent)
+        .min_by_key(|(_, c)| (0..3).map(|k| (c[k] as i32 - rgb[k] as i32).pow(2)).sum::<i32>())
+        .map(|(i, _)| i as u8)
+}
+
+/// Paints solid marks, given in screen pixels, in every frame. Frames that miss them are copied byte for byte. Each frame
+/// uses its palette's closest colour. Transparent pixels inside a mark are painted too, since they would otherwise show
+/// an earlier frame through.
+pub fn redact(b: &[u8], marks: &[Mark]) -> Result<Vec<u8>, String> {
     screen_size(b).ok_or("Not a GIF")?;
     let flags = *b.get(10).ok_or("GIF ends early")?;
     let mut i = 13;
@@ -182,20 +194,23 @@ pub fn redact(b: &[u8], boxes: &[(u32, u32, u32, u32)]) -> Result<Vec<u8>, Strin
                 } else { global };
                 let min_code = *b.get(j).ok_or("GIF ends early")?;
                 let (data, end) = read_blocks(b, j + 1)?;
-                let hits = |&&(x, y, w, h): &&(u32, u32, u32, u32)| (x as usize) < fx + fw && fx < (x + w) as usize && (y as usize) < fy + fh && fy < (y + h) as usize;
-                if !boxes.iter().any(|bx| hits(&bx)) {
+                let hits = |m: &&Mark| (m.x as usize) < fx + fw && fx < (m.x + m.w) as usize && (m.y as usize) < fy + fh && fy < (m.y + m.h) as usize;
+                if !marks.iter().any(|m| hits(&m)) {
                     out.extend_from_slice(&b[i..end]);
                 } else {
-                    let ink = darkest(table, transparent).ok_or("This GIF frame has no colour table")?;
                     let mut px = lzw_decode(&data, min_code, fw * fh)?;
                     let rows = row_order(fh, f & 0x40 != 0);
-                    for (file_row, &row) in rows.iter().enumerate() {
-                        let sy = fy + row;
-                        for &(x, y, w, h) in boxes {
-                            if sy < y as usize || sy >= (y + h) as usize { continue; }
-                            let from = (x as usize).max(fx);
-                            let to = ((x + w) as usize).min(fx + fw);
-                            for sx in from..to { px[file_row * fw + sx - fx] = ink; }
+                    for m in marks {
+                        let Fill::Solid(rgb) = m.fill else { return Err("A GIF blur cannot be painted in place".into()) };
+                        let ink = nearest(table, transparent, rgb).ok_or("This GIF frame has no colour table")?;
+                        for (file_row, &row) in rows.iter().enumerate() {
+                            let sy = (fy + row) as u32;
+                            if sy < m.y || sy >= m.y + m.h { continue; }
+                            let from = m.x.max(fx as u32);
+                            let to = (m.x + m.w).min((fx + fw) as u32);
+                            for sx in from..to {
+                                if m.coverage(sx, sy) > 0.0 { px[file_row * fw + sx as usize - fx] = ink; }
+                            }
                         }
                     }
                     out.extend_from_slice(&b[i..=j]);
@@ -244,6 +259,13 @@ mod tests {
         let t = [0, 0, 0, 200, 200, 200, 20, 20, 20];
         assert_eq!(darkest(&t, None), Some(0));
         assert_eq!(darkest(&t, Some(0)), Some(2));
+    }
+    #[test]
+    fn nearest_finds_the_closest_colour() {
+        let t = [0, 0, 0, 250, 10, 10, 10, 10, 250];
+        assert_eq!(nearest(&t, None, [255, 0, 0]), Some(1));
+        assert_eq!(nearest(&t, Some(1), [255, 0, 0]), Some(0));
+        assert_eq!(nearest(&t, None, [0, 0, 240]), Some(2));
     }
     #[test]
     fn garbage_is_refused() {

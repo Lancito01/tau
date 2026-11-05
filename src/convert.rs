@@ -1,10 +1,29 @@
 //! Convert wheel: routes one target format to the engine for each input's category.
-use crate::catalog::{classify, dominant, Cat};
+use crate::catalog::{classify, dominant, ext_of, Cat};
 use crate::job::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// What this conversion gives up, for the progress card.
+fn set_detail(job: &Job, input: &Path, target: &str) {
+    use crate::quality::{document_notice, image_notice, media_notice};
+    let n = match classify(input) {
+        Cat::Image if target == "pdf" => None,
+        Cat::Image => image_notice(&ext_of(input), target),
+        Cat::Video | Cat::Audio => media_notice(&crate::media::probe(input), target),
+        Cat::Pdf => document_notice("pdf", target),
+        Cat::Doc => document_notice("doc", target),
+        Cat::Slides => document_notice("slides", target),
+        Cat::Sheet => document_notice("sheet", target),
+        Cat::Epub => document_notice("epub", target),
+        Cat::Sub => document_notice("sub", target),
+        _ => None,
+    };
+    *job.detail.lock().unwrap() = n;
+}
+
 pub fn one(job: &Job, input: &Path, target: &str) -> Result<PathBuf, String> {
+    set_detail(job, input, target);
     match classify(input) {
         Cat::Image if target == "pdf" => {
             let out = sibling(input, "", "pdf");

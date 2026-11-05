@@ -44,11 +44,16 @@ Tau keeps as much of the original as the target format allows, in this order:
 
 1. **Copy the original data.** When the codecs already fit the target, video and audio move across bit for bit (MKV to MP4, AAC from a video to M4A, a JPEG into a PDF).
 2. **Lossless encode, for edits that keep the format.** Redact, crop, trim, split, speed and join keep every other pixel exactly as decoded from the source, along with its bit depth, HDR tags, and all audio and subtitle tracks. An image redaction saves as PNG when the source format is lossy.
-3. **The top setting of the target format, when converting to something lossy by nature.** Resolution, frame rate and bit depth are kept (GIF stops at the 50 fps the format can show). Lossless audio stays lossless wherever the target can hold it.
+3. **What the source is worth, when converting.** A lossless source stays lossless wherever the target can hold it. A lossy source goes to the new codec at very high quality, capped at a bitrate matched to the source: a 5 Mbps MP4 has 5 Mbps of detail, so a lossless copy would be many times the size and show nothing more. The cap allows for how efficient each codec is, so HEVC to H.264 gets more bits and H.264 to WMV more again. Resolution, frame rate and bit depth are kept (GIF stops at the 50 fps the format can show).
+4. **The top setting, for formats that are lossy by nature.** The progress card says so when a format has to give something up.
 
 Only **Compress** gives quality away, by the amount you choose.
 
 Lossless H.264 uses a profile that the default Windows player and many editors and phones cannot decode, so redacted, cropped and trimmed videos may need VLC or mpv, and they are much larger than the original. AVI, WMV and sources H.264 cannot store exactly are saved as MKV with FFV1 instead. Lossless editing also needs `ffprobe.exe`, which comes with ffmpeg, next to `ffmpeg.exe`, and ffmpeg 5.1 or newer.
+
+## Redaction
+
+Each mark has its own shape (box or ellipse), fill (any colour, or Gaussian blur at a chosen strength) and feather. Feather reaches outward, so everything marked stays fully covered. Pixels past a mark and its feather do not change. A weak blur can sometimes be reversed, so use a solid colour for anything sensitive.
 
 ## Install
 
@@ -69,8 +74,10 @@ The executable is written to `target/release/tau.exe`. A local build does not in
 `tests/fidelity.rs` puts the arguments Tau builds through a real ffmpeg and measures the output frame by frame. It covers only platform-independent code, so it also runs on macOS and Linux without building the app:
 
 ```sh
-rustc --edition 2021 --test tests/fidelity.rs -o target/fidelity && target/fidelity --test-threads=4
+rustc --edition 2021 --test tests/fidelity.rs -o target/fidelity && target/fidelity --test-threads=4 --nocapture
 ```
+
+Tests for encoders the local ffmpeg lacks (WebP, AVIF, Vorbis) say so and skip themselves.
 
 ## Command line
 

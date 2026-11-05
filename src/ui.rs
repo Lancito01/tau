@@ -170,6 +170,18 @@ impl Ui {
     pub fn ring(&self, x: f32, y: f32, rad: f32, c: u32, a: f32, w: f32) {
         unsafe { self.rt().DrawEllipse(&ellipse(x, y, rad), self.b(c, a), w, None); }
     }
+    pub fn oval(&self, q: R, c: u32, a: f32) {
+        let mut e = ellipse(q.x + q.w / 2.0, q.y + q.h / 2.0, 1.0);
+        e.radiusX = q.w / 2.0;
+        e.radiusY = q.h / 2.0;
+        unsafe { self.rt().FillEllipse(&e, self.b(c, a)); }
+    }
+    pub fn oval_stroke(&self, q: R, c: u32, a: f32, w: f32) {
+        let mut e = ellipse(q.x + q.w / 2.0, q.y + q.h / 2.0, 1.0);
+        e.radiusX = (q.w / 2.0).max(0.5);
+        e.radiusY = (q.h / 2.0).max(0.5);
+        unsafe { self.rt().DrawEllipse(&e, self.b(c, a), w, None); }
+    }
     pub fn arc(&self, x: f32, y: f32, rad: f32, from: f32, sweep: f32, c: u32, a: f32, w: f32) {
         if let Ok(g) = crate::gfx::arc(&self.gfx, x, y, rad, from, sweep) {
             unsafe { self.rt().DrawGeometry(&g, self.b(c, a), w, self.round.as_ref()); }

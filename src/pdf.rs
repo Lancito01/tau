@@ -76,6 +76,30 @@ fn images_at(job: &Job, input: &Path, ext: &str, dpi: f64) -> std::result::Resul
     Ok(dir.unwrap_or(last))
 }
 
+/// The first page as `Compress` would make it: the picture, and its size in bytes in that form.
+pub fn first_page(input: &Path, dpi: f64, jpeg: bool) -> std::result::Result<(Bmp, u64), String> {
+    let doc = open(input)?;
+    let enc = if jpeg { BitmapEncoder::JpegEncoderId() } else { BitmapEncoder::PngEncoderId() }.map_err(es)?;
+    let st = InMemoryRandomAccessStream::new().map_err(es)?;
+    render_page(&doc, 0, dpi, &st, Some(enc))?;
+    let bytes = read_stream(&st)?;
+    let t = TempDir::new()?;
+    let f = t.file(if jpeg { "page.jpg" } else { "page.png" });
+    std::fs::write(&f, &bytes).map_err(|e| e.to_string())?;
+    Ok((image::load(&f)?, bytes.len() as u64))
+}
+
+/// The real size of the file after tidying its structure.
+pub fn tidied_size(input: &Path) -> std::result::Result<u64, String> {
+    let t = TempDir::new()?;
+    let f = t.file("tidy.pdf");
+    let mut d = load_doc(input)?;
+    d.prune_objects();
+    d.compress();
+    d.save(&f).map_err(|e| e.to_string())?;
+    std::fs::metadata(&f).map(|m| m.len()).map_err(|e| e.to_string())
+}
+
 /// Text of one page by OCR, for pages with no text layer.
 fn ocr_page(doc: &PdfDocument, i: u32) -> std::result::Result<String, String> {
     let st = InMemoryRandomAccessStream::new().map_err(es)?;

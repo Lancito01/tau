@@ -6,6 +6,7 @@ use crate::form::{self, choice, text, Field};
 use crate::image::{self, Bmp, SaveOpts};
 use crate::job::*;
 use crate::media::{self, s as sv};
+use crate::preview::{self, format_bytes, Sampler};
 use crate::quality;
 use crate::timeline;
 use std::collections::HashMap;
@@ -124,6 +125,89 @@ fn suggest(p: &Path, b: &Bmp) -> Vec<Shape> {
     crate::detect::regions(p, b.w, b.h).unwrap_or_default().into_iter().map(|(x, y, w, h)| Shape::rect(x, y, x + w, y + h)).collect()
 }
 
+// ---- what each compress level would give ----
+
+const QUALITY_LEVELS: &[&str] = &["Smaller file", "Balanced", "Higher quality"];
+const THUMB_MAX: u32 = 900;
+
+/// A copy small enough to redraw while a slider moves.
+fn thumbnail(b: Bmp) -> Result<Bmp, String> {
+    let long = b.w.max(b.h);
+    if long <= THUMB_MAX { return Ok(b); }
+    let f = THUMB_MAX as f64 / long as f64;
+    b.scaled(((b.w as f64 * f) as u32).max(1), ((b.h as f64 * f) as u32).max(1))
+}
+
+fn file_size(p: &Path) -> u64 { std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) }
+
+fn compress_choice(title: &str, sampler: Sampler, option_label: &str, options: &[&str], levels: &[&str], default: usize) -> Option<(String, String)> {
+    preview::show(preview::Spec {
+        title: title.into(), ok: "Compress".into(),
+        levels: levels.iter().map(|s| s.to_string()).collect(), default,
+        option_label: option_label.into(), options: options.iter().map(|s| s.to_string()).collect(), sampler,
+    })
+}
+
+/// An image compressed for real at each level, since a picture takes no time.
+fn image_sampler(input: &Path) -> Sampler {
+    const MAXES: [&str; 5] = ["Keep size", "3840", "2560", "1920", "1280"];
+    let input = input.to_path_buf();
+    Arc::new(move |level, opt| {
+        let mut b = image::load(&input)?;
+        if level == 0 { return Ok((b, file_size(&input))); }
+        if let Ok(max) = MAXES[opt].parse::<u32>() {
+            let long = b.w.max(b.h);
+            if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; }
+        }
+        let t = TempDir::new()?;
+        let out = t.file(&format!("o.{}", compress_ext(&ext_of(&input), b.has_alpha())));
+        image::save(&b, &out, &SaveOpts { quality: quality_of(QUALITY_LEVELS[level - 1]), fit: None })?;
+        Ok((image::load(&out)?, file_size(&out)))
+    })
+}
+
+/// Two short pieces of the video, encoded with exactly the settings the tool will use. One gives the picture, and both
+/// give the size per second, scaled up to the whole length. The first piece is taken as a typical part of the file.
+fn video_sampler(input: &Path) -> Sampler {
+    const HEIGHTS: [&str; 4] = ["Keep size", "1080", "720", "480"];
+    let input = input.to_path_buf();
+    Arc::new(move |level, opt| {
+        let dur = media::duration(&input);
+        let len = 2f64.min(dur / 3.0).max(0.1);
+        let starts = if dur > len * 3.0 { vec![dur * 0.3, dur * 0.7] } else { vec![0.0] };
+        if level == 0 { return Ok((frame_at(&input, starts[0] + len / 2.0)?, file_size(&input))); }
+        let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
+        let args = quality::compress_video_args(&media::probe(&input), crf_of(QUALITY_LEVELS[level - 1]), HEIGHTS[opt].parse().ok());
+        let t = TempDir::new()?;
+        let (mut picture, mut bytes, mut seconds) = (None, 0u64, 0f64);
+        for (i, start) in starts.iter().enumerate() {
+            let out = t.file(&format!("s{i}.mp4"));
+            let mut a = sv(&["-y", "-hide_banner", "-nostdin", "-ss", &format!("{start:.3}"), "-t", &format!("{len:.3}"), "-i", &input.display().to_string()]);
+            a.extend_from_slice(&args);
+            a.push(out.display().to_string());
+            run(None, &ff, &a, None)?;
+            bytes += file_size(&out);
+            seconds += len;
+            if picture.is_none() { picture = Some(frame_at(&out, len / 2.0)?); }
+        }
+        Ok((picture.ok_or("No sample")?, (bytes as f64 / seconds * dur) as u64))
+    })
+}
+
+/// A PDF's first page in each form. Tidying is really done for its size, and a rebuild is scaled up from that one page.
+fn pdf_sampler(input: &Path) -> Sampler {
+    let input = input.to_path_buf();
+    Arc::new(move |level, _| {
+        let pages = crate::pdf::page_count(&input)? as u64;
+        match level {
+            0 => Ok((crate::pdf::first_page(&input, 200.0, false)?.0, file_size(&input))),
+            1 => Ok((crate::pdf::first_page(&input, 200.0, false)?.0, crate::pdf::tidied_size(&input)?)),
+            2 => { let (b, n) = crate::pdf::first_page(&input, 150.0, true)?; Ok((b, n * pages)) }
+            _ => { let (b, n) = crate::pdf::first_page(&input, 96.0, true)?; Ok((b, n * pages)) }
+        }
+    })
+}
+
 // ---- options UI ----
 
 /// Asks for what the tool needs. `None` means the user cancelled.
@@ -131,8 +215,8 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
     let first = paths.first()?;
     Some(match id {
         "img.compress" => {
-            let v = form::show("Compress image", &[choice("Quality", &["Balanced", "Smaller file", "Higher quality"], 0), choice("Longest side", &["Keep size", "3840", "2560", "1920", "1280"], 0)], "Compress")?;
-            opts(&[("quality", v[0].clone()), ("max", v[1].clone())])
+            let (q, m) = compress_choice("Compress image", image_sampler(first), "Longest side", &["Keep size", "3840", "2560", "1920", "1280"], QUALITY_LEVELS, 1)?;
+            opts(&[("quality", q), ("max", m)])
         }
         "img.metadata" => {
             form::show("Image metadata", &[Field::Note("Saves a copy with camera, location and other metadata removed.".into())], "Remove")?;
@@ -147,11 +231,41 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("brightness", v[0].clone()), ("contrast", v[1].clone()), ("saturation", v[2].clone()), ("rotate", v[3].clone()), ("flip", v[4].clone())])
         }
         "img.background" => {
-            let v = form::show("Add background", &[Field::Color("Colour", "#FFFFFF".into())], "Apply")?;
+            let fields = [Field::Color("Colour", "#FFFFFF".into())];
+            let p = first.clone();
+            let v = match pump_job("Reading file", move |_| image::load(&p).and_then(thumbnail)) {
+                Ok(b) => form::show_with_preview("Add background", &fields, "Apply", Box::new(move |v| {
+                    let mut out = Bmp::new(b.w, b.h, image::parse_color(v.first()?));
+                    out.blit(&b, 0, 0);
+                    Some(out)
+                }))?,
+                Err(_) => form::show("Add background", &fields, "Apply")?,
+            };
             opts(&[("color", v[0].clone())])
         }
         "img.collage" => {
-            let v = form::show("Collage", &[choice("Columns", &["Auto", "2", "3", "4", "5"], 0), Field::Slider("Gap (pixels)", 0, 80, 12), Field::Color("Background", "#FFFFFF".into())], "Create")?;
+            let fields = [choice("Columns", &["Auto", "2", "3", "4", "5"], 0), Field::Slider("Gap (pixels)", 0, 80, 12), Field::Color("Background", "#FFFFFF".into())];
+            let ps = paths.to_vec();
+            let loaded = pump_job("Reading files", move |_| {
+                let mut out = vec![];
+                let mut scale = 1f64;
+                for p in &ps {
+                    let b = image::load(p)?;
+                    let long = b.w.max(b.h);
+                    let t = thumbnail(b)?;
+                    scale = scale.min(t.w.max(t.h) as f64 / long as f64);
+                    out.push(t);
+                }
+                Ok((out, scale))
+            });
+            let v = match loaded {
+                Ok((thumbs, scale)) => form::show_with_preview("Collage", &fields, "Create", Box::new(move |v| {
+                    let cols = v.first()?.parse().unwrap_or_else(|_| auto_columns(thumbs.len()));
+                    let gap = (v.get(1)?.trim().parse::<f64>().unwrap_or(12.0) * scale) as u32;
+                    collage(&thumbs, cols, gap, image::parse_color(v.get(2)?)).ok()
+                }))?,
+                Err(_) => form::show("Collage", &fields, "Create")?,
+            };
             opts(&[("columns", v[0].clone()), ("gap", v[1].clone()), ("color", v[2].clone())])
         }
         "img.crop" => {
@@ -169,8 +283,8 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("shapes", sh)])
         }
         "vid.compress" => {
-            let v = form::show("Compress video", &[choice("Quality", &["Balanced", "Smaller file", "Higher quality"], 0), choice("Height", &["Keep size", "1080", "720", "480"], 0)], "Compress")?;
-            opts(&[("quality", v[0].clone()), ("height", v[1].clone())])
+            let (q, h) = compress_choice("Compress video", video_sampler(first), "Height", &["Keep size", "1080", "720", "480"], QUALITY_LEVELS, 1)?;
+            opts(&[("quality", q), ("height", h)])
         }
         "vid.metadata" | "aud.metadata" => {
             let v = form::show("Metadata", &[text("Title", ""), text("Artist or author", ""), text("Comment", ""), Field::Check("Remove everything else", false)], "Save")?;
@@ -200,7 +314,13 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("marks", marks_str(&m))])
         }
         "aud.compress" => {
-            let v = form::show("Compress audio", &[choice("Bitrate", &["64 kbps", "96 kbps", "128 kbps", "192 kbps"], 2)], "Compress")?;
+            // Each choice says what it comes to. The first word is the bitrate.
+            let p = first.clone();
+            let dur = pump_job("Reading file", move |_| Ok(media::duration(&p))).unwrap_or(0.0);
+            let labels: Vec<String> = [64u64, 96, 128, 192].iter().map(|k| {
+                if dur > 0.0 { format!("{k} kbps (about {})", format_bytes((k * 125) as u64 * dur as u64)) } else { format!("{k} kbps") }
+            }).collect();
+            let v = form::show("Compress audio", &[Field::Choice("Bitrate", labels, 2)], "Compress")?;
             opts(&[("bitrate", v[0].split(' ').next().unwrap_or("128").to_string())])
         }
         "aud.channels" => {
@@ -208,8 +328,8 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("mode", v[0].clone())])
         }
         "pdf.compress" => {
-            let v = form::show("Compress PDF", &[choice("Method", &["Tidy structure (keeps text selectable)", "Rebuild at 150 DPI (text becomes images)", "Rebuild at 96 DPI (text becomes images)"], 0)], "Compress")?;
-            let dpi = if v[0].contains("150") { "150" } else if v[0].contains("96") { "96" } else { "" };
+            let (m, _) = compress_choice("Compress PDF", pdf_sampler(first), "", &[], &["Tidy structure, text stays", "150 DPI, text becomes images", "96 DPI, text becomes images"], 0)?;
+            let dpi = if m.contains("150") { "150" } else if m.contains("96") { "96" } else { "" };
             opts(&[("dpi", dpi.to_string())])
         }
         "pdf.metadata" => {
@@ -423,7 +543,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
                 if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; resized = true; }
             }
             let ext = compress_ext(&ext_of(p), b.has_alpha());
-            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")) });
+            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None });
             if resized { res } else { only_if_smaller(j, p, res) }
         }),
         "img.metadata" => each("Removing metadata", paths, |j, p| {
@@ -461,11 +581,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         "img.redact" => each("Redacting", paths, move |j, p| {
             let n = image::load_native(p)?;
             let (fw, fh) = n.size();
-            for sh in &shapes {
-                let (x, y, w, h) = crop_px(sh, fw, fh, false);
-                // Solid black, not blur: nothing remains to be recovered.
-                n.blacken(x, y, w, h)?;
-            }
+            n.apply(&canvas::marks_for(&shapes, fw, fh, false))?;
             // Saving a JPEG again would change every pixel, so anything lossy becomes PNG. Metadata does not
             // carry over, and with it goes any embedded thumbnail of the unredacted picture.
             let e = ext_of(p);
@@ -524,19 +640,24 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         "vid.redact" => each("Redacting", paths, move |j, p| {
             if shapes.is_empty() { return Err("Nothing marked to redact".into()); }
             if ext_of(p) == "gif" {
-                // In place, so palettes, timing and everything outside the boxes stay as they are.
                 let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
                 let (w, h) = crate::gif::screen_size(&bytes).ok_or("Could not read this GIF")?;
-                let boxes: Vec<_> = shapes.iter().map(|sh| crop_px(sh, w, h, false)).collect();
-                let clean = crate::gif::redact(&bytes, &boxes)?;
-                let out = sibling(p, " redacted", "gif");
-                return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|e| e.to_string()));
+                let marks = canvas::marks_for(&shapes, w, h, false);
+                // Hard solid marks go in place, so palettes, timing and everything outside them stay as they are.
+                if marks.iter().all(|m| m.is_hard_solid()) {
+                    let clean = crate::gif::redact(&bytes, &marks)?;
+                    let out = sibling(p, " redacted", "gif");
+                    return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|e| e.to_string()));
+                }
+                // A blur or feather needs colours the palette may not have, so each frame gets a new one.
+                let g = quality::redact_graph("bgra", "", true, w, h, &marks).ok_or(NO_LOSSLESS)?;
+                return media::transform(j, p, " redacted", None, quality::gif_edit_args(Some(&format!("format=gbrap,{g}"))));
             }
             let pr = media::probe(p);
             let v = pr.video.as_ref().ok_or(NO_LOSSLESS)?;
             let (w, h) = v.display_size();
-            let boxes: Vec<_> = shapes.iter().map(|sh| { let (x, y, cw, ch) = crop_px(sh, w, h, false); quality::redact_box(x, y, cw, ch, w, h) }).collect();
-            let f = quality::redact_filter(&v.pix_fmt, v.full_range, &boxes).ok_or(NO_LOSSLESS)?;
+            let marks = canvas::marks_for(&shapes, w, h, true);
+            let f = quality::redact_graph(&v.pix_fmt, &v.color_space, v.full_range, w, h, &marks).ok_or(NO_LOSSLESS)?;
             let e = ext_of(p);
             let l = quality::redact_args(&pr, &e, &f).ok_or(NO_LOSSLESS)?;
             if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }

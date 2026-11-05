@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const CARD_W: f32 = 340.0;
 const CARD_H: f32 = 64.0;
 const ERROR_H: f32 = 84.0;
+const DETAIL_H: f32 = 34.0;
 const GAP: f32 = 8.0;
 const MAX_CARDS: usize = 4;
 const DONE_SECS: f32 = 3.5;
@@ -61,12 +62,16 @@ fn snapshot() -> Vec<Arc<Job>> { JOBS.lock().unwrap().iter().take(MAX_CARDS).clo
 
 fn failed(j: &Job) -> bool { j.finished.load(Ordering::Relaxed) && !j.cancelled() && !j.errors.lock().unwrap().is_empty() }
 
+fn card_height(j: &Job) -> f32 {
+    if failed(j) { ERROR_H } else if j.detail.lock().unwrap().is_some() { CARD_H + DETAIL_H } else { CARD_H }
+}
+
 struct Hud { shown: bool, preview: bool }
 
 impl Page for Hud {
     fn size(&self) -> (f32, f32) {
         let jobs = snapshot();
-        let h: f32 = jobs.iter().map(|j| if failed(j) { ERROR_H } else { CARD_H }).sum::<f32>() + GAP * jobs.len().saturating_sub(1) as f32;
+        let h: f32 = jobs.iter().map(|j| card_height(j)).sum::<f32>() + GAP * jobs.len().saturating_sub(1) as f32;
         (CARD_W, h.max(CARD_H))
     }
     fn card(&self) -> bool { false }
@@ -86,7 +91,7 @@ impl Page for Hud {
         for j in &jobs {
             let finished = j.finished.load(Ordering::Relaxed);
             let is_failed = failed(j);
-            let h = if is_failed { ERROR_H } else { CARD_H };
+            let h = card_height(j);
             let q = r(0.0, y, CARD_W, h);
             y += h + GAP;
             ui.card(q, 14.0);
@@ -130,6 +135,9 @@ impl Page for Hud {
                 ui.unclip();
             } else {
                 ui.text(&msg, r(tx, q.y + 31.0, q.w - 58.0 - 14.0, 18.0), 11.5, 400, col, Align::Left);
+                if let Some(d) = j.detail.lock().unwrap().as_ref() {
+                    ui.wrapped(d, r(tx, q.y + 52.0, q.w - 58.0 - 14.0, DETAIL_H), 11.0, 400, MUTED);
+                }
             }
         }
     }
@@ -156,7 +164,7 @@ pub fn init() -> Result<()> {
 
 /// The cards as a PNG with sample jobs, for design review.
 pub fn render(out: &std::path::Path) -> std::result::Result<(), String> {
-    let running = Arc::new(Job { title: "Converting to MP4".into(), total: 4, done: 1.into(), frac: Mutex::new(0.55), ..Default::default() });
+    let running = Arc::new(Job { title: "Converting to MP4".into(), total: 4, done: 1.into(), frac: Mutex::new(0.55), detail: Mutex::new(Some("The source is lossy, so re-encoding loses a little. Bitrate is matched to the source.".into())), ..Default::default() });
     let saved = Arc::new(Job { title: "Compressing".into(), total: 1, done: 1.into(), finished: true.into(), last_output: Mutex::new(Some("C:\\holiday compressed.jpg".into())), ..Default::default() });
     let bad = Arc::new(Job { title: "Rendering video".into(), total: 1, done: 1.into(), finished: true.into(), errors: Mutex::new(vec!["ffmpeg stopped: the input has no audio stream, so there is nothing to draw a waveform from.".into()]), ..Default::default() });
     { let mut j = JOBS.lock().unwrap(); j.push(running); j.push(saved); j.push(bad); }

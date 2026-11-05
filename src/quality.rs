@@ -4,14 +4,19 @@
 //! The order of preference, everywhere:
 //!   1. Copy the original bits (stream copy, remux, embedding a JPEG as is).
 //!   2. Lossless encode, when the operation keeps the file's format: redact, crop, trim, split, speed, join.
-//!   3. The highest setting of the target codec, when converting to a format that is lossy by nature.
+//!      A conversion gets this too when the source itself is lossless and the target can hold it.
+//!   3. A lossy source going to a new codec: very high quality, capped at a bitrate matched to the source. A 5 Mbps MP4
+//!      has 5 Mbps of detail, so a lossless copy of it would be many times the size and show nothing more.
+//!   4. The highest setting of the target codec, when the format is lossy by nature.
 //! Compress is the only tool that gives quality away, because that is what the user asked it to do.
 //!
 //! Never trust a filter or an encoder to keep the pixel format by itself. ffmpeg converts silently when
 //! one does not support it (drawbox turns 10-bit into 8-bit without a word), so formats are set explicitly.
+use crate::redact::{Fill, Mark};
 use std::collections::BTreeMap;
 
 /// x264 at this CRF stays in the High profile that every player decodes, unlike true lossless.
+/// With a lossy source the bitrate cap is what decides, and this only stops it spending bits it does not need.
 pub const CONVERT_X264_CRF: &str = "10";
 const CONVERT_VP9_CRF: &str = "4";
 /// GIF timing has centisecond steps, and browsers slow down anything faster than 2 of them.
@@ -31,6 +36,9 @@ pub struct VideoInfo {
     pub fps: f64,
     pub full_range: bool,
     pub extradata: String,
+    pub color_space: String,
+    /// Bits per second of this stream alone, 0 when the file does not say.
+    pub bitrate: u64,
 }
 
 impl VideoInfo {
@@ -47,6 +55,8 @@ pub struct AudioInfo {
     pub bits: u32,
     pub rate: u32,
     pub channels: u32,
+    /// Bits per second, 0 when the file does not say.
+    pub bitrate: u64,
 }
 
 impl AudioInfo {
@@ -67,7 +77,7 @@ pub struct Probe {
 /// ffprobe arguments whose output `parse_probe` reads.
 pub fn probe_args(path: &str) -> Vec<String> {
     sv(&["-v", "error", "-show_data_hash", "md5", "-show_entries",
-        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash:stream_disposition=attached_pic:stream_side_data=rotation",
+        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash,bit_rate,color_space:stream_disposition=attached_pic:stream_side_data=rotation:format=bit_rate",
         "-of", "flat", path])
 }
 
@@ -80,7 +90,9 @@ fn parse_rate(s: &str) -> f64 {
 
 pub fn parse_probe(flat: &str) -> Probe {
     let mut streams: BTreeMap<u32, BTreeMap<String, String>> = BTreeMap::new();
+    let mut file_bitrate = 0u64;
     for line in flat.lines() {
+        if let Some(v) = line.strip_prefix("format.bit_rate=") { file_bitrate = v.trim_matches('"').parse().unwrap_or(0); }
         let Some(rest) = line.strip_prefix("streams.stream.") else { continue };
         let Some((n, kv)) = rest.split_once('.') else { continue };
         let Some((k, v)) = kv.split_once('=') else { continue };
@@ -104,6 +116,8 @@ pub fn parse_probe(flat: &str) -> Probe {
                     fps: if fps > 0.0 { fps } else { parse_rate(get("r_frame_rate")) },
                     full_range: get("color_range") == "pc" || get("pix_fmt").starts_with("yuvj"),
                     extradata: get("extradata_hash").into(),
+                    color_space: get("color_space").into(),
+                    bitrate: get("bit_rate").parse().unwrap_or(0),
                 });
             }
             "audio" => p.audio.push(AudioInfo {
@@ -112,11 +126,17 @@ pub fn parse_probe(flat: &str) -> Probe {
                 bits: num("bits_per_raw_sample").max(num("bits_per_sample")),
                 rate: num("sample_rate"),
                 channels: num("channels"),
+                bitrate: get("bit_rate").parse().unwrap_or(0),
             }),
             "subtitle" => p.subs.push(get("codec_name").into()),
             _ => {}
         }
     }
+    // MKV and WebM usually only give a total, so the video gets what the known audio leaves.
+    if let Some(v) = p.video.as_mut() {
+        if v.bitrate == 0 { v.bitrate = file_bitrate.saturating_sub(p.audio.iter().map(|a| a.bitrate).sum()); }
+    }
+    if p.video.is_none() && p.audio.len() == 1 && p.audio[0].bitrate == 0 { p.audio[0].bitrate = file_bitrate; }
     p
 }
 
@@ -192,6 +212,53 @@ fn vp9_nearest(pix: &str) -> String {
     format!("yuv444p{}", if depth_of(&p) > 8 { "12le" } else { "" })
 }
 
+// ---- what the source is worth ----
+
+/// True for codecs that store every pixel exactly, so a lossless target keeps something real.
+pub fn video_is_lossless(codec: &str) -> bool {
+    matches!(codec, "ffv1" | "huffyuv" | "ffvhuff" | "utvideo" | "rawvideo" | "png" | "qtrle" | "lagarith" | "magicyuv" | "v210" | "v410")
+}
+
+/// Rough bits each codec needs for the same picture, relative to H.264.
+fn video_cost(codec: &str) -> f64 {
+    match codec {
+        "av1" => 0.5,
+        "hevc" => 0.6,
+        "vp9" => 0.65,
+        "h264" => 1.0,
+        "vp8" | "vc1" | "wmv3" => 1.1,
+        "mpeg4" | "msmpeg4v3" | "msmpeg4v2" | "wmv1" | "wmv2" => 1.5,
+        "mpeg2video" | "mpeg1video" => 2.0,
+        // Intra-only, so most of their bitrate pays for what the others get from neighbouring frames.
+        "mjpeg" | "prores" | "dvvideo" | "dnxhd" | "gif" => 3.0,
+        _ => 1.0,
+    }
+}
+
+/// The kbps that holds what the source holds, in this encoder. None when the file gives no bitrate to go on.
+fn video_budget(v: &VideoInfo, encoder_cost: f64) -> Option<u32> {
+    if v.bitrate == 0 { return None; }
+    Some(((v.bitrate as f64 / 1000.0 * encoder_cost / video_cost(&v.codec)) as u32).max(100))
+}
+
+/// The same idea for lossy audio.
+fn audio_cost(codec: &str) -> f64 {
+    match codec {
+        "opus" => 0.65,
+        "aac" | "vorbis" | "wmapro" => 0.8,
+        "mp3" | "wmav1" | "wmav2" => 1.0,
+        "ac3" | "eac3" => 1.2,
+        "dts" | "mp2" => 1.5,
+        _ => 1.0,
+    }
+}
+
+/// The lower of the format's top bitrate and what holds everything in the source. Lossless sources get the top.
+fn audio_kbps(a: &AudioInfo, codec: &str, top: u32, match_source: bool) -> u32 {
+    if !match_source || a.is_lossless() || a.bitrate == 0 { return top; }
+    ((a.bitrate as f64 / 1000.0 * audio_cost(codec) / audio_cost(&a.codec)) as u32).clamp(32, top)
+}
+
 // ---- audio ----
 
 /// Whether a codec can go into a container without touching it.
@@ -231,32 +298,36 @@ fn pcm_codec(a: &AudioInfo, big_endian: bool) -> String {
 /// Per-stream options for encoding one audio stream at the best the target allows. `extra` is a filter to run first.
 fn encode_audio(target: &str, a: &AudioInfo, extra: Option<&str>) -> Vec<(&'static str, String)> {
     let ch = a.channels.max(2);
+    // An edit keeps the format and has already lost a generation, so it stays at the top. A conversion matches the source.
+    let m = extra.is_none();
     let mut o: Vec<(&'static str, String)> = vec![];
     let mut cap = 0u32;
     match target {
         "mp3" | "avi" => {
-            o.extend([("c", "libmp3lame".to_string()), ("b", "320k".to_string()), ("compression_level", "0".to_string())]);
+            o.extend([("c", "libmp3lame".to_string()), ("b", format!("{}k", audio_kbps(a, "mp3", 320, m))), ("compression_level", "0".to_string())]);
             cap = 48000;
             if a.channels > 2 { o.push(("ac", "2".into())); }
         }
         "wma" | "wmv" => {
-            o.extend([("c", "wmav2".to_string()), ("b", "320k".to_string())]);
+            o.extend([("c", "wmav2".to_string()), ("b", format!("{}k", audio_kbps(a, "wmav2", 320, m)))]);
             cap = 48000;
             if a.channels > 2 { o.push(("ac", "2".into())); }
         }
         "m4a" | "mp4" | "m4v" | "mov" if a.is_lossless() => o.push(("c", "alac".into())),
-        "m4a" | "mp4" | "m4v" | "mov" | "aac" => o.extend([("c", "aac".to_string()), ("b", format!("{}k", 160 * ch))]),
+        "m4a" | "mp4" | "m4v" | "mov" | "aac" => o.extend([("c", "aac".to_string()), ("b", format!("{}k", audio_kbps(a, "aac", 160 * ch, m)))]),
         "mkv" | "flac" => o.extend([("c", "flac".to_string()), ("compression_level", "8".to_string())]),
+        // Quality 10 is its top, but a set bitrate is what can follow the source.
+        "ogg" if m && !a.is_lossless() && a.bitrate > 0 => o.extend([("c", "libvorbis".to_string()), ("b", format!("{}k", audio_kbps(a, "vorbis", 500, m)))]),
         "ogg" => o.extend([("c", "libvorbis".to_string()), ("q", "10".to_string())]),
         "opus" | "webm" => {
             // libopus refuses more than 256 kbps per channel.
-            o.extend([("c", "libopus".to_string()), ("b", format!("{}k", 256 * a.channels.max(1)))]);
+            o.extend([("c", "libopus".to_string()), ("b", format!("{}k", audio_kbps(a, "opus", 256 * a.channels.max(1), m)))]);
             cap = 48000;
             if a.channels > 2 { o.push(("mapping_family", "1".into())); }
         }
         "wav" => o.push(("c", pcm_codec(a, false))),
         "aiff" | "aif" => o.push(("c", pcm_codec(a, true))),
-        _ => o.extend([("c", "aac".to_string()), ("b", format!("{}k", 160 * ch))]),
+        _ => o.extend([("c", "aac".to_string()), ("b", format!("{}k", audio_kbps(a, "aac", 160 * ch, m)))]),
     }
     let rate = if target == "opus" || target == "webm" { 48000 } else if cap > 0 && a.rate > cap { if a.rate % 44100 == 0 { 44100 } else { cap } } else { a.rate };
     let mut filters: Vec<String> = extra.map(str::to_string).into_iter().collect();
@@ -406,21 +477,88 @@ pub fn redact_args(p: &Probe, src_ext: &str, filter: &str) -> Option<Lossless> {
     Some(l)
 }
 
-/// Solid black over the boxes, in the source's own format. geq rather than drawbox because drawbox only
-/// handles 8-bit: on anything deeper ffmpeg would silently convert the whole video first.
-pub fn redact_filter(pix: &str, full_range: bool, boxes: &[(u32, u32, u32, u32)]) -> Option<String> {
-    let planar = planar_of(pix)?;
-    let c = boxes.iter().map(|(x, y, w, h)| format!("between(X/SW,{x},{})*between(Y/SH,{y},{})", x + w - 1, y + h - 1)).collect::<Vec<_>>().join("+");
-    let d = depth_of(&planar);
-    let alpha = if has_alpha(&planar) { ":a='alpha(X,Y)'" } else { "" };
-    Some(if is_rgb(&planar) {
-        format!("geq=r='if({c},0,r(X,Y))':g='if({c},0,g(X,Y))':b='if({c},0,b(X,Y))'{alpha}")
-    } else if planar.starts_with("gray") {
-        format!("geq=lum='if({c},{},p(X,Y))'", if full_range { 0 } else { 16u32 << (d - 8) })
+/// RGB to this format's YUV samples, using the matrix the video is tagged with.
+fn yuv_of(rgb: [u8; 3], color_space: &str, h: u32, full_range: bool, depth: u32) -> (u32, u32, u32) {
+    let (kr, kb) = match color_space {
+        s if s.starts_with("bt2020") => (0.2627, 0.0593),
+        "bt709" => (0.2126, 0.0722),
+        "bt470bg" | "smpte170m" => (0.299, 0.114),
+        _ if h >= 720 => (0.2126, 0.0722),
+        _ => (0.299, 0.114),
+    };
+    let (r, g, b) = (rgb[0] as f64 / 255.0, rgb[1] as f64 / 255.0, rgb[2] as f64 / 255.0);
+    let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+    let (u, v) = ((b - y) / (2.0 * (1.0 - kb)), (r - y) / (2.0 * (1.0 - kr)));
+    let top = ((1u32 << depth) - 1) as f64;
+    let step = (1u32 << (depth - 8)) as f64;
+    if full_range {
+        ((y * top).round() as u32, ((u + 0.5) * top).round() as u32, ((v + 0.5) * top).round() as u32)
     } else {
-        let (y, n) = (if full_range { 0 } else { 16u32 << (d - 8) }, 128u32 << (d - 8));
-        format!("geq=lum='if({c},{y},p(X,Y))':cb='if({c},{n},p(X,Y))':cr='if({c},{n},p(X,Y))'{alpha}")
-    })
+        (((16.0 + 219.0 * y) * step).round() as u32, ((128.0 + 224.0 * u) * step).round() as u32, ((128.0 + 224.0 * v) * step).round() as u32)
+    }
+}
+
+/// How much of a mark covers a sample, from 0 to `top`. The same shape as `Mark::coverage`, written for geq.
+fn coverage_expr(m: &Mark, top: u32) -> String {
+    let (xx, yy) = ("(X/SW+0.5)", "(Y/SH+0.5)");
+    let (x0, y0, x1, y1) = (m.x as f64, m.y as f64, (m.x + m.w) as f64, (m.y + m.h) as f64);
+    let boxed = format!("hypot(max(max({x0}-{xx},{xx}-{x1}),0),max(max({y0}-{yy},{yy}-{y1}),0))");
+    let d = if m.ellipse {
+        let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+        let (dx, dy) = (format!("({xx}-{})", x0 + rx), format!("({yy}-{})", y0 + ry));
+        let k = format!("(pow({dx}/{rx},2)+pow({dy}/{ry},2))");
+        // Inside when k <= 1. Otherwise first-order distance to the curve, never less than to the bounding box.
+        format!("if(lte({k},1),0,max(({k}-1)/(2*hypot({dx}/{},{dy}/{})),{boxed}))", rx * rx, ry * ry)
+    } else {
+        boxed
+    };
+    if m.feather == 0 { return format!("if(lte({d},0),{top},0)"); }
+    let f = m.feather;
+    format!("if(lte({d},0),{top},if(gte({d},{f}),0,{top}*pow(1-({d})/{f},2)*(3-2*(1-({d})/{f}))))")
+}
+
+/// geq arguments giving each plane of this format a value.
+fn planes(planar: &str, luma_or_all: &str, cb: &str, cr: &str) -> String {
+    let alpha = if has_alpha(planar) { ":a='0'" } else { "" };
+    if is_rgb(planar) { format!("geq=r='{luma_or_all}':g='{cb}':b='{cr}'{alpha}") }
+    else if planar.starts_with("gray") { format!("geq=lum='{luma_or_all}'") }
+    else { format!("geq=lum='{luma_or_all}':cb='{cb}':cr='{cr}'{alpha}") }
+}
+
+/// Applies the marks in the source's own format, for `format=` to precede. Each mark merges a layer through a mask
+/// holding its coverage. A zero in the mask leaves a sample exactly as it was, at any depth, and the mask and solid
+/// layers are one frame each, repeated, so a long video does not pay to compute them again.
+pub fn redact_graph(pix: &str, color_space: &str, full_range: bool, w: u32, h: u32, marks: &[Mark]) -> Option<String> {
+    let planar = planar_of(pix)?;
+    let d = depth_of(&planar);
+    let top = (1u32 << d) - 1;
+    let frame = format!("color=black:s={w}x{h}:r=1:d=1,format={planar},");
+    let mut g = String::from("null[c0];");
+    for (i, m) in marks.iter().enumerate() {
+        let n = i + 1;
+        let layer = match m.fill {
+            Fill::Blur(sigma) => { g.push_str(&format!("[c{i}]split[s{i}][t{i}];[t{i}]gblur=sigma={:.3}:steps=3[l{i}];", sigma.max(0.5))); format!("[s{i}]") }
+            Fill::Solid(rgb) => {
+                let vals = if is_rgb(&planar) {
+                    // gbr planes in geq's r, g and b order, scaled to depth.
+                    let s = |c: u8| ((c as f64 / 255.0) * top as f64).round() as u32;
+                    (s(rgb[0]), s(rgb[1]), s(rgb[2]))
+                } else if planar.starts_with("gray") {
+                    let y = 0.299 * rgb[0] as f64 + 0.587 * rgb[1] as f64 + 0.114 * rgb[2] as f64;
+                    (if full_range { (y / 255.0 * top as f64).round() as u32 } else { ((16.0 + y / 255.0 * 219.0) * (1u32 << (d - 8)) as f64).round() as u32 }, 0, 0)
+                } else {
+                    yuv_of(rgb, color_space, h, full_range, d)
+                };
+                g.push_str(&format!("{frame}{}[l{i}];", planes(&planar, &vals.0.to_string(), &vals.1.to_string(), &vals.2.to_string())));
+                format!("[c{i}]")
+            }
+        };
+        let c = coverage_expr(m, top);
+        g.push_str(&format!("{frame}{}[m{i}];", planes(&planar, &c, &c, &c)));
+        g.push_str(&format!("{layer}[l{i}][m{i}]maskedmerge"));
+        if n < marks.len() { g.push_str(&format!("[c{n}];")); }
+    }
+    Some(g)
 }
 
 // ---- conversion, where the target format decides what is possible ----
@@ -437,23 +575,53 @@ fn video_fits(container: &str, codec: &str) -> bool {
     }
 }
 
-/// Encoder arguments for a video target at its top setting. Keeps depth and chroma, and pads rather than
-/// resamples a frame whose odd size a codec cannot store: a scale filter would soften every pixel to add one row.
+/// x264's cap overshoots by about a quarter on detailed video, so it is set under the budget it must hold.
+fn x264_cap(kbps: u32) -> Vec<String> {
+    let cap = kbps * 4 / 5;
+    vec!["-maxrate".into(), format!("{cap}k"), "-bufsize".into(), format!("{}k", cap * 2)]
+}
+
+/// Encoder arguments for a video target, chosen by what the source is worth: lossless when it is lossless and the format
+/// can hold that, otherwise capped to match it. Keeps depth and chroma, and pads rather than resamples a frame whose odd
+/// size a codec cannot store: a scale filter would soften every pixel to add one row.
 fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
     let pix = v.map(|i| i.pix_fmt.as_str()).unwrap_or("");
+    let lossless_source = v.is_some_and(|i| video_is_lossless(&i.codec));
     let mut a: Vec<String> = vec![];
     let fmt = match target {
         "mp4" | "m4v" | "mov" | "mkv" => {
-            a.extend(sv(&["-c:v", "libx264", "-preset", "slow", "-crf", CONVERT_X264_CRF]));
+            if lossless_source {
+                a.extend(sv(&["-c:v", "libx264", "-qp", "0", "-preset", "medium"]));
+            } else {
+                a.extend(sv(&["-c:v", "libx264", "-preset", "slow", "-crf", CONVERT_X264_CRF]));
+                if let Some(k) = v.and_then(|i| video_budget(i, 1.0)) { a.extend(x264_cap(k)); }
+            }
             (!pix.is_empty()).then(|| x264_nearest(pix))
         }
         "webm" => {
-            a.extend(sv(&["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", CONVERT_VP9_CRF, "-qmin", "0", "-qmax", "20", "-deadline", "good", "-cpu-used", "2", "-row-mt", "1"]));
+            if lossless_source {
+                a.extend(sv(&["-c:v", "libvpx-vp9", "-lossless", "1", "-row-mt", "1", "-deadline", "good", "-cpu-used", "2"]));
+            } else {
+                // A VP9 target bitrate lands well under what it is given, so this counts as H.264's budget, not its own.
+                let k = v.and_then(|i| video_budget(i, 1.0)).map(|k| format!("{k}k")).unwrap_or_else(|| "0".to_string());
+                a.extend(sv(&["-c:v", "libvpx-vp9", "-b:v", &k, "-crf", CONVERT_VP9_CRF, "-qmin", "0", "-qmax", "20", "-deadline", "good", "-cpu-used", "2", "-row-mt", "1"]));
+            }
             (!pix.is_empty()).then(|| vp9_nearest(pix))
         }
-        // These codecs stop at 8-bit 4:2:0. Scale 1 is their finest.
-        "avi" => { a.extend(sv(&["-c:v", "mpeg4", "-q:v", "1", "-qmin", "1", "-mbd", "rd"])); Some("yuv420p".to_string()) }
-        "wmv" => { a.extend(sv(&["-c:v", "wmv2", "-q:v", "1", "-qmin", "1", "-mbd", "rd"])); Some("yuv420p".to_string()) }
+        // AVI can carry FFV1, so a lossless source stays lossless. These older codecs otherwise stop at 8-bit 4:2:0.
+        "avi" if lossless_source => {
+            a.extend(sv(&["-c:v", "ffv1", "-level", "3", "-g", "1", "-slices", "16", "-slicecrc", "1"]));
+            return a;
+        }
+        "avi" | "wmv" => {
+            let (codec, cost) = if target == "avi" { ("mpeg4", 1.5) } else { ("wmv2", 1.6) };
+            a.extend(sv(&["-c:v", codec, "-mbd", "rd", "-qmin", "1"]));
+            match v.filter(|i| !lossless_source && i.bitrate > 0).and_then(|i| video_budget(i, cost)) {
+                Some(k) => a.extend(["-b:v".to_string(), format!("{k}k"), "-maxrate".to_string(), format!("{k}k"), "-bufsize".to_string(), format!("{}k", k * 2)]),
+                None => a.extend(sv(&["-q:v", "1"])),
+            }
+            Some("yuv420p".to_string())
+        }
         _ => None,
     };
     let needs_pad = match (&fmt, v) {
@@ -540,6 +708,68 @@ pub fn convert_attempts(p: &Probe, target: &str) -> Vec<Vec<String>> {
             v
         }
     }
+}
+
+// ---- telling the user what a format cannot do ----
+
+fn format_name(t: &str) -> String { match t { "jpg" | "jpeg" => "JPEG".into(), o => o.to_ascii_uppercase() } }
+
+/// One short line about what this conversion must give up, when it must give up anything.
+pub fn media_notice(p: &Probe, target: &str) -> Option<String> {
+    let name = format_name(target);
+    match target {
+        "gif" => return Some("GIF holds 256 colours per frame and has no sound, so colours are approximated.".into()),
+        "mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "aiff" | "wma" => {
+            let a = p.audio.first()?;
+            if audio_fits(target, &a.codec) { return None; }
+            if a.channels > 2 && matches!(target, "mp3" | "wma") { return Some(format!("{name} holds two channels, so surround sound is mixed down.")); }
+            let target_lossless = matches!(target, "wav" | "flac" | "aiff");
+            return match (target_lossless, a.is_lossless()) {
+                (true, true) => None,
+                (true, false) => Some(format!("The source is lossy. {name} keeps all of it, but cannot bring back what it lost.")),
+                (false, true) if target == "m4a" => None,
+                (false, true) => Some(format!("{name} is a lossy format, so some detail is lost. Using its top quality.")),
+                (false, false) => Some(format!("Both formats are lossy, so a little is lost. Quality is matched to the source.")),
+            };
+        }
+        _ => {}
+    }
+    let v = p.video.as_ref()?;
+    if video_fits(target, &v.codec) { return None; }
+    let planar = planar_of(&v.pix_fmt).unwrap_or_default();
+    if target == "wmv" { return Some("WMV is lossy and 8-bit, so some detail is lost. Using its top quality.".into()); }
+    if target == "avi" && !video_is_lossless(&v.codec) && (depth_of(&planar) > 8 || !planar.contains("420")) {
+        return Some("This AVI codec stores 8-bit 4:2:0, so some colour detail is lost.".into());
+    }
+    if has_alpha(&planar) && matches!(target, "mp4" | "m4v" | "mov") { return Some(format!("{name} video here has no transparency, so it is flattened.")); }
+    if video_is_lossless(&v.codec) { return None; }
+    Some("The source is lossy, so re-encoding loses a little. Bitrate is matched to the source.".into())
+}
+
+pub fn image_notice(src_ext: &str, target: &str) -> Option<String> {
+    let lossy_source = matches!(src_ext, "jpg" | "jpeg" | "heic" | "heif" | "avif");
+    match target {
+        "jpg" | "jpeg" => Some("JPEG is lossy and has no transparency. Saving at top quality with full colour.".into()),
+        "heic" | "heif" => Some("HEIC is lossy here. Saving at top quality.".into()),
+        "bmp" => Some("BMP keeps every pixel but flattens transparency.".into()),
+        "webp" | "avif" if lossy_source => Some(format!("Both formats are lossy, so a little is lost. Size is matched to the source.")),
+        _ => None,
+    }
+}
+
+/// `cat` names the source: pdf, doc, slides, sheet, epub or sub.
+pub fn document_notice(cat: &str, target: &str) -> Option<String> {
+    Some(match (cat, target) {
+        ("pdf", "jpg" | "png") | ("slides", "jpg" | "png") | ("doc", "jpg" | "png") => "Pages become pictures, so text stops being selectable.".into(),
+        ("pdf", "txt" | "md" | "epub") => "Only the text carries over. Layout and images are left behind.".into(),
+        ("pdf", "docx" | "xlsx") => "PDF does not record structure, so the layout is rebuilt as closely as possible.".into(),
+        ("pdf", "pptx") => "Each page becomes a picture on a slide, so text stops being editable.".into(),
+        ("doc" | "epub", "txt") => "Plain text has no formatting or images, so only the words carry over.".into(),
+        ("doc" | "epub", "md") => "Markdown holds basic formatting only. The rest is simplified.".into(),
+        ("sheet", "csv" | "tsv") => format!("{} holds one sheet of plain values. Formatting and formulas are lost.", format_name(target)),
+        ("sub", "txt") => "Plain text has no timing, so only the words carry over.".into(),
+        _ => return None,
+    })
 }
 
 /// Audio filtered in place (normalize, channels, bleep): the same format at its best settings.
@@ -642,8 +872,11 @@ pub fn can_concat_copy(probes: &[Probe], exts: &[String]) -> bool {
     let Some(first) = probes.first() else { return false };
     let Some(v) = &first.video else { return false };
     if v.extradata.is_empty() && matches!(v.codec.as_str(), "h264" | "hevc") { return false; }
+    // Two takes from one camera differ in bitrate and nothing else.
+    let same_audio = |a: &[AudioInfo], b: &[AudioInfo]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| AudioInfo { bitrate: 0, ..x.clone() } == AudioInfo { bitrate: 0, ..y.clone() });
+    let plain = |o: &VideoInfo| VideoInfo { bitrate: 0, ..o.clone() };
     exts.iter().all(|e| *e == exts[0]) && probes.iter().all(|p| {
-        p.video.as_ref().is_some_and(|o| o == v) && p.audio == first.audio && p.subs.is_empty()
+        p.video.as_ref().is_some_and(|o| plain(o) == plain(v)) && same_audio(&p.audio, &first.audio) && p.subs.is_empty()
     })
 }
 
@@ -733,6 +966,16 @@ pub fn image_encode_args(ext: &str) -> Vec<String> {
     a
 }
 
+/// Lossy settings to try from a lossy source, best first: the first that does not outgrow the source is kept, the same
+/// rule as video bitrate. A lossless copy of a JPEG would be several times its size and show nothing more.
+pub fn still_ladder(ext: &str) -> Vec<Vec<String>> {
+    if ext == "webp" {
+        [100, 98, 95, 90].iter().map(|q: &u32| sv(&["-c:v", "libwebp", "-quality", &q.to_string()])).collect()
+    } else {
+        [8, 14, 20, 26].iter().map(|c: &u32| sv(&["-c:v", "libaom-av1", "-still-picture", "1", "-crf", &c.to_string(), "-pix_fmt", "yuv444p", "-cpu-used", "4"])).collect()
+    }
+}
+
 /// AVIF only stays lossless with RGB samples stored directly, since converting to YUV rounds.
 pub fn avif_lossless_args() -> Vec<String> {
     sv(&["-c:v", "libaom-av1", "-still-picture", "1", "-crf", "0", "-lossless", "1", "-pix_fmt", "gbrp", "-cpu-used", "4"])
@@ -800,6 +1043,7 @@ streams.stream.2.codec_type="video"
 streams.stream.2.disposition.attached_pic=1
 streams.stream.3.codec_name="subrip"
 streams.stream.3.codec_type="subtitle"
+format.bit_rate="5000000"
 "#;
 
     #[test]
@@ -854,7 +1098,7 @@ streams.stream.3.codec_type="subtitle"
     }
     #[test]
     fn opus_bitrate_respects_the_per_channel_limit() {
-        let a = AudioInfo { codec: "flac".into(), sample_fmt: "s32".into(), bits: 24, rate: 96000, channels: 1 };
+        let a = AudioInfo { codec: "flac".into(), sample_fmt: "s32".into(), bits: 24, rate: 96000, channels: 1, ..Default::default() };
         let o = encode_audio("opus", &a, None);
         assert!(o.contains(&("b", "256k".to_string())) && o.contains(&("ar", "48000".to_string())));
     }
@@ -897,11 +1141,57 @@ streams.stream.3.codec_type="subtitle"
         assert_eq!(x + w, 639);
     }
     #[test]
-    fn redact_black_matches_depth_and_range() {
-        let f = redact_filter("yuv420p10le", false, &[(0, 0, 2, 2)]).unwrap();
-        assert!(f.contains(",64,") && f.contains(",512,"), "{f}");
-        let f = redact_filter("yuvj420p", true, &[(0, 0, 2, 2)]).unwrap();
-        assert!(f.contains(",0,p(") && f.contains(",128,"), "{f}");
+    fn black_lands_on_the_right_value_for_depth_and_range() {
+        assert_eq!(yuv_of([0, 0, 0], "bt709", 1080, false, 10), (64, 512, 512));
+        assert_eq!(yuv_of([0, 0, 0], "bt709", 1080, false, 8), (16, 128, 128));
+        assert_eq!(yuv_of([0, 0, 0], "bt709", 1080, true, 8).0, 0);
+        assert_eq!(yuv_of([255, 255, 255], "bt709", 1080, false, 8), (235, 128, 128));
+        // Red differs by matrix, so the tag has to be honoured.
+        assert_ne!(yuv_of([255, 0, 0], "bt709", 1080, false, 8), yuv_of([255, 0, 0], "bt470bg", 480, false, 8));
+    }
+    #[test]
+    fn lossy_sources_are_capped_and_lossless_ones_are_not() {
+        let v = VideoInfo { codec: "h264".into(), pix_fmt: "yuv420p".into(), width: 640, height: 360, bitrate: 5_000_000, ..Default::default() };
+        let a = encode_video("mov", Some(&v)).join(" ");
+        assert!(a.contains("-maxrate 4000k") && a.contains("-crf"), "{a}");
+        let hevc = VideoInfo { codec: "hevc".into(), ..v.clone() };
+        assert!(encode_video("mp4", Some(&hevc)).join(" ").contains("-maxrate 6666k"), "HEVC needs more bits as H.264");
+        let raw = VideoInfo { codec: "ffv1".into(), ..v.clone() };
+        let l = encode_video("mp4", Some(&raw)).join(" ");
+        assert!(l.contains("-qp 0") && !l.contains("-maxrate"), "{l}");
+        assert!(encode_video("avi", Some(&raw)).join(" ").contains("ffv1"));
+        assert!(encode_video("webm", Some(&raw)).join(" ").contains("-lossless 1"));
+    }
+    #[test]
+    fn audio_bitrate_follows_a_lossy_source() {
+        let mp3 = AudioInfo { codec: "mp3".into(), sample_fmt: "fltp".into(), rate: 44100, channels: 2, bitrate: 128_000, ..Default::default() };
+        assert!(encode_audio("m4a", &mp3, None).contains(&("b", "102k".to_string())));
+        assert!(encode_audio("opus", &mp3, None).contains(&("b", "83k".to_string())));
+        assert!(encode_audio("wma", &mp3, None).contains(&("b", "128k".to_string())));
+        let flac = AudioInfo { codec: "flac".into(), sample_fmt: "s32".into(), rate: 44100, channels: 2, ..Default::default() };
+        assert!(encode_audio("mp3", &flac, None).contains(&("b", "320k".to_string())));
+        assert_eq!(encode_audio("m4a", &flac, None)[0].1, "alac");
+        assert!(encode_audio("mp3", &mp3, Some("volume=1")).contains(&("b", "320k".to_string())), "edits stay at the top");
+        let huge = AudioInfo { bitrate: 900_000, ..mp3 };
+        assert!(encode_audio("mp3", &huge, None).contains(&("b", "320k".to_string())));
+    }
+    #[test]
+    fn notices_appear_only_when_something_is_given_up() {
+        let mut p = parse_probe(FLAT);
+        assert!(media_notice(&p, "mkv").is_none(), "stream copy gives up nothing");
+        assert!(media_notice(&p, "m4a").is_none(), "AAC moves as it is");
+        assert!(media_notice(&p, "gif").unwrap().contains("256"));
+        assert!(media_notice(&p, "webm").unwrap().contains("matched"));
+        assert!(media_notice(&p, "mp3").unwrap().contains("lossy"));
+        assert!(media_notice(&p, "wav").unwrap().contains("cannot bring back"));
+        p.audio[0].codec = "flac".into();
+        assert!(media_notice(&p, "flac").is_none());
+        assert!(media_notice(&p, "m4a").is_none());
+        assert!(media_notice(&p, "mp3").unwrap().contains("top quality"));
+        assert!(image_notice("png", "jpg").is_some());
+        assert!(image_notice("jpg", "png").is_none());
+        assert!(document_notice("pdf", "txt").is_some());
+        assert!(document_notice("sheet", "xlsx").is_none());
     }
     #[test]
     fn keyframe_check_uses_half_a_frame() {
@@ -926,6 +1216,9 @@ streams.stream.3.codec_type="subtitle"
         let mut plain = p.clone();
         plain.subs.clear();
         assert!(can_concat_copy(&[plain.clone(), plain.clone()], &e("mp4")));
+        let mut other_rate = plain.clone();
+        other_rate.video.as_mut().unwrap().bitrate = 1;
+        assert!(can_concat_copy(&[plain.clone(), other_rate], &e("mp4")), "bitrate alone does not stop a join");
         let mut other = plain.clone();
         other.video.as_mut().unwrap().extradata = "md5:zzz".into();
         assert!(!can_concat_copy(&[plain.clone(), other], &e("mp4")));

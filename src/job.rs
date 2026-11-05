@@ -21,6 +21,8 @@ pub struct Job {
     pub finished_at: Mutex<Option<std::time::Instant>>,
     /// Shown when finished, in place of the saved file name.
     pub note: Mutex<Option<String>>,
+    /// What the format being written cannot hold, shown on the card while it works.
+    pub detail: Mutex<Option<String>>,
 }
 
 impl Job {

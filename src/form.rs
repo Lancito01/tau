@@ -1,6 +1,7 @@
 //! The option form every simple tool uses. Callers describe fields; the page lays them out.
 use crate::gfx::*;
-use crate::ui::{self, r, Align, Page, Style, Ui, FOOT_H, PAD, TITLE_H};
+use crate::image::Bmp;
+use crate::ui::{self, r, Align, Page, Style, Ui, FOOT_H, PAD, R, TITLE_H};
 use std::cell::RefCell;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
@@ -31,6 +32,11 @@ pub fn context() -> String { CONTEXT.with(|c| c.borrow().clone()) }
 
 const SWATCHES: [&str; 6] = ["#FFFFFF", "#000000", "#F2EFE8", "#1E293B", "#2563EB", "#E11D48"];
 const WIDTH: f32 = 480.0;
+const STAGE: f32 = 560.0;
+const MIN_WITH_STAGE: f32 = 520.0;
+
+/// Draws the result for a form's current values, cheaply enough to run as they change.
+pub type Render = Box<dyn FnMut(&[String]) -> Option<Bmp>>;
 
 struct Value { text: String, sel: usize, on: bool, num: f32 }
 
@@ -44,6 +50,10 @@ pub struct Form {
     max_h: f32,
     started: bool,
     result: Option<bool>,
+    render: Option<Render>,
+    shown: Option<Bmp>,
+    shown_for: Vec<String>,
+    generation: u64,
 }
 
 /// Short option lists read best as a segmented control.
@@ -72,7 +82,7 @@ impl Form {
         let at = cursor_pos();
         let wa = work_area_at(at);
         let max_h = (wa.bottom - wa.top) as f32 / dpi_scale_at(at) - 80.0;
-        Form { title: title.into(), sub: sub.into(), fields: fields.to_vec(), values, ok: ok.into(), content: 120.0, max_h, started: false, result: None }
+        Form { title: title.into(), sub: sub.into(), fields: fields.to_vec(), values, ok: ok.into(), content: 120.0, max_h, started: false, result: None, render: None, shown: None, shown_for: vec![], generation: 0 }
     }
     fn output(&self) -> Vec<String> {
         self.fields.iter().zip(&self.values).map(|(f, v)| match f {
@@ -83,7 +93,34 @@ impl Form {
             _ => String::new(),
         }).collect()
     }
-    fn height(&self) -> f32 { (TITLE_H + self.content + FOOT_H).min(self.max_h) }
+    fn height(&self) -> f32 {
+        let wanted = TITLE_H + self.content + FOOT_H;
+        (if self.render.is_some() { wanted.max(MIN_WITH_STAGE) } else { wanted }).min(self.max_h)
+    }
+    fn width(&self) -> f32 { if self.render.is_some() { WIDTH + STAGE } else { WIDTH } }
+
+    /// The live result beside the fields, redrawn when a value changes.
+    fn stage(&mut self, ui: &mut Ui, q: R) {
+        let now = self.output();
+        if self.shown_for != now || self.shown.is_none() {
+            if let Some(f) = self.render.as_mut() {
+                if let Some(b) = f(&now) {
+                    ui.forget_image(ui::id(&format!("form.stage{}", self.generation)));
+                    self.generation += 1;
+                    self.shown = Some(b);
+                }
+            }
+            self.shown_for = now;
+        }
+        ui.fill(q, 0.0, 0x0A0B0C, 1.0);
+        ui.fill(r(q.x, q.y, 1.0, q.h), 0.0, BORDER, 0.7);
+        if let Some(b) = &self.shown {
+            let inner = q.inset(16.0);
+            let s = (inner.w / b.w as f32).min(inner.h / b.h as f32);
+            let (w, h) = (b.w as f32 * s, b.h as f32 * s);
+            ui.image(ui::id(&format!("form.stage{}", self.generation)), b, r(inner.x + (inner.w - w) / 2.0, inner.y + (inner.h - h) / 2.0, w, h));
+        }
+    }
 
     /// Lays out and draws the fields from `y`, returning where they end.
     fn body(&mut self, ui: &mut Ui, start: f32) -> f32 {
@@ -180,7 +217,7 @@ impl Form {
 }
 
 impl Page for Form {
-    fn size(&self) -> (f32, f32) { (WIDTH, self.height()) }
+    fn size(&self) -> (f32, f32) { (self.width(), self.height()) }
     fn done(&self) -> bool { self.result.is_some() }
     fn on_close(&mut self) { self.result = Some(false); }
     fn frame(&mut self, ui: &mut Ui) {
@@ -198,10 +235,12 @@ impl Page for Form {
         if overflow { ui.unclip(); }
         self.content = end - top + 8.0;
 
+        let total = self.width();
+        if self.render.is_some() { self.stage(ui, r(WIDTH, TITLE_H, STAGE, h - TITLE_H - FOOT_H)); }
         let fy = h - FOOT_H;
-        ui.divider(fy, 0.0, WIDTH);
+        ui.divider(fy, 0.0, total);
         let by = fy + (FOOT_H - 38.0) / 2.0;
-        let primary = r(WIDTH - PAD - 120.0, by, 120.0, 38.0);
+        let primary = r(total - PAD - 120.0, by, 120.0, 38.0);
         let cancel = r(primary.x - 96.0, by, 88.0, 38.0);
         if ui.button("form.cancel", "Cancel", cancel, Style::Ghost, true) { self.result = Some(false); }
         if ui.button("form.ok", &self.ok.clone(), primary, Style::Primary, true) { self.result = Some(true); }
@@ -214,6 +253,14 @@ impl Page for Form {
 /// Choice gives the chosen option text, Check gives "1" or "0", Slider the number, Note and Heading "".
 pub fn show(title: &str, fields: &[Field], ok_label: &str) -> Option<Vec<String>> {
     let f = ui::run_modal(Form::new(title, &context(), fields, ok_label), title, None)?;
+    (f.result == Some(true)).then(|| f.output())
+}
+
+/// The same, with the result drawn live beside the fields.
+pub fn show_with_preview(title: &str, fields: &[Field], ok_label: &str, render: Render) -> Option<Vec<String>> {
+    let mut page = Form::new(title, &context(), fields, ok_label);
+    page.render = Some(render);
+    let f = ui::run_modal(page, title, None)?;
     (f.result == Some(true)).then(|| f.output())
 }
 
