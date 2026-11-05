@@ -1,0 +1,79 @@
+feature,area,priority,original,clone,notes
+Drag + tap key opens wheel at cursor,wheel,must,yes,yes,tested with a real OLE file drag from a test window; a drag from File Explorer still needs a test by hand
+Convert wheel by file type,wheel,must,yes,yes,
+Tools wheel by file type,wheel,must,yes,yes,
+Actions wheel for anything,wheel,must,yes,yes,
+Wheel stays open after key release,wheel,must,yes,yes,
+Switch wheels mid-drag,wheel,must,yes,yes,"Scroll while the wheel is up; trackpads, which cannot scroll mid-drag, can opt in to a separate key per wheel"
+Esc cancels,wheel,must,yes,yes,
+Keyboard flow (select + key + arrows + Enter),wheel,must,yes,yes,"Windows cannot take Enter globally, so Ctrl+Alt+Space opens the wheel for the Explorer selection, then arrows + Enter"
+Rebind keys in Settings,settings,must,yes,yes,Settings window checked; a changed key was not exercised through the hook
+Tray icon and menu,settings,must,yes,yes,Settings menu command tested by message; clicking the tray icon itself was not tested
+Launch at login,settings,should,yes,yes,"per-user Run key, off by default; on/off round trip tested"
+Solid vs translucent look,settings,could,yes,no,not built
+Saved beside the original with no overwrite,core,must,yes,yes,
+Progress HUD with cancel,core,must,yes,yes,
+Batch selection,core,must,yes,yes,
+Works fully offline,core,must,yes,yes,
+Image conversions JPG PNG WebP TIFF AVIF BMP,convert,must,yes,yes,
+HEIC conversion,convert,should,yes,partial,HEIC output needs the Store HEIF/HEVC codecs
+SVG input,convert,could,yes,yes,"needs ffmpeg, which the MSI does not bundle; without it these entries are dimmed"
+Image to PDF export,convert,must,yes,yes,
+Audio conversions MP3 M4A WAV FLAC OGG Opus AIFF WMA,convert,must,yes,yes,"needs ffmpeg, which the MSI does not bundle; without it these entries are dimmed"
+Video conversions MP4 MOV MKV WebM AVI WMV GIF + MP3,convert,must,yes,yes,"needs ffmpeg, which the MSI does not bundle; without it these entries are dimmed"
+PDF to JPG/PNG at 300 DPI,convert,must,yes,yes,
+PDF to TXT,convert,must,yes,yes,
+PDF to MD,convert,should,yes,yes,
+PDF to DOCX,convert,should,yes,yes,"needs Word; one transient failure earlier was not reproduced, retry added"
+PDF to PPTX,convert,could,yes,yes,needs PowerPoint
+PDF to XLSX,convert,could,yes,yes,needs Excel
+PDF to EPUB,convert,could,yes,yes,
+OCR for scanned PDFs,convert,could,yes,yes,uses Windows OCR and the installed language packs
+Documents DOCX MD TXT EPUB to PDF HTML etc,convert,should,yes,yes,Word formats need Word; HTML to PDF uses Edge
+RTF input,convert,could,yes,yes,
+Slides PPT PPTX to PDF JPG PNG,convert,should,yes,yes,needs PowerPoint
+Spreadsheets XLSX ODS CSV TSV XLS + PDF,convert,should,yes,yes,needs Excel except csv/tsv swaps
+EPUB to PDF DOCX TXT MD HTML,convert,could,yes,yes,
+Subtitles SRT VTT TXT,convert,must,yes,yes,
+Archives ZIP TAR GZIP + RAR input,convert,must,yes,yes,
+Extract archive,tools,must,yes,yes,
+Compress image,tools,must,yes,yes,
+Image metadata edit or strip,tools,should,yes,partial,"strip only, no editing of image metadata"
+Edit photo adjustments,tools,could,yes,yes,
+Annotate photo,tools,could,yes,yes,
+Add background,tools,could,yes,yes,
+Crop image,tools,must,yes,yes,
+Redact photo with face and text detection,tools,should,yes,yes,
+Create PDF from images,tools,must,yes,yes,
+Collage,tools,could,yes,yes,
+Compress video,tools,must,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Video metadata,tools,could,yes,yes,
+Mute video,tools,must,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Trim video,tools,must,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Crop video,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Speed video,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Snapshot video frames,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Split video,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Redact video,tools,could,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Join videos,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Compress audio,tools,must,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Audio metadata,tools,should,yes,yes,shares the video metadata code; not content-checked on its own
+Normalize audio,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Visualize audio,tools,could,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Trim audio,tools,must,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Audio channels,tools,should,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Bleep audio,tools,could,yes,yes,"needs ffmpeg, not bundled in the MSI"
+Compress PDF,tools,should,yes,yes,
+PDF metadata,tools,could,yes,yes,
+Split PDF,tools,must,yes,yes,
+Organize PDF pages,tools,should,yes,yes,
+Merge PDFs,tools,must,yes,yes,
+Share action (AirDrop equivalent),actions,must,yes,partial,OPEN: Windows share host starts but no visible sheet was captured and focus leaves at once; needs a test by hand
+Float shelf,actions,should,yes,yes,opens and lists the file; dragging out of it was not tested
+Copy action,actions,must,yes,yes,
+Move action,actions,must,yes,partial,cancel tested through the wheel; a real move was not run end to end
+Copy Path action,actions,must,yes,yes,
+Terminal action,actions,must,yes,yes,opened Windows Terminal at the file's folder
+Pages import and export,convert,could,yes,skip,proprietary format with no Windows engine
+AirDrop itself,actions,could,yes,skip,Apple-only; Share sheet replaces it
+Trial limit and purchase,commerce,could,yes,skip,personal tool

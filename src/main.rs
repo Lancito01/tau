@@ -1,0 +1,422 @@
+//! Orrery: drag a file, tap a key, drop it on an orbit.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
+mod actions;
+mod canvas;
+mod catalog;
+mod convert;
+mod detect;
+mod docs;
+mod explorer;
+mod form;
+mod gfx;
+mod hud;
+mod image;
+mod job;
+mod media;
+mod pdf;
+mod settings;
+mod shelf;
+mod timeline;
+mod tools;
+mod update;
+mod wheel;
+
+use catalog::{Engines, Kind};
+use settings::Settings;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use windows::core::*;
+use windows::Win32::Foundation::*;
+use windows::Win32::System::Console::*;
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Ole::OleInitialize;
+use windows::Win32::System::Registry::*;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+pub const VERSION: &str = match option_env!("ORRERY_VERSION") { Some(v) => v, None => env!("CARGO_PKG_VERSION") };
+
+const WM_APP_TRAY: u32 = WM_APP + 30;
+const WM_APP_QUIT: u32 = WM_APP + 31;
+const MENU_SETTINGS: usize = 1;
+const MENU_UPDATE: usize = 2;
+const MENU_QUIT: usize = 3;
+const HOTKEY_ID: i32 = 1;
+const COPYDATA_PATHS: usize = 0x4F52;
+
+static MAIN: AtomicIsize = AtomicIsize::new(0);
+static WHEEL: AtomicIsize = AtomicIsize::new(0);
+/// Which key group opens each wheel, indexed by `Kind` order.
+static KEYS: [AtomicU32; 3] = [AtomicU32::new(1), AtomicU32::new(2), AtomicU32::new(3)];
+static HELD: AtomicU32 = AtomicU32::new(0);
+/// Key groups whose press Windows saw, so their release must reach it too or the key sticks.
+static LEAKED: AtomicU32 = AtomicU32::new(0);
+/// Key groups whose press was hidden from Windows, so their release must be hidden too.
+static EATEN: AtomicU32 = AtomicU32::new(0);
+/// Each wheel has its own key. Otherwise one key opens the wheel and scrolling switches.
+static SEPARATE_KEYS: AtomicBool = AtomicBool::new(false);
+
+// ---- engines ----
+
+fn on_path(name: &str) -> Option<PathBuf> {
+    let beside = std::env::current_exe().ok()?.with_file_name(name);
+    if beside.exists() { return Some(beside); }
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+pub fn ffmpeg() -> Option<PathBuf> {
+    static F: OnceLock<Option<PathBuf>> = OnceLock::new();
+    F.get_or_init(|| on_path("ffmpeg.exe")).clone()
+}
+
+fn has_progid(id: PCWSTR) -> bool {
+    unsafe {
+        let mut k = HKEY::default();
+        let ok = RegOpenKeyExW(HKEY_CLASSES_ROOT, id, None, KEY_READ, &mut k).is_ok();
+        if ok { let _ = RegCloseKey(k); }
+        ok
+    }
+}
+
+pub fn engines() -> Engines {
+    static E: OnceLock<Engines> = OnceLock::new();
+    *E.get_or_init(|| Engines {
+        ffmpeg: ffmpeg().is_some(),
+        word: has_progid(w!("Word.Application")),
+        excel: has_progid(w!("Excel.Application")),
+        powerpoint: has_progid(w!("PowerPoint.Application")),
+        edge: docs::has_edge(),
+        tar: docs::tar_exe().exists(),
+    })
+}
+
+pub fn dispatch(kind: Kind, id: &str, paths: Vec<PathBuf>) {
+    match kind {
+        Kind::Convert => { convert::run(id, paths); }
+        Kind::Tools => tools::run_ui(id, paths),
+        Kind::Actions => actions::run(id, paths),
+    }
+}
+
+pub fn request_quit() {
+    let h = MAIN.load(Ordering::Relaxed);
+    if h != 0 { unsafe { let _ = PostMessageW(Some(HWND(h as *mut _)), WM_APP_QUIT, WPARAM(0), LPARAM(0)); } }
+}
+
+// ---- keyboard ----
+
+/// Groups left and right variants of a key. 0 is unbound.
+pub fn key_group(name: &str) -> u32 {
+    match name { "Shift" => 1, "Ctrl" => 2, "Alt" => 3, "Win" => 4, "Caps Lock" => 5, "Tab" => 6, _ => 0 }
+}
+
+const WIN_GROUP: u32 = 4;
+
+/// The key group that opens each wheel, in `Kind` order.
+fn wheel_keys(s: &Settings) -> [u32; 3] {
+    if s.separate_keys {
+        [key_group(&s.convert_key), key_group(&s.tools_key), key_group(&s.actions_key)]
+    } else {
+        [WIN_GROUP, 0, 0]
+    }
+}
+
+fn group_of(vk: u32) -> u32 {
+    let k = VIRTUAL_KEY(vk as u16);
+    match k {
+        VK_LSHIFT | VK_RSHIFT | VK_SHIFT => 1,
+        VK_LCONTROL | VK_RCONTROL | VK_CONTROL => 2,
+        VK_LMENU | VK_RMENU | VK_MENU => 3,
+        VK_LWIN | VK_RWIN => WIN_GROUP,
+        VK_CAPITAL => 5,
+        VK_TAB => 6,
+        _ => 0,
+    }
+}
+
+fn apply_settings(s: &Settings) {
+    for (slot, group) in KEYS.iter().zip(wheel_keys(s)) { slot.store(group, Ordering::Relaxed); }
+    SEPARATE_KEYS.store(s.separate_keys, Ordering::Relaxed);
+    let h = HWND(MAIN.load(Ordering::Relaxed) as *mut _);
+    unsafe {
+        let _ = UnregisterHotKey(Some(h), HOTKEY_ID);
+        let m = match s.hotkey.as_str() {
+            "Ctrl+Alt+Space" => Some(MOD_CONTROL | MOD_ALT),
+            "Ctrl+Shift+Space" => Some(MOD_CONTROL | MOD_SHIFT),
+            "Win+Alt+Space" => Some(MOD_WIN | MOD_ALT),
+            _ => None,
+        };
+        if let Some(m) = m { let _ = RegisterHotKey(Some(h), HOTKEY_ID, m | MOD_NOREPEAT, VK_SPACE.0 as u32); }
+    }
+}
+
+fn primary_down() -> bool {
+    unsafe {
+        let swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+        GetAsyncKeyState(if swapped { VK_RBUTTON.0 } else { VK_LBUTTON.0 } as i32) < 0
+    }
+}
+
+/// Runs on the UI thread with a hard time budget, so it only reads state and posts messages.
+unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let kb = *(lp.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wp.0 as u32;
+        let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+        let wheel_hwnd = HWND(WHEEL.load(Ordering::Relaxed) as *mut _);
+        let mode = wheel::mode();
+        let vk = VIRTUAL_KEY(kb.vkCode as u16);
+        if mode == wheel::Mode::Modal {
+            let nav = match vk {
+                VK_LEFT | VK_UP => Some(0),
+                VK_RIGHT | VK_DOWN => Some(1),
+                VK_RETURN => Some(2),
+                VK_ESCAPE => Some(3),
+                VK_TAB => Some(4),
+                _ => None,
+            };
+            if let Some(n) = nav {
+                if down { let _ = PostMessageW(Some(wheel_hwnd), wheel::WM_APP_NAV, WPARAM(n), LPARAM(0)); }
+                return LRESULT(1);
+            }
+        }
+        let group = group_of(kb.vkCode);
+        if group != 0 {
+            let bit = 1u32 << group;
+            if up {
+                HELD.fetch_and(!bit, Ordering::Relaxed);
+                let leaked = LEAKED.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
+                let eaten = EATEN.fetch_and(!bit, Ordering::Relaxed) & bit != 0;
+                // A release on its own could still open the Start menu.
+                if eaten && !leaked { return LRESULT(1); }
+            }
+            if let Some(i) = KEYS.iter().position(|k| k.load(Ordering::Relaxed) == group) {
+                let dragging = primary_down();
+                if down && (dragging || mode == wheel::Mode::Modal) {
+                    // Auto-repeat must not re-open or flicker the wheel.
+                    if HELD.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                        // A single key only opens the wheel: pressed again, it must not undo the scrolling.
+                        if SEPARATE_KEYS.load(Ordering::Relaxed) || mode == wheel::Mode::Hidden {
+                            let _ = PostMessageW(Some(wheel_hwnd), wheel::WM_APP_KEY, WPARAM(i), LPARAM(0));
+                        }
+                    }
+                    // Keys with a job of their own must not also fire it mid-drag. A key held since
+                    // before the drag is already down as far as Windows knows, so it stays visible.
+                    if group >= WIN_GROUP && LEAKED.load(Ordering::Relaxed) & bit == 0 {
+                        EATEN.fetch_or(bit, Ordering::Relaxed);
+                        return LRESULT(1);
+                    }
+                }
+            }
+            if down { LEAKED.fetch_or(bit, Ordering::Relaxed); }
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn win_opens_the_wheel_unless_keys_are_separate() {
+        let s = Settings::default();
+        assert_eq!(wheel_keys(&s), [WIN_GROUP, 0, 0]);
+        assert_eq!(wheel_keys(&Settings { separate_keys: true, ..s }), [1, 2, 3]);
+    }
+}
+
+// ---- tray and main window ----
+
+fn tray(hwnd: HWND, add: bool) {
+    unsafe {
+        let mut n = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() };
+        if add {
+            n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            n.uCallbackMessage = WM_APP_TRAY;
+            let inst = GetModuleHandleW(None).unwrap_or_default();
+            n.hIcon = LoadIconW(Some(inst.into()), PCWSTR(1 as *const u16)).or_else(|_| LoadIconW(None, IDI_APPLICATION)).unwrap_or_default();
+            for (d, s) in n.szTip.iter_mut().zip(format!("Orrery {VERSION}").encode_utf16()) { *d = s; }
+            let _ = Shell_NotifyIconW(NIM_ADD, &n);
+        } else {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &n);
+        }
+    }
+}
+
+fn tray_menu(hwnd: HWND) {
+    unsafe {
+        let Ok(m) = CreatePopupMenu() else { return };
+        let _ = AppendMenuW(m, MF_STRING, MENU_SETTINGS, w!("Settings"));
+        if update::REPO.is_some() { let _ = AppendMenuW(m, MF_STRING, MENU_UPDATE, w!("Check for updates")); }
+        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(m, MF_STRING, MENU_QUIT, w!("Quit Orrery"));
+        let mut p = POINT::default();
+        let _ = GetCursorPos(&mut p);
+        // Without this the menu would not close when clicking elsewhere.
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
+        let _ = DestroyMenu(m);
+    }
+}
+
+fn open_wheel_for(paths: Vec<PathBuf>) {
+    if !paths.is_empty() { wheel::open_modal(paths, Kind::Convert); }
+}
+
+extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_APP_TRAY => {
+                let ev = (lp.0 & 0xFFFF) as u32;
+                if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU || ev == WM_LBUTTONUP { tray_menu(hwnd); }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                match wp.0 & 0xFFFF {
+                    MENU_SETTINGS => { if let Some(s) = settings::show(&Settings::load()) { apply_settings(&s); } }
+                    MENU_UPDATE => update::check_now(),
+                    MENU_QUIT => { let _ = DestroyWindow(hwnd); }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_HOTKEY => { open_wheel_for(explorer::selection()); LRESULT(0) }
+            WM_COPYDATA => {
+                let cd = &*(lp.0 as *const COPYDATASTRUCT);
+                if cd.dwData == COPYDATA_PATHS && !cd.lpData.is_null() {
+                    let units = std::slice::from_raw_parts(cd.lpData as *const u16, cd.cbData as usize / 2);
+                    let text = String::from_utf16_lossy(units);
+                    open_wheel_for(text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect());
+                }
+                LRESULT(1)
+            }
+            WM_APP_QUIT => { let _ = DestroyWindow(hwnd); LRESULT(0) }
+            WM_DESTROY => { tray(hwnd, false); PostQuitMessage(0); LRESULT(0) }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
+fn run_app(paths: Vec<PathBuf>) -> Result<()> {
+    unsafe {
+        OleInitialize(None)?;
+        let inst = GetModuleHandleW(None)?;
+        let wc = WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: inst.into(), lpszClassName: w!("OrreryMain"), ..Default::default() };
+        RegisterClassW(&wc);
+        // A hidden top-level window, not message-only: other instances find it with FindWindow.
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, w!("OrreryMain"), w!("Orrery"), WS_POPUP, 0, 0, 0, 0, None, None, Some(inst.into()), None)?;
+        MAIN.store(hwnd.0 as isize, Ordering::Relaxed);
+        hud::init()?;
+        let wheel_hwnd = wheel::init()?;
+        WHEEL.store(wheel_hwnd.0 as isize, Ordering::Relaxed);
+        apply_settings(&Settings::load());
+        tray(hwnd, true);
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), Some(inst.into()), 0)?;
+        update::start_background();
+        open_wheel_for(paths);
+        let mut m = MSG::default();
+        while GetMessageW(&mut m, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        let _ = UnhookWindowsHookEx(hook);
+        Ok(())
+    }
+}
+
+/// Hands paths to a copy already running. Returns false if this is the first instance.
+fn forward_to_running(paths: &[PathBuf]) -> bool {
+    unsafe {
+        let m = CreateMutexW(None, false, w!("Local\\OrreryRunning"));
+        if GetLastError() != ERROR_ALREADY_EXISTS { std::mem::forget(m); return false; }
+        if let Ok(h) = FindWindowW(w!("OrreryMain"), None) {
+            let text: Vec<u16> = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
+            let cd = COPYDATASTRUCT { dwData: COPYDATA_PATHS, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+            SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cd as *const _ as isize)));
+        }
+        true
+    }
+}
+
+// ---- command line ----
+
+fn wait(job: std::sync::Arc<job::Job>) -> i32 {
+    while !job.finished.load(Ordering::Relaxed) { std::thread::sleep(std::time::Duration::from_millis(30)); }
+    if let Some(p) = job.last_output.lock().unwrap().as_ref() { println!("{}", p.display()); }
+    let errs = job.errors.lock().unwrap();
+    for e in errs.iter() { eprintln!("error: {e}"); }
+    if errs.is_empty() { 0 } else { 1 }
+}
+
+/// Office and Edge resolve relative paths against their own folders, so every path handed on must be absolute.
+fn absolute(p: &str) -> PathBuf { std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p)) }
+
+fn kind_of(s: &str) -> Kind { match s { "tools" => Kind::Tools, "actions" => Kind::Actions, _ => Kind::Convert } }
+
+fn cli(a: &[String]) -> Option<i32> {
+    let cmd = a.first()?.as_str();
+    let rest = &a[1..];
+    match cmd {
+        "--version" => { println!("{VERSION}"); Some(0) }
+        // Run by the installer on a real uninstall, not on an upgrade.
+        "--uninstall" => {
+            unsafe {
+                if let Ok(h) = FindWindowW(w!("OrreryMain"), None) {
+                    let _ = PostMessageW(Some(h), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+            }
+            settings::set_startup(false);
+            settings::set_sendto(false);
+            Some(0)
+        }
+        // --convert <format> <files...>
+        "--convert" if rest.len() >= 2 => {
+            job::com_init();
+            Some(wait(convert::run(&rest[0], rest[1..].iter().map(|f| absolute(f)).collect())))
+        }
+        // --tool <id> [key=value ...] <files...>   Values may use \n and \t for shape lists.
+        "--tool" if rest.len() >= 2 => {
+            job::com_init();
+            let (mut o, mut files) = (tools::Opts::new(), vec![]);
+            for x in &rest[1..] {
+                match x.split_once('=') {
+                    Some((k, v)) if !PathBuf::from(x).exists() => { o.insert(k.to_string(), v.replace("\\n", "\n").replace("\\t", "\t")); }
+                    _ => files.push(absolute(x)),
+                }
+            }
+            Some(wait(tools::exec(&rest[0], files, o)))
+        }
+        // --render-wheel <convert|tools|actions> <sample file> <hover|-> <scale> <out.png>
+        "--render-wheel" if rest.len() >= 5 => {
+            job::com_init();
+            let hover = rest[2].parse().ok();
+            let scale = rest[3].parse().unwrap_or(1.0);
+            match wheel::render_png(kind_of(&rest[0]), &[PathBuf::from(&rest[1])], hover, scale, &PathBuf::from(&rest[4])) {
+                Ok(()) => Some(0),
+                Err(e) => { eprintln!("error: {e}"); Some(1) }
+            }
+        }
+        "--engines" => { println!("{:?}", engines()); Some(0) }
+        _ => None,
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // A windows-subsystem exe has no console of its own; borrow the caller's so CLI output is visible.
+    unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
+    if let Some(code) = cli(&args) { std::process::exit(code); }
+    let paths: Vec<PathBuf> = args.iter().filter(|a| !a.starts_with("--")).map(|a| absolute(a)).collect();
+    if forward_to_running(&paths) { return; }
+    if let Err(e) = run_app(paths) {
+        let m = gfx::wz(&format!("Orrery could not start: {e}"));
+        unsafe { MessageBoxW(None, PCWSTR(m.as_ptr()), w!("Orrery"), MB_ICONERROR); }
+    }
+}

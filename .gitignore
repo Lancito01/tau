@@ -1,0 +1,7 @@
+/target
+/dist
+*.msi
+*.wixpdb
+*.msi.sha256
+# Reference screenshots of the original app. Never shipped or published.
+/replica/screens/
