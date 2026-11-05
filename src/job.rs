@@ -86,7 +86,7 @@ pub struct TempDir(pub PathBuf);
 impl TempDir {
     pub fn new() -> Result<TempDir, String> {
         static N: AtomicUsize = AtomicUsize::new(0);
-        let d = std::env::temp_dir().join(format!("orrery-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let d = std::env::temp_dir().join(format!("tau-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
         Ok(TempDir(d))
     }
@@ -97,7 +97,7 @@ impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&se
 /// Builds the real output through a temp name so a failed or cancelled run leaves nothing behind.
 pub fn atomically(out: &Path, f: impl FnOnce(&Path) -> Result<(), String>) -> Result<PathBuf, String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
-    let tmp = out.with_extension(format!("orrery-part.{ext}"));
+    let tmp = out.with_extension(format!("tau-part.{ext}"));
     match f(&tmp) {
         Ok(()) => { std::fs::rename(&tmp, out).map_err(|e| e.to_string())?; Ok(out.to_path_buf()) }
         Err(e) => { let _ = std::fs::remove_file(&tmp); Err(e) }

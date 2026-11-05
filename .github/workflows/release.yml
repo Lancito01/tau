@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ORRERY_VERSION: 0.1.${{ github.run_number }}
+  TAU_VERSION: 0.1.${{ github.run_number }}
   WIX_VERSION: 5.0.2
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
-      # GITHUB_REPOSITORY and ORRERY_VERSION are compiled in. Local builds have neither, so they never update.
+      # GITHUB_REPOSITORY and TAU_VERSION are compiled in. Local builds have neither, so they never update.
       - name: Build
         run: cargo build --release --locked
 
@@ -47,8 +47,8 @@ jobs:
         run: |
           dotnet tool install --global wix --version $env:WIX_VERSION
           New-Item -ItemType Directory -Force dist | Out-Null
-          $msi = "dist/Orrery-$env:ORRERY_VERSION.msi"
-          wix build installer/orrery.wxs -arch x64 -d "Version=$env:ORRERY_VERSION" -d "ExePath=target/release/orrery.exe" -d "IconPath=target/orrery.ico" -o $msi
+          $msi = "dist/Tau-$env:TAU_VERSION.msi"
+          wix build installer/tau.wxs -arch x64 -d "Version=$env:TAU_VERSION" -d "ExePath=target/release/tau.exe" -d "IconPath=target/tau.ico" -o $msi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
           "$hash  $(Split-Path $msi -Leaf)" | Set-Content -NoNewline -Encoding ascii "$msi.sha256"
@@ -58,11 +58,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "v$env:ORRERY_VERSION"
+          $tag = "v$env:TAU_VERSION"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag (Get-ChildItem dist/*).FullName --clobber
           } else {
-            gh release create $tag (Get-ChildItem dist/*).FullName --title "Orrery $env:ORRERY_VERSION" --generate-notes --target $env:GITHUB_SHA
+            gh release create $tag (Get-ChildItem dist/*).FullName --title "Tau $env:TAU_VERSION" --generate-notes --target $env:GITHUB_SHA
           }
           exit $LASTEXITCODE

@@ -1,4 +1,4 @@
-//! Orrery: drag a file, tap a key, drop it on an orbit.
+//! Tau: drag a file, tap a key, drop it on the dial.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod actions;
@@ -15,10 +15,13 @@ mod image;
 mod job;
 mod media;
 mod pdf;
+mod photo;
 mod settings;
 mod shelf;
 mod timeline;
 mod tools;
+mod ui;
+mod ui_samples;
 mod update;
 mod wheel;
 
@@ -39,13 +42,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const VERSION: &str = match option_env!("ORRERY_VERSION") { Some(v) => v, None => env!("CARGO_PKG_VERSION") };
+pub const VERSION: &str = match option_env!("TAU_VERSION") { Some(v) => v, None => env!("CARGO_PKG_VERSION") };
 
 const WM_APP_TRAY: u32 = WM_APP + 30;
 const WM_APP_QUIT: u32 = WM_APP + 31;
-const MENU_SETTINGS: usize = 1;
-const MENU_UPDATE: usize = 2;
-const MENU_QUIT: usize = 3;
 const HOTKEY_ID: i32 = 1;
 const COPYDATA_PATHS: usize = 0x4F52;
 
@@ -241,7 +241,7 @@ fn tray(hwnd: HWND, add: bool) {
             n.uCallbackMessage = WM_APP_TRAY;
             let inst = GetModuleHandleW(None).unwrap_or_default();
             n.hIcon = LoadIconW(Some(inst.into()), PCWSTR(1 as *const u16)).or_else(|_| LoadIconW(None, IDI_APPLICATION)).unwrap_or_default();
-            for (d, s) in n.szTip.iter_mut().zip(format!("Orrery {VERSION}").encode_utf16()) { *d = s; }
+            for (d, s) in n.szTip.iter_mut().zip(format!("Tau {VERSION}").encode_utf16()) { *d = s; }
             let _ = Shell_NotifyIconW(NIM_ADD, &n);
         } else {
             let _ = Shell_NotifyIconW(NIM_DELETE, &n);
@@ -250,18 +250,20 @@ fn tray(hwnd: HWND, add: bool) {
 }
 
 fn tray_menu(hwnd: HWND) {
-    unsafe {
-        let Ok(m) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(m, MF_STRING, MENU_SETTINGS, w!("Settings"));
-        if update::REPO.is_some() { let _ = AppendMenuW(m, MF_STRING, MENU_UPDATE, w!("Check for updates")); }
-        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(m, MF_STRING, MENU_QUIT, w!("Quit Orrery"));
-        let mut p = POINT::default();
-        let _ = GetCursorPos(&mut p);
-        // Without this the menu would not close when clicking elsewhere.
-        let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(m, TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None);
-        let _ = DestroyMenu(m);
+    use ui::{glyph, Menu, MenuItem};
+    let at = gfx::cursor_pos();
+    let mut items = vec![MenuItem::new("Settings", glyph::SETTINGS)];
+    let updates = update::REPO.is_some();
+    if updates { items.push(MenuItem::new("Check for updates", glyph::SYNC)); }
+    items.push(MenuItem::separator());
+    items.push(MenuItem::new("Quit Tau", glyph::POWER));
+    let quit = items.len() - 1;
+    let chosen = ui::show_menu(Menu::new(230.0, items, None, Some(format!("Tau {VERSION}"))), at, at.y);
+    match chosen {
+        Some(i) if i == quit => unsafe { let _ = DestroyWindow(hwnd); },
+        Some(0) => { if let Some(s) = settings::show(&Settings::load()) { apply_settings(&s); } }
+        Some(1) if updates => update::check_now(),
+        _ => {}
     }
 }
 
@@ -275,15 +277,6 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
             WM_APP_TRAY => {
                 let ev = (lp.0 & 0xFFFF) as u32;
                 if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU || ev == WM_LBUTTONUP { tray_menu(hwnd); }
-                LRESULT(0)
-            }
-            WM_COMMAND => {
-                match wp.0 & 0xFFFF {
-                    MENU_SETTINGS => { if let Some(s) = settings::show(&Settings::load()) { apply_settings(&s); } }
-                    MENU_UPDATE => update::check_now(),
-                    MENU_QUIT => { let _ = DestroyWindow(hwnd); }
-                    _ => {}
-                }
                 LRESULT(0)
             }
             WM_HOTKEY => { open_wheel_for(explorer::selection()); LRESULT(0) }
@@ -306,11 +299,12 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 fn run_app(paths: Vec<PathBuf>) -> Result<()> {
     unsafe {
         OleInitialize(None)?;
+        settings::migrate();
         let inst = GetModuleHandleW(None)?;
-        let wc = WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: inst.into(), lpszClassName: w!("OrreryMain"), ..Default::default() };
+        let wc = WNDCLASSW { lpfnWndProc: Some(main_proc), hInstance: inst.into(), lpszClassName: w!("TauMain"), ..Default::default() };
         RegisterClassW(&wc);
         // A hidden top-level window, not message-only: other instances find it with FindWindow.
-        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, w!("OrreryMain"), w!("Orrery"), WS_POPUP, 0, 0, 0, 0, None, None, Some(inst.into()), None)?;
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, w!("TauMain"), w!("Tau"), WS_POPUP, 0, 0, 0, 0, None, None, Some(inst.into()), None)?;
         MAIN.store(hwnd.0 as isize, Ordering::Relaxed);
         hud::init()?;
         let wheel_hwnd = wheel::init()?;
@@ -333,9 +327,9 @@ fn run_app(paths: Vec<PathBuf>) -> Result<()> {
 /// Hands paths to a copy already running. Returns false if this is the first instance.
 fn forward_to_running(paths: &[PathBuf]) -> bool {
     unsafe {
-        let m = CreateMutexW(None, false, w!("Local\\OrreryRunning"));
+        let m = CreateMutexW(None, false, w!("Local\\TauRunning"));
         if GetLastError() != ERROR_ALREADY_EXISTS { std::mem::forget(m); return false; }
-        if let Ok(h) = FindWindowW(w!("OrreryMain"), None) {
+        if let Ok(h) = FindWindowW(w!("TauMain"), None) {
             let text: Vec<u16> = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
             let cd = COPYDATASTRUCT { dwData: COPYDATA_PATHS, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
             SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cd as *const _ as isize)));
@@ -367,7 +361,7 @@ fn cli(a: &[String]) -> Option<i32> {
         // Run by the installer on a real uninstall, not on an upgrade.
         "--uninstall" => {
             unsafe {
-                if let Ok(h) = FindWindowW(w!("OrreryMain"), None) {
+                if let Ok(h) = FindWindowW(w!("TauMain"), None) {
                     let _ = PostMessageW(Some(h), WM_APP_QUIT, WPARAM(0), LPARAM(0));
                     std::thread::sleep(std::time::Duration::from_millis(1500));
                 }
@@ -393,12 +387,35 @@ fn cli(a: &[String]) -> Option<i32> {
             }
             Some(wait(tools::exec(&rest[0], files, o)))
         }
+        // --open <id> <files...>: opens a tool's window directly, as if chosen from the dial.
+        "--open" if rest.len() >= 2 => {
+            job::com_init();
+            let files: Vec<PathBuf> = rest[1..].iter().map(|f| absolute(f)).collect();
+            if hud::init().is_err() { return Some(1); }
+            tools::run_ui(&rest[0], files);
+            unsafe {
+                let mut m = MSG::default();
+                while hud::busy() {
+                    while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() { let _ = TranslateMessage(&m); DispatchMessageW(&m); }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+            }
+            Some(0)
+        }
         // --render-wheel <convert|tools|actions> <sample file> <hover|-> <scale> <out.png>
         "--render-wheel" if rest.len() >= 5 => {
             job::com_init();
             let hover = rest[2].parse().ok();
             let scale = rest[3].parse().unwrap_or(1.0);
             match wheel::render_png(kind_of(&rest[0]), &[PathBuf::from(&rest[1])], hover, scale, &PathBuf::from(&rest[4])) {
+                Ok(()) => Some(0),
+                Err(e) => { eprintln!("error: {e}"); Some(1) }
+            }
+        }
+        // --render-ui <name> <out.png>: draws a window with sample data, for design review.
+        "--render-ui" if rest.len() >= 2 => {
+            job::com_init();
+            match ui_samples::render(&rest[0], &PathBuf::from(&rest[1])) {
                 Ok(()) => Some(0),
                 Err(e) => { eprintln!("error: {e}"); Some(1) }
             }
@@ -416,7 +433,7 @@ fn main() {
     let paths: Vec<PathBuf> = args.iter().filter(|a| !a.starts_with("--")).map(|a| absolute(a)).collect();
     if forward_to_running(&paths) { return; }
     if let Err(e) = run_app(paths) {
-        let m = gfx::wz(&format!("Orrery could not start: {e}"));
-        unsafe { MessageBoxW(None, PCWSTR(m.as_ptr()), w!("Orrery"), MB_ICONERROR); }
+        let m = gfx::wz(&format!("Tau could not start: {e}"));
+        unsafe { MessageBoxW(None, PCWSTR(m.as_ptr()), w!("Tau"), MB_ICONERROR); }
     }
 }

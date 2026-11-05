@@ -1,19 +1,22 @@
-//! A small modal option form built from plain Win32 controls.
-use crate::gfx::wz;
-use windows::core::*;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+//! The option form every simple tool uses. Callers describe fields; the page lays them out.
+use crate::gfx::*;
+use crate::ui::{self, r, Align, Page, Style, Ui, FOOT_H, PAD, TITLE_H};
+use std::cell::RefCell;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Clone)]
 pub enum Field {
     Text(&'static str, String),
     Choice(&'static str, Vec<String>, usize),
+    /// A choice that only applies while the toggle at the given field index is on.
+    ChoiceIf(usize, &'static str, Vec<String>, usize),
     Check(&'static str, bool),
+    Slider(&'static str, i32, i32, i32),
+    Color(&'static str, String),
     Note(String),
+    Heading(&'static str),
+    /// A row of found / not found chips.
+    Status(Vec<(String, bool)>),
 }
 
 pub fn choice(label: &'static str, opts: &[&str], default: usize) -> Field {
@@ -21,154 +24,200 @@ pub fn choice(label: &'static str, opts: &[&str], default: usize) -> Field {
 }
 pub fn text(label: &'static str, v: &str) -> Field { Field::Text(label, v.to_string()) }
 
-const IDOK_: i32 = 1;
-const IDCANCEL_: i32 = 2;
-const CBS_DROPDOWNLIST_: u32 = 3;
-const BS_AUTOCHECKBOX_: u32 = 3;
-const BS_DEFPUSHBUTTON_: u32 = 1;
-const CB_ADDSTRING_: u32 = 0x0143;
-const CB_SETCURSEL_: u32 = 0x014E;
-const CB_GETCURSEL_: u32 = 0x0147;
-const BM_GETCHECK_: u32 = 0x00F0;
-const BM_SETCHECK_: u32 = 0x00F1;
+thread_local! { static CONTEXT: RefCell<String> = const { RefCell::new(String::new()) }; }
+/// What the next windows are working on, shown under their title.
+pub fn set_context(s: String) { CONTEXT.with(|c| *c.borrow_mut() = s); }
+pub fn context() -> String { CONTEXT.with(|c| c.borrow().clone()) }
 
-static mut RESULT: i32 = 0;
+const SWATCHES: [&str; 6] = ["#FFFFFF", "#000000", "#F2EFE8", "#1E293B", "#2563EB", "#E11D48"];
+const WIDTH: f32 = 480.0;
 
-extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_COMMAND => {
-                let id = (wp.0 & 0xFFFF) as i32;
-                if id == IDOK_ || id == IDCANCEL_ { RESULT = id; }
-                LRESULT(0)
+struct Value { text: String, sel: usize, on: bool, num: f32 }
+
+pub struct Form {
+    title: String,
+    sub: String,
+    fields: Vec<Field>,
+    values: Vec<Value>,
+    ok: String,
+    content: f32,
+    max_h: f32,
+    started: bool,
+    result: Option<bool>,
+}
+
+/// Short option lists read best as a segmented control.
+fn fits_segmented(opts: &[String]) -> bool {
+    opts.len() <= 4 && opts.iter().map(|o| o.chars().count() + 3).sum::<usize>() <= 44
+}
+
+fn color_of(s: &str) -> u32 {
+    let c = crate::image::parse_color(s);
+    ((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32
+}
+
+impl Form {
+    pub fn new(title: &str, sub: &str, fields: &[Field], ok: &str) -> Form {
+        let values = fields.iter().map(|f| {
+            let mut v = Value { text: String::new(), sel: 0, on: false, num: 0.0 };
+            match f {
+                Field::Text(_, s) | Field::Color(_, s) => v.text = s.clone(),
+                Field::Choice(_, _, d) | Field::ChoiceIf(_, _, _, d) => v.sel = *d,
+                Field::Check(_, b) => v.on = *b,
+                Field::Slider(_, _, _, d) => v.num = *d as f32,
+                _ => {}
             }
-            WM_CLOSE => { RESULT = IDCANCEL_; LRESULT(0) }
-            WM_CTLCOLORSTATIC => {
-                // Keep labels on the window's own background.
-                SetBkMode(HDC(wp.0 as *mut _), TRANSPARENT);
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+            v
+        }).collect();
+        let at = cursor_pos();
+        let wa = work_area_at(at);
+        let max_h = (wa.bottom - wa.top) as f32 / dpi_scale_at(at) - 80.0;
+        Form { title: title.into(), sub: sub.into(), fields: fields.to_vec(), values, ok: ok.into(), content: 120.0, max_h, started: false, result: None }
+    }
+    fn output(&self) -> Vec<String> {
+        self.fields.iter().zip(&self.values).map(|(f, v)| match f {
+            Field::Text(..) | Field::Color(..) => v.text.clone(),
+            Field::Choice(_, o, _) | Field::ChoiceIf(_, _, o, _) => o.get(v.sel).cloned().unwrap_or_default(),
+            Field::Check(..) => if v.on { "1".into() } else { "0".into() },
+            Field::Slider(..) => format!("{}", v.num as i32),
+            _ => String::new(),
+        }).collect()
+    }
+    fn height(&self) -> f32 { (TITLE_H + self.content + FOOT_H).min(self.max_h) }
+
+    /// Lays out and draws the fields from `y`, returning where they end.
+    fn body(&mut self, ui: &mut Ui, start: f32) -> f32 {
+        let (x, w) = (PAD, WIDTH - PAD * 2.0);
+        let mut y = start;
+        for i in 0..self.fields.len() {
+            let f = self.fields[i].clone();
+            let key = format!("f{i}");
+            match &f {
+                Field::Heading(l) => {
+                    if i > 0 { y += 6.0; }
+                    ui.text(l, r(x, y, w, 18.0), 12.0, 600, ACCENT, Align::Left);
+                    y += 24.0;
+                }
+                Field::Note(s) => {
+                    let h = ui.wrapped_height(s, 12.5, 400, w) + 2.0;
+                    ui.wrapped(s, r(x, y, w, h), 12.5, 400, MUTED);
+                    y += h + 12.0;
+                }
+                Field::Status(items) => {
+                    let mut cx = x;
+                    for (name, ok) in items {
+                        let tw = ui.measure(name, 12.0, 500) + 30.0;
+                        if cx + tw > x + w { cx = x; y += 34.0; }
+                        let q = r(cx, y, tw, 28.0);
+                        ui.fill(q, 14.0, if *ok { SUCCESS } else { TEXT }, if *ok { 0.12 } else { 0.05 });
+                        ui.dot(q.x + 13.0, q.y + 14.0, 3.0, if *ok { SUCCESS } else { FAINT }, 1.0);
+                        ui.text(name, r(q.x + 22.0, q.y, tw - 24.0, 28.0), 12.0, 500, if *ok { TEXT } else { MUTED }, Align::Left);
+                        cx += tw + 6.0;
+                    }
+                    y += 40.0;
+                }
+                Field::Check(l, _) => {
+                    ui.text(l, r(x, y, w - 52.0, 36.0), 13.0, 400, TEXT, Align::Left);
+                    ui.toggle(&key, r(x, y, w, 36.0), &mut self.values[i].on);
+                    y += 38.0;
+                }
+                Field::Text(l, _) => {
+                    ui.text(l, r(x, y, w, 18.0), 12.5, 500, MUTED, Align::Left);
+                    if !self.started { ui.focus = ui::id(&key); self.started = true; }
+                    ui.text_input(&key, r(x, y + 22.0, w, 38.0), &mut self.values[i].text, "");
+                    y += 72.0;
+                }
+                Field::Choice(l, o, _) if fits_segmented(o) => {
+                    ui.text(l, r(x, y, w, 18.0), 12.5, 500, MUTED, Align::Left);
+                    ui.segmented(&key, r(x, y + 22.0, w, 38.0), o, &mut self.values[i].sel);
+                    y += 72.0;
+                }
+                Field::Choice(l, o, _) if o.iter().any(|s| s.chars().count() > 24) => {
+                    ui.text(l, r(x, y, w, 18.0), 12.5, 500, MUTED, Align::Left);
+                    ui.select(&key, r(x, y + 22.0, w, 38.0), o, &mut self.values[i].sel, true);
+                    y += 72.0;
+                }
+                Field::Choice(l, o, _) => {
+                    ui.text(l, r(x, y, w - 220.0, 38.0), 13.0, 400, TEXT, Align::Left);
+                    ui.select(&key, r(x + w - 210.0, y, 210.0, 38.0), o, &mut self.values[i].sel, true);
+                    y += 44.0;
+                }
+                Field::ChoiceIf(dep, l, o, _) => {
+                    let on = self.values.get(*dep).is_some_and(|v| v.on);
+                    ui.text(l, r(x, y, w - 220.0, 38.0), 13.0, 400, if on { TEXT } else { FAINT }, Align::Left);
+                    ui.select(&key, r(x + w - 210.0, y, 210.0, 38.0), o, &mut self.values[i].sel, on);
+                    y += 44.0;
+                }
+                Field::Slider(l, min, max, _) => {
+                    let n = self.values[i].num as i32;
+                    ui.text(l, r(x, y, w - 60.0, 20.0), 13.0, 400, TEXT, Align::Left);
+                    ui.text(&format!("{}{n}", if n > 0 && *min < 0 { "+" } else { "" }), r(x + w - 60.0, y, 60.0, 20.0), 12.5, 600, MUTED, Align::Right);
+                    let origin = if *min < 0 { 0.0 } else { *min as f32 };
+                    ui.slider(&key, r(x - 9.0, y + 20.0, w + 18.0, 28.0), *min as f32, *max as f32, origin, &mut self.values[i].num);
+                    y += 54.0;
+                }
+                Field::Color(l, _) => {
+                    ui.text(l, r(x, y, w, 18.0), 12.5, 500, MUTED, Align::Left);
+                    let mut sx = x;
+                    let picked = color_of(&self.values[i].text);
+                    for (si, c) in SWATCHES.iter().enumerate() {
+                        let q = r(sx, y + 22.0, 38.0, 38.0);
+                        let col = color_of(c);
+                        let (hover, _, clicked) = ui.hit(ui::id(&format!("{key}/s{si}")), q);
+                        if clicked { self.values[i].text = c.to_string(); }
+                        ui.fill(q.inset(4.0), 8.0, col, 1.0);
+                        ui.stroke(q.inset(4.0), 8.0, 0xFFFFFF, 0.14, 1.0);
+                        if picked == col { ui.stroke(q, 11.0, ACCENT, 1.0, 2.0); } else if hover { ui.stroke(q, 11.0, TEXT, 0.3, 1.5); }
+                        sx += 42.0;
+                    }
+                    ui.text_input(&key, r(sx + 8.0, y + 22.0, x + w - sx - 8.0, 38.0), &mut self.values[i].text, "#RRGGBB");
+                    y += 72.0;
+                }
             }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
+        y
+    }
+}
+
+impl Page for Form {
+    fn size(&self) -> (f32, f32) { (WIDTH, self.height()) }
+    fn done(&self) -> bool { self.result.is_some() }
+    fn on_close(&mut self) { self.result = Some(false); }
+    fn frame(&mut self, ui: &mut Ui) {
+        if ui.titlebar(&self.title.clone(), &self.sub.clone()) { self.result = Some(false); }
+        let h = self.height();
+        let view = r(0.0, TITLE_H, WIDTH, h - TITLE_H - FOOT_H);
+        let overflow = self.content > view.h + 0.5;
+        let real_mouse = ui.mouse;
+        let off = if overflow { ui.scroll_area("form.body", view, self.content) } else { 0.0 };
+        // Rows scrolled under the title or footer must not catch the pointer.
+        if overflow && !view.has(real_mouse) { ui.mouse = (-1000.0, -1000.0); }
+        let top = TITLE_H + 6.0 - off;
+        let end = self.body(ui, top);
+        ui.mouse = real_mouse;
+        if overflow { ui.unclip(); }
+        self.content = end - top + 8.0;
+
+        let fy = h - FOOT_H;
+        ui.divider(fy, 0.0, WIDTH);
+        let by = fy + (FOOT_H - 38.0) / 2.0;
+        let primary = r(WIDTH - PAD - 120.0, by, 120.0, 38.0);
+        let cancel = r(primary.x - 96.0, by, 88.0, 38.0);
+        if ui.button("form.cancel", "Cancel", cancel, Style::Ghost, true) { self.result = Some(false); }
+        if ui.button("form.ok", &self.ok.clone(), primary, Style::Primary, true) { self.result = Some(true); }
+        if ui.key(VK_ESCAPE) { self.result = Some(false); }
+        if ui.key(VK_RETURN) { self.result = Some(true); }
     }
 }
 
 /// Shows the form and blocks. Returns one string per field, or None on cancel.
-/// Choice gives the chosen option text, Check gives "1" or "0", Note gives "".
+/// Choice gives the chosen option text, Check gives "1" or "0", Slider the number, Note and Heading "".
 pub fn show(title: &str, fields: &[Field], ok_label: &str) -> Option<Vec<String>> {
-    unsafe {
-        let inst = GetModuleHandleW(None).ok()?;
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("OrreryForm"),
-            hCursor: LoadCursorW(None, IDC_ARROW).ok()?, hbrBackground: GetSysColorBrush(COLOR_WINDOW), ..Default::default()
-        };
-        RegisterClassW(&wc);
-        let t = wz(title);
-        let hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, w!("OrreryForm"), PCWSTR(t.as_ptr()),
-            WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 100, 100, None, None, Some(inst.into()), None).ok()?;
-        let dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
-        let sc = |v: i32| (v as f32 * dpi) as i32;
-        let font = CreateFontW(-sc(14), 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"));
-        let setf = |h: HWND| { SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1))); };
-        let (lx, cx, cw, rh) = (sc(16), sc(200), sc(250), sc(32));
-        let mut y = sc(14);
-        let mut controls: Vec<(HWND, &Field)> = vec![];
-        let tabstop = WINDOW_STYLE(WS_TABSTOP.0 | WS_CHILD.0 | WS_VISIBLE.0);
-        for f in fields {
-            let label = |s: &str, y: i32, w: i32, h: i32| {
-                let l = wz(s);
-                if let Ok(c) = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(l.as_ptr()), WS_CHILD | WS_VISIBLE, lx, y + sc(4), w, h, Some(hwnd), None, Some(inst.into()), None) { setf(c); }
-            };
-            match f {
-                Field::Text(l, v) => {
-                    label(l, y, cx - lx - sc(6), sc(22));
-                    let vs = wz(v);
-                    let c = CreateWindowExW(WS_EX_CLIENTEDGE, w!("EDIT"), PCWSTR(vs.as_ptr()), WINDOW_STYLE(tabstop.0 | 0x80), cx, y, cw, sc(26), Some(hwnd), None, Some(inst.into()), None).ok()?;
-                    setf(c);
-                    controls.push((c, f));
-                    y += rh;
-                }
-                Field::Choice(l, opts, d) => {
-                    label(l, y, cx - lx - sc(6), sc(22));
-                    let c = CreateWindowExW(WINDOW_EX_STYLE(0), w!("COMBOBOX"), None, WINDOW_STYLE(tabstop.0 | CBS_DROPDOWNLIST_ | WS_VSCROLL.0), cx, y, cw, sc(240), Some(hwnd), None, Some(inst.into()), None).ok()?;
-                    setf(c);
-                    for o in opts { let w = wz(o); SendMessageW(c, CB_ADDSTRING_, None, Some(LPARAM(w.as_ptr() as isize))); }
-                    SendMessageW(c, CB_SETCURSEL_, Some(WPARAM(*d)), None);
-                    controls.push((c, f));
-                    y += rh;
-                }
-                Field::Check(l, v) => {
-                    let w = wz(l);
-                    let c = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(w.as_ptr()), WINDOW_STYLE(tabstop.0 | BS_AUTOCHECKBOX_), lx, y, cx + cw - lx, sc(26), Some(hwnd), None, Some(inst.into()), None).ok()?;
-                    setf(c);
-                    SendMessageW(c, BM_SETCHECK_, Some(WPARAM(*v as usize)), None);
-                    controls.push((c, f));
-                    y += rh;
-                }
-                Field::Note(s) => {
-                    let lines = s.lines().map(|l| 1 + l.len() as i32 / 62).sum::<i32>().max(1);
-                    let h = sc(19) * lines + sc(4);
-                    let w = wz(s);
-                    if let Ok(c) = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(w.as_ptr()), WS_CHILD | WS_VISIBLE, lx, y, cx + cw - lx, h, Some(hwnd), None, Some(inst.into()), None) { setf(c); }
-                    y += h + sc(6);
-                }
-            }
-        }
-        y += sc(6);
-        let w = wz(ok_label);
-        let bw = sc(96);
-        let right = cx + cw;
-        let ok = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(w.as_ptr()), WINDOW_STYLE(tabstop.0 | BS_DEFPUSHBUTTON_), right - bw, y, bw, sc(30), Some(hwnd), Some(HMENU(IDOK_ as *mut _)), Some(inst.into()), None).ok()?;
-        setf(ok);
-        let cancel = CreateWindowExW(WINDOW_EX_STYLE(0), w!("BUTTON"), w!("Cancel"), tabstop, right - bw * 2 - sc(8), y, bw, sc(30), Some(hwnd), Some(HMENU(IDCANCEL_ as *mut _)), Some(inst.into()), None).ok()?;
-        setf(cancel);
-        y += sc(30) + sc(14);
+    let f = ui::run_modal(Form::new(title, &context(), fields, ok_label), title, None)?;
+    (f.result == Some(true)).then(|| f.output())
+}
 
-        let mut r = RECT { left: 0, top: 0, right: right + lx, bottom: y };
-        let _ = AdjustWindowRectEx(&mut r, WS_CAPTION | WS_SYSMENU, false, WS_EX_DLGMODALFRAME);
-        let (ww, wh) = (r.right - r.left, r.bottom - r.top);
-        let wa = crate::gfx::work_area_at(crate::gfx::cursor_pos());
-        let _ = SetWindowPos(hwnd, None, wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2, ww, wh, SWP_NOZORDER);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-        if let Some((c, _)) = controls.first() { let _ = SetFocus(Some(*c)); }
-
-        RESULT = 0;
-        let mut msg = MSG::default();
-        while RESULT == 0 && GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_ESCAPE.0 as usize { RESULT = IDCANCEL_; break; }
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        let accepted = RESULT == IDOK_;
-        let mut out = vec![];
-        let mut ci = controls.iter();
-        for f in fields {
-            match f {
-                Field::Note(_) => out.push(String::new()),
-                _ => {
-                    let (c, _) = ci.next().unwrap();
-                    out.push(match f {
-                        Field::Text(..) => {
-                            let n = GetWindowTextLengthW(*c) as usize;
-                            let mut b = vec![0u16; n + 1];
-                            let got = GetWindowTextW(*c, &mut b) as usize;
-                            String::from_utf16_lossy(&b[..got])
-                        }
-                        Field::Choice(_, opts, _) => {
-                            let i = SendMessageW(*c, CB_GETCURSEL_, None, None).0 as usize;
-                            opts.get(i).cloned().unwrap_or_default()
-                        }
-                        Field::Check(..) => if SendMessageW(*c, BM_GETCHECK_, None, None).0 == 1 { "1".into() } else { "0".into() },
-                        Field::Note(_) => unreachable!(),
-                    });
-                }
-            }
-        }
-        let _ = DestroyWindow(hwnd);
-        let _ = DeleteObject(font.into());
-        accepted.then_some(out)
-    }
+/// The form as a PNG, for design review.
+pub fn render(title: &str, sub: &str, fields: &[Field], ok: &str, out: &std::path::Path) -> Result<(), String> {
+    ui::render_png(&mut Form::new(title, sub, fields, ok), 1.0, None, out)
 }

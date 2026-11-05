@@ -1,24 +1,32 @@
 //! Generates the app icon (no binary assets in the repo) and embeds it with the manifest.
 use std::path::Path;
 
-/// One icon image: a dark disc, a thin orbit ring, and a violet node. Premultiply-free BGRA, top-down.
+/// Distance from a point to a line segment.
+fn seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    ((p.0 - a.0 - dx * t).powi(2) + (p.1 - a.1 - dy * t).powi(2)).sqrt()
+}
+
+/// One icon image: a signal disc with a dark tau. Same geometry as gfx::draw_logo. BGRA, top-down.
 fn draw(size: u32) -> Vec<u8> {
     let s = size as f32;
     let mut px = vec![0u8; (size * size * 4) as usize];
     let cover = |d: f32| (0.5 - d).clamp(0.0, 1.0);
+    // Tiny icons get a heavier stroke so the glyph survives the tray.
+    let stroke = if size <= 24 { 0.12 } else { 0.09 } * s / 2.0;
+    let mut tau = vec![((0.27, 0.36), (0.75, 0.36)), ((0.50, 0.36), (0.50, 0.60))];
+    let curve = |t: f32| ((1.0 - t).powi(2) * 0.50 + 2.0 * t * (1.0 - t) * 0.50 + t * t * 0.64, (1.0 - t).powi(2) * 0.60 + 2.0 * t * (1.0 - t) * 0.72 + t * t * 0.72);
+    for i in 0..10 { tau.push((curve(i as f32 / 10.0), curve((i + 1) as f32 / 10.0))); }
     for y in 0..size {
         for x in 0..size {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let r = ((fx - s / 2.0).powi(2) + (fy - s / 2.0).powi(2)).sqrt();
-            let disc = cover(r - s * 0.48);
-            let mut c = [0x1Au8 as f32, 0x11 as f32, 0x10 as f32];
-            let ring = cover((r - s * 0.32).abs() - (s * 0.018).max(0.6));
-            for (i, v) in [0x6Au8, 0x45, 0x3Au8].iter().enumerate() { c[i] += (*v as f32 - c[i]) * ring; }
-            let hub = cover(r - s * 0.11);
-            for (i, v) in [0xFAu8, 0xF4, 0xF3].iter().enumerate() { c[i] += (*v as f32 - c[i]) * hub; }
-            let (nx, ny) = (s / 2.0 + s * 0.226, s / 2.0 - s * 0.226);
-            let node = cover(((fx - nx).powi(2) + (fy - ny).powi(2)).sqrt() - s * 0.115);
-            for (i, v) in [0xFFu8, 0x4A, 0x6D].iter().enumerate() { c[i] += (*v as f32 - c[i]) * node; }
+            let disc = cover(r - s * 0.5 + 0.5);
+            let d = tau.iter().map(|&(a, b)| seg((fx, fy), (a.0 * s, a.1 * s), (b.0 * s, b.1 * s))).fold(f32::MAX, f32::min);
+            let ink = cover(d - stroke);
+            // BGR of #C8F135 and #12140A.
+            let c: [f32; 3] = std::array::from_fn(|i| { let (bg, fg) = ([0x35, 0xF1, 0xC8][i] as f32, [0x0A, 0x14, 0x12][i] as f32); bg + (fg - bg) * ink });
             let o = ((y * size + x) * 4) as usize;
             px[o] = c[0] as u8; px[o + 1] = c[1] as u8; px[o + 2] = c[2] as u8;
             px[o + 3] = (disc * 255.0) as u8;
@@ -60,18 +68,18 @@ fn ico(sizes: &[u32]) -> Vec<u8> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=orrery.manifest");
-    println!("cargo:rerun-if-env-changed=ORRERY_VERSION");
+    println!("cargo:rerun-if-changed=tau.manifest");
+    println!("cargo:rerun-if-env-changed=TAU_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_REPOSITORY");
     let out = std::env::var("OUT_DIR").unwrap();
-    let icon = Path::new(&out).join("orrery.ico");
+    let icon = Path::new(&out).join("tau.ico");
     let bytes = ico(&[16, 20, 24, 32, 48, 64, 256]);
     std::fs::write(&icon, &bytes).unwrap();
     // Kept for the installer, which needs the same icon.
-    std::fs::write(Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("target").join("orrery.ico"), &bytes).ok();
-    let manifest = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("orrery.manifest");
+    std::fs::write(Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("target").join("tau.ico"), &bytes).ok();
+    let manifest = Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("tau.manifest");
     let esc = |p: &Path| p.display().to_string().replace('\\', "\\\\");
-    let rc = Path::new(&out).join("orrery.rc");
+    let rc = Path::new(&out).join("tau.rc");
     std::fs::write(&rc, format!("1 ICON \"{}\"\n1 24 \"{}\"\n", esc(&icon), esc(&manifest))).unwrap();
     embed_resource::compile(&rc, embed_resource::NONE).manifest_required().unwrap();
 }

@@ -335,20 +335,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orrery"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "lopdf",
- "pulldown-cmark",
- "windows",
- "windows-collections",
- "windows-core",
- "windows-future",
- "windows-numerics",
-]
-
-[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -550,6 +536,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tau"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "lopdf",
+ "pulldown-cmark",
+ "windows",
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
 ]
 
 [[package]]

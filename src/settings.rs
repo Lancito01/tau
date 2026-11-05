@@ -8,7 +8,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Shell::*;
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
-const RUN_VALUE: PCWSTR = w!("Orrery");
+const RUN_VALUE: PCWSTR = w!("Tau");
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
@@ -31,7 +31,7 @@ pub const KEYS: [&str; 7] = ["Shift", "Ctrl", "Alt", "Win", "Caps Lock", "Tab", 
 pub const HOTKEYS: [&str; 4] = ["Ctrl+Alt+Space", "Ctrl+Shift+Space", "Win+Alt+Space", "Off"];
 
 fn dir() -> PathBuf {
-    let d = PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into())).join("Orrery");
+    let d = PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into())).join("Tau");
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -87,7 +87,7 @@ pub fn set_startup(on: bool) {
 }
 
 fn sendto_link() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var("APPDATA").ok()?).join(r"Microsoft\Windows\SendTo\Orrery.lnk"))
+    Some(PathBuf::from(std::env::var("APPDATA").ok()?).join(r"Microsoft\Windows\SendTo\Tau.lnk"))
 }
 
 pub fn sendto_enabled() -> bool { sendto_link().is_some_and(|p| p.exists()) }
@@ -104,37 +104,69 @@ pub fn set_sendto(on: bool) {
     }
 }
 
-fn engine_note() -> String {
+/// Carries settings, the startup entry and the Send To link over from when this app was called Orrery.
+pub fn migrate() {
+    const OLD: &str = "Orrery";
+    let Ok(appdata) = std::env::var("APPDATA") else { return };
+    let appdata = PathBuf::from(appdata);
+    let (old_ini, new_ini) = (appdata.join(OLD).join("settings.ini"), dir().join("settings.ini"));
+    if old_ini.exists() && !new_ini.exists() { let _ = std::fs::copy(&old_ini, &new_ini); }
+    let old_link = appdata.join(r"Microsoft\Windows\SendTo").join(format!("{OLD}.lnk"));
+    if old_link.exists() {
+        let _ = std::fs::remove_file(&old_link);
+        set_sendto(true);
+    }
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, KEY_SET_VALUE | KEY_QUERY_VALUE, &mut key).is_err() { return; }
+        let name = HSTRING::from(OLD);
+        let mut size = 0u32;
+        if RegQueryValueExW(key, &name, None, None, None, Some(&mut size)).is_ok() {
+            let _ = RegDeleteValueW(key, &name);
+            set_startup(true);
+        }
+        let _ = RegCloseKey(key);
+    }
+}
+
+fn fields(cur: &Settings, startup: bool, sendto: bool) -> Vec<Field> {
+    let idx = |list: &[&str], v: &str| list.iter().position(|k| *k == v).unwrap_or(0);
+    let keys: Vec<String> = KEYS.iter().map(|s| s.to_string()).collect();
     let e = crate::engines();
-    let flag = |b: bool| if b { "found" } else { "not found" };
-    format!(
-        "ffmpeg {} (audio, video, WebP, AVIF). Word {}, Excel {}, PowerPoint {} (Office formats).{}",
-        flag(e.ffmpeg), flag(e.word), flag(e.excel), flag(e.powerpoint),
-        if e.ffmpeg { "" } else { "\nPut ffmpeg.exe on your PATH or next to Orrery.exe to turn on audio and video." }
-    )
+    let mut about = format!("Version {}.", crate::VERSION);
+    if !e.ffmpeg { about.push_str(" Put ffmpeg.exe on your PATH or next to Tau.exe to turn on audio and video."); }
+    vec![
+        Field::Heading("Keys"),
+        Field::Note("During a drag, press Win to open the dial, then scroll to switch wheels. Trackpads can't scroll mid-drag, so turn this on to give each wheel its own key.".into()),
+        Field::Check("Use a separate key for each wheel", cur.separate_keys),
+        Field::ChoiceIf(2, "Convert wheel", keys.clone(), idx(&KEYS, &cur.convert_key)),
+        Field::ChoiceIf(2, "Tools wheel", keys.clone(), idx(&KEYS, &cur.tools_key)),
+        Field::ChoiceIf(2, "Actions wheel", keys, idx(&KEYS, &cur.actions_key)),
+        form::choice("Keyboard shortcut", &HOTKEYS, idx(&HOTKEYS, &cur.hotkey)),
+        Field::Heading("General"),
+        Field::Check("Start Tau when I sign in to Windows", startup),
+        Field::Check("Add Tau to the Send To menu", sendto),
+        Field::Check("Install updates automatically", cur.auto_update),
+        Field::Heading("Engines"),
+        Field::Status(vec![("ffmpeg".into(), e.ffmpeg), ("Word".into(), e.word), ("Excel".into(), e.excel), ("PowerPoint".into(), e.powerpoint)]),
+        Field::Note(about),
+    ]
 }
 
 /// Shows the settings form. Returns the new settings if the user saved.
 pub fn show(cur: &Settings) -> Option<Settings> {
-    let idx = |list: &[&str], v: &str| list.iter().position(|k| *k == v).unwrap_or(0);
-    let fields = vec![
-        Field::Note("During a drag, press Win to open the wheel, then scroll to switch wheels. Trackpads can't scroll mid-drag, so tick this box to give each wheel its own key instead.".into()),
-        Field::Check("Use a separate key for each wheel", cur.separate_keys),
-        form::choice("Convert wheel key", &KEYS, idx(&KEYS, &cur.convert_key)),
-        form::choice("Tools wheel key", &KEYS, idx(&KEYS, &cur.tools_key)),
-        form::choice("Actions wheel key", &KEYS, idx(&KEYS, &cur.actions_key)),
-        form::choice("Keyboard shortcut", &HOTKEYS, idx(&HOTKEYS, &cur.hotkey)),
-        Field::Check("Start Orrery when I sign in to Windows", startup_enabled()),
-        Field::Check("Add Orrery to the Send To menu", sendto_enabled()),
-        Field::Check("Install updates automatically (checks GitHub once a day)", cur.auto_update),
-        Field::Note(format!("Version {}. {}", crate::VERSION, engine_note())),
-    ];
-    let v = form::show("Orrery settings", &fields, "Save")?;
-    let s = Settings { separate_keys: v[1] == "1", convert_key: v[2].clone(), tools_key: v[3].clone(), actions_key: v[4].clone(), hotkey: v[5].clone(), auto_update: v[8] == "1" };
-    if v[6] == "1" { set_startup(true); } else if startup_enabled() { set_startup(false); }
-    if v[7] == "1" { set_sendto(true); } else if sendto_enabled() { set_sendto(false); }
+    form::set_context(String::new());
+    let v = form::show("Settings", &fields(cur, startup_enabled(), sendto_enabled()), "Save")?;
+    let s = Settings { separate_keys: v[2] == "1", convert_key: v[3].clone(), tools_key: v[4].clone(), actions_key: v[5].clone(), hotkey: v[6].clone(), auto_update: v[10] == "1" };
+    if v[8] == "1" { set_startup(true); } else if startup_enabled() { set_startup(false); }
+    if v[9] == "1" { set_sendto(true); } else if sendto_enabled() { set_sendto(false); }
     s.save();
     Some(s)
+}
+
+/// The settings form as a PNG, for design review.
+pub fn render(out: &std::path::Path) -> std::result::Result<(), String> {
+    form::render("Settings", "", &fields(&Settings::default(), true, false), "Save", out)
 }
 
 #[cfg(test)]
@@ -165,7 +197,7 @@ mod startup_tests {
     #[test]
     #[ignore]
     fn startup_round_trip() {
-        assert!(!startup_enabled(), "an Orrery startup entry already exists; not touching it");
+        assert!(!startup_enabled(), "a Tau startup entry already exists; not touching it");
         set_startup(true);
         let on = startup_enabled();
         let mut size = 0u32;

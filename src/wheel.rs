@@ -1,4 +1,4 @@
-//! The orbit wheel: geometry, drawing, the layered window, and the mid-drag drop target.
+//! The dial: geometry, drawing, the layered window, and the mid-drag drop target.
 use crate::catalog::{self, Entry, Kind};
 use crate::gfx::*;
 use std::cell::RefCell;
@@ -18,11 +18,13 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const DISC_R: f32 = 176.0;
-pub const ORBIT_R: f32 = 122.0;
-pub const NODE_R: f32 = 35.0;
+pub const ORBIT_R: f32 = 124.0;
+const RING_R: f32 = 72.0;
+const CHIP_W: f32 = 76.0;
+const CHIP_H: f32 = 56.0;
 pub const HUB_R: f32 = 52.0;
-const PAD: f32 = 14.0;
-const OPEN_MS: f32 = 140.0;
+const PAD: f32 = 20.0;
+const OPEN_MS: f32 = 180.0;
 const PROBE_MS: u32 = 300;
 
 pub const WM_APP_KEY: u32 = WM_APP + 1; // wparam: Kind index
@@ -55,6 +57,12 @@ pub fn node_center(i: usize, count: usize, radius: f32) -> (f32, f32) {
     (a.sin() * radius, -a.cos() * radius)
 }
 
+/// The signed turn from one angle to another, the short way round.
+fn needle_delta(from: f32, to: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    (to - from + pi).rem_euclid(std::f32::consts::TAU) - pi
+}
+
 /// The wheel `steps` places along from `kind`, wrapping at both ends.
 fn cycled(kind: Kind, steps: i32) -> Kind {
     let i = KINDS.iter().position(|k| *k == kind).unwrap_or(0) as i32;
@@ -74,6 +82,9 @@ pub struct View<'a> {
     pub hover: Option<usize>,
     pub open: f32,
     pub count: usize,
+    /// Where the needle points, in radians clockwise from twelve, and how visible it is.
+    pub needle: f32,
+    pub needle_on: f32,
 }
 
 fn draw_text(rt: &ID2D1RenderTarget, f: &IDWriteTextFormat, s: &str, x: f32, y: f32, w: f32, h: f32, b: &ID2D1SolidColorBrush) {
@@ -85,96 +96,105 @@ fn draw_text(rt: &ID2D1RenderTarget, f: &IDWriteTextFormat, s: &str, x: f32, y: 
 /// Draws the wheel centred at (cx, cy) in DIPs. Used for the window and for --render-wheel.
 pub fn draw(g: &Gfx, rt: &ID2D1RenderTarget, cx: f32, cy: f32, v: &View) -> Result<()> {
     unsafe {
+        let tau = std::f32::consts::TAU;
         let ease = 1.0 - (1.0 - v.open).powi(3);
         let brush = |c: u32, a: f32| rt.CreateSolidColorBrush(&rgba(c, a), None);
+        let round = round_stroke(g)?;
+        let semi = DWRITE_FONT_WEIGHT_SEMI_BOLD;
+        let center = DWRITE_TEXT_ALIGNMENT_CENTER;
 
         // Disc with a soft outer shadow. Every pixel is non-zero alpha so OLE hit-tests the whole disc.
+        let outer = DISC_R + PAD;
+        let edge = DISC_R / outer;
         let stops = [
-            D2D1_GRADIENT_STOP { position: 0.0, color: rgba(0, 0.45 * ease) },
-            D2D1_GRADIENT_STOP { position: DISC_R / (DISC_R + PAD) - 0.01, color: rgba(0, 0.45 * ease) },
+            D2D1_GRADIENT_STOP { position: 0.0, color: rgba(0, 0.5 * ease) },
+            D2D1_GRADIENT_STOP { position: edge - 0.01, color: rgba(0, 0.5 * ease) },
+            D2D1_GRADIENT_STOP { position: edge, color: rgba(0, 0.3 * ease) },
             D2D1_GRADIENT_STOP { position: 1.0, color: rgba(0, 0.0) },
         ];
         let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
         let shadow = rt.CreateRadialGradientBrush(
-            &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: pt(cx, cy), gradientOriginOffset: pt(0.0, 0.0), radiusX: DISC_R + PAD, radiusY: DISC_R + PAD },
+            &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES { center: pt(cx, cy), gradientOriginOffset: pt(0.0, 0.0), radiusX: outer, radiusY: outer },
             None, &coll,
         )?;
-        rt.FillEllipse(&ellipse(cx, cy, DISC_R + PAD), &shadow);
-        rt.FillEllipse(&ellipse(cx, cy, DISC_R * (0.82 + 0.18 * ease)), &brush(BG, 0.96 * ease)?);
-
-        // The orbit, drawn as a thin ring, never as wedges.
-        let orbit = ORBIT_R * ease;
-        rt.DrawEllipse(&ellipse(cx, cy, orbit), &brush(BORDER, ease)?, 1.5, None);
+        rt.FillEllipse(&ellipse(cx, cy, outer), &shadow);
+        let disc = DISC_R * (0.86 + 0.14 * ease);
+        rt.FillEllipse(&ellipse(cx, cy, disc), &brush(BG, 0.95 * ease)?);
+        rt.DrawEllipse(&ellipse(cx, cy, disc - 0.5), &brush(0xFFFFFF, 0.08 * ease)?, 1.0, None);
 
         let n = v.entries.len();
-        let label = g.format("Segoe UI", 11.0, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let small = g.format("Segoe UI", 9.0, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let icon = g.format("Segoe MDL2 Assets", 18.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        let step = if n > 0 { tau / n as f32 } else { tau };
+        let orbit = ORBIT_R * (0.9 + 0.1 * ease);
+        let ring = RING_R * (0.9 + 0.1 * ease);
+        let at_ring = |a: f32, rad: f32| pt(cx + a.sin() * rad, cy - a.cos() * rad);
 
-        // Tether and comet for the active node, under the nodes.
-        if let Some(h) = v.hover.filter(|&h| h < n) {
-            if v.entries[h].blocked.is_none() {
-                let (nx, ny) = node_center(h, n, orbit);
-                let len = (nx * nx + ny * ny).sqrt().max(1.0);
-                let (ux, uy) = (nx / len, ny / len);
-                rt.DrawLine(pt(cx + ux * HUB_R, cy + uy * HUB_R), pt(cx + nx, cy + ny), &brush(ACCENT, ease)?, 2.5, None);
-                let sweep = std::f32::consts::TAU / n as f32 * 0.42;
-                let mid = h as f32 / n as f32 * std::f32::consts::TAU;
-                let steps = 18;
-                for s in 0..steps {
-                    let t0 = s as f32 / steps as f32;
-                    let t1 = (s + 1) as f32 / steps as f32;
-                    let (a0, a1) = (mid - sweep * t1, mid - sweep * t0);
-                    let p0 = pt(cx + a0.sin() * orbit, cy - a0.cos() * orbit);
-                    let p1 = pt(cx + a1.sin() * orbit, cy - a1.cos() * orbit);
-                    rt.DrawLine(p0, p1, &brush(ACCENT, (1.0 - t0) * 0.9 * ease)?, 3.0, None);
-                }
-            }
+        // The dial: a thin ring with one tick per entry.
+        rt.DrawEllipse(&ellipse(cx, cy, ring), &brush(TEXT, 0.10 * ease)?, 1.0, None);
+        for i in 0..n {
+            let p = at_ring(i as f32 * step, ring);
+            rt.FillEllipse(&ellipse(p.X, p.Y, 1.6), &brush(TEXT, 0.34 * ease)?);
+        }
+        // Opening, a stroke of signal colour sweeps once around.
+        if v.open < 1.0 {
+            let sweep = arc(g, cx, cy, ring, 0.0, tau * ease.max(0.001))?;
+            rt.DrawGeometry(&sweep, &brush(ACCENT, (1.0 - v.open) * 0.9)?, 2.0, &round);
         }
 
+        let blocked_active = v.hover.and_then(|h| v.entries.get(h)).is_some_and(|e| e.blocked.is_some());
+        if v.needle_on > 0.01 && n > 0 {
+            let col = if blocked_active { FAINT } else { ACCENT };
+            let on = v.needle_on * ease;
+            let seg = (step * 0.6).min(1.2);
+            let g_arc = arc(g, cx, cy, ring, v.needle - seg / 2.0, seg)?;
+            rt.DrawGeometry(&g_arc, &brush(col, on)?, 3.0, &round);
+            rt.DrawLine(at_ring(v.needle, HUB_R + 2.0), at_ring(v.needle, ring), &brush(col, on)?, 2.0, &round);
+        }
+
+        let label = g.format(FONT, 10.0, semi, center)?;
+        let long = g.format(FONT, 9.0, semi, center)?;
+        let fmt = g.format(FONT, 13.5, DWRITE_FONT_WEIGHT_BOLD, center)?;
+        let icon = g.format(ICONS, 19.0, DWRITE_FONT_WEIGHT_NORMAL, center)?;
+        let chip_w = (2.0 * orbit * (step / 2.0).sin() - 4.0).clamp(52.0, CHIP_W);
         for (i, e) in v.entries.iter().enumerate() {
             let (dx, dy) = node_center(i, n, orbit);
             let (x, y) = (cx + dx, cy + dy);
             let active = v.hover == Some(i);
             let blocked = e.blocked.is_some();
-            let r = NODE_R * ease * if active && !blocked { 1.16 } else { 1.0 };
-            let fill = if active && !blocked { ACCENT } else { SURFACE };
-            if active && !blocked {
-                rt.FillEllipse(&ellipse(x, y, r + 6.0), &brush(ACCENT, 0.28 * ease)?);
+            if active {
+                let c = rrect(x - chip_w / 2.0, y - CHIP_H / 2.0, chip_w, CHIP_H, 14.0);
+                rt.FillRoundedRectangle(&c, &brush(if blocked { RAISED } else { ACCENT }, ease)?);
             }
-            rt.FillEllipse(&ellipse(x, y, r), &brush(fill, if blocked { 0.55 * ease } else { ease })?);
-            rt.DrawEllipse(&ellipse(x, y, r), &brush(if active { ACCENT } else { BORDER }, ease)?, 1.0, None);
-            let fg = if active && !blocked { ON_ACCENT } else if blocked { MUTED } else { TEXT };
-            let fb = brush(fg, ease * if blocked { 0.7 } else { 1.0 })?;
+            let (fg, alpha) = if active && !blocked { (ON_ACCENT, 1.0) } else if blocked { (MUTED, if active { 0.8 } else { 0.38 }) } else { (TEXT, 1.0) };
+            let fb = brush(fg, alpha * ease)?;
             if e.icon != 0 {
                 let glyph = String::from_utf16_lossy(&[e.icon]);
-                draw_text(rt, &icon, &glyph, x, y - 8.0, 60.0, 24.0, &fb);
-                draw_text(rt, &small, e.label, x, y + 13.0, 68.0, 14.0, &fb);
+                draw_text(rt, &icon, &glyph, x, y - 9.0, chip_w, 24.0, &fb);
+                let f = if e.label.chars().count() > 11 { &long } else { &label };
+                draw_text(rt, f, e.label, x, y + 13.0, chip_w + 6.0, 14.0, &fb);
             } else {
-                draw_text(rt, &label, e.label, x, y, 66.0, 22.0, &fb);
+                draw_text(rt, &fmt, e.label, x, y, chip_w, 22.0, &fb);
             }
         }
 
-        // Hub: the current choice, and which wheel this is.
+        // Hub: the current choice, and which wheel this is. Dropping here cancels.
         rt.FillEllipse(&ellipse(cx, cy, HUB_R), &brush(SURFACE, ease)?);
-        rt.DrawEllipse(&ellipse(cx, cy, HUB_R), &brush(BORDER, ease)?, 1.0, None);
-        let hub = g.format("Segoe UI", 13.0, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let cap = g.format("Segoe UI", 9.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        rt.DrawEllipse(&ellipse(cx, cy, HUB_R - 0.5), &brush(0xFFFFFF, 0.07 * ease)?, 1.0, None);
         let (main, sub): (String, String) = match v.hover.and_then(|h| v.entries.get(h)) {
             Some(e) if e.blocked.is_some() => (e.label.to_string(), e.blocked.unwrap().to_string()),
             Some(e) => (e.label.to_string(), if v.count > 1 { format!("{} files", v.count) } else { v.kind.title().to_string() }),
             None if n == 0 => ("Nothing here".to_string(), "try another wheel".to_string()),
             None => (v.kind.title().to_string(), if v.count > 1 { format!("{} files", v.count) } else { "drop here to cancel".to_string() }),
         };
-        draw_text(rt, &hub, &main, cx, cy - 8.0, 96.0, 20.0, &brush(TEXT, ease)?);
-        let cap_font = if sub.len() > 14 { g.format("Segoe UI", 8.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)? } else { cap };
-        draw_text(rt, &cap_font, &sub, cx, cy + 10.0, 96.0, 14.0, &brush(MUTED, ease)?);
+        let hub = g.format(FONT, if main.chars().count() > 13 { 11.5 } else { 13.0 }, semi, center)?;
+        let cap = g.format(FONT, if sub.chars().count() > 14 { 8.5 } else { 9.5 }, DWRITE_FONT_WEIGHT_NORMAL, center)?;
+        draw_text(rt, &hub, &main, cx, cy - 9.0, 94.0, 20.0, &brush(TEXT, ease)?);
+        draw_text(rt, &cap, &sub, cx, cy + 9.0, 94.0, 14.0, &brush(MUTED, ease)?);
 
-        // Three pips under the hub text: which of the three wheels is showing.
+        // Three dashes under the hub text: which of the three wheels is showing.
         for (i, k) in KINDS.iter().enumerate() {
-            let x = cx + (i as f32 - 1.0) * 10.0;
+            let x = cx - 19.0 + i as f32 * 14.0;
             let on = *k == v.kind;
-            rt.FillEllipse(&ellipse(x, cy + 28.0, 2.5), &brush(if on { ACCENT } else { BORDER }, ease)?);
+            rt.FillRoundedRectangle(&rrect(x, cy + 26.75, 10.0, 2.5, 1.25), &brush(if on { ACCENT } else { TEXT }, if on { ease } else { 0.18 * ease })?);
         }
         Ok(())
     }
@@ -197,6 +217,9 @@ struct Wheel {
     center: POINT,
     scale: f32,
     opened_at: std::time::Instant,
+    needle: f32,
+    needle_on: f32,
+    last_paint: std::time::Instant,
     pending: Option<(Kind, Entry)>,
     helper: Option<IDropTargetHelper>,
     mouse_hook: Option<HHOOK>,
@@ -233,27 +256,56 @@ impl Wheel {
         self.kind = kind;
         self.entries = catalog::entries(kind, &self.paths, &crate::engines());
         self.hover = None;
+        self.needle_on = 0.0;
         self.opened_at = std::time::Instant::now();
         unsafe { SetTimer(Some(self.hwnd), TIMER_ANIM, 8, None); }
     }
 
     fn paint(&mut self) {
-        let Some(s) = self.surface.as_ref() else { return };
         let open = (self.opened_at.elapsed().as_secs_f32() * 1000.0 / OPEN_MS).min(1.0);
+        let settled = self.step_needle();
+        let Some(s) = self.surface.as_ref() else { return };
         unsafe {
             s.rt.BeginDraw();
             // Never fully clear: a transparent pixel under the cursor is click-through, OLE would see
             // the drag leave mid-animation and the wheel would vanish. 1/255 is invisible but solid.
             s.rt.Clear(Some(&rgba(0, 1.0 / 255.0)));
             s.rt.SetTransform(&windows_numerics::Matrix3x2 { M11: self.scale, M12: 0.0, M21: 0.0, M22: self.scale, M31: 0.0, M32: 0.0 });
-            let c = (DISC_R + PAD) as f32;
-            let view = View { kind: self.kind, entries: &self.entries, hover: self.hover, open, count: self.paths.len() };
+            let c = DISC_R + PAD;
+            let view = View { kind: self.kind, entries: &self.entries, hover: self.hover, open, count: self.paths.len(), needle: self.needle, needle_on: self.needle_on };
             let rt: ID2D1RenderTarget = s.rt.cast().unwrap();
             let _ = draw(&self.gfx, &rt, c, c, &view);
             let _ = s.rt.EndDraw(None, None);
         }
         s.present(self.hwnd, self.origin.x, self.origin.y);
-        if open >= 1.0 { unsafe { let _ = KillTimer(Some(self.hwnd), TIMER_ANIM); } }
+        unsafe {
+            if open >= 1.0 && settled { let _ = KillTimer(Some(self.hwnd), TIMER_ANIM); } else { SetTimer(Some(self.hwnd), TIMER_ANIM, 8, None); }
+        }
+    }
+
+    /// Eases the needle towards the active entry by the short way round. True once it has stopped.
+    fn step_needle(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let dt = (now - self.last_paint).as_secs_f32().min(0.05);
+        self.last_paint = now;
+        let k = 1.0 - (-dt * 26.0).exp();
+        let n = self.entries.len();
+        match self.hover.filter(|h| *h < n) {
+            Some(h) => {
+                let target = h as f32 / n as f32 * std::f32::consts::TAU;
+                if self.needle_on < 0.02 { self.needle = target; }
+                let d = needle_delta(self.needle, target);
+                self.needle = if d.abs() < 0.002 { target } else { self.needle + d * k };
+                self.needle_on += (1.0 - self.needle_on) * k;
+                if self.needle_on > 0.99 { self.needle_on = 1.0; }
+                d.abs() < 0.002 && self.needle_on >= 1.0
+            }
+            None => {
+                self.needle_on -= self.needle_on * k;
+                if self.needle_on < 0.01 { self.needle_on = 0.0; }
+                self.needle_on == 0.0
+            }
+        }
     }
 
     fn hover_at(&mut self, p: POINT) -> bool {
@@ -542,13 +594,13 @@ pub fn init() -> Result<HWND> {
     unsafe {
         let inst = GetModuleHandleW(None)?;
         let wc = WNDCLASSW {
-            lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("OrreryWheel"),
+            lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("TauWheel"),
             hCursor: LoadCursorW(None, IDC_ARROW)?, ..Default::default()
         };
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("OrreryWheel"), w!("Orrery"), WS_POPUP, 0, 0, 10, 10, None, None, Some(inst.into()), None,
+            w!("TauWheel"), w!("Tau"), WS_POPUP, 0, 0, 10, 10, None, None, Some(inst.into()), None,
         )?;
         let target: IDropTarget = Target.into();
         RegisterDragDrop(hwnd, &target)?;
@@ -556,7 +608,7 @@ pub fn init() -> Result<HWND> {
         let wheel = Wheel {
             hwnd, gfx: Gfx::new()?, surface: None, mode: Mode::Hidden, kind: Kind::Convert,
             paths: vec![], entries: vec![], hover: None, last_mouse: POINT::default(), origin: POINT::default(), center: POINT::default(),
-            scale: 0.0, opened_at: std::time::Instant::now(), pending: None, helper, mouse_hook: None,
+            scale: 0.0, opened_at: std::time::Instant::now(), needle: 0.0, needle_on: 0.0, last_paint: std::time::Instant::now(), pending: None, helper, mouse_hook: None,
         };
         W.with(|w| *w.borrow_mut() = Some(wheel));
         Ok(hwnd)
@@ -597,7 +649,8 @@ pub fn render_png(kind: Kind, paths: &[PathBuf], hover: Option<usize>, scale: f3
         surf.rt.Clear(Some(&rgba(0, 0.0)));
         surf.rt.SetTransform(&windows_numerics::Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: 0.0, M32: 0.0 });
         let c = DISC_R + PAD;
-        let view = View { kind, entries: &en, hover, open: 1.0, count: paths.len() };
+        let needle = hover.filter(|h| *h < en.len()).map(|h| h as f32 / en.len() as f32 * std::f32::consts::TAU);
+        let view = View { kind, entries: &en, hover, open: 1.0, count: paths.len(), needle: needle.unwrap_or(0.0), needle_on: if needle.is_some() { 1.0 } else { 0.0 } };
         let rt: ID2D1RenderTarget = surf.rt.cast()?;
         draw(&g, &rt, c, c, &view)?;
         surf.rt.EndDraw(None, None)?;
@@ -631,6 +684,12 @@ mod tests {
     #[test]
     fn turning_back_drops_the_leftover() {
         assert_eq!(scroll_notches(80, -40), (0, -40));
+    }
+    #[test]
+    fn needle_takes_the_short_way() {
+        let tau = std::f32::consts::TAU;
+        assert!((needle_delta(0.1, tau - 0.1) + 0.2).abs() < 1e-4);
+        assert!((needle_delta(tau - 0.1, 0.1) - 0.2).abs() < 1e-4);
     }
     #[test]
     fn hub_cancels() { assert_eq!(pick(0.0, 0.0, 6), None); assert_eq!(pick(HUB_R - 1.0, 0.0, 6), None); }

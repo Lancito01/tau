@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Per-user install: no elevation, so the auto-updater can run it silently. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Tau" Manufacturer="Tau" Version="$(var.Version)"
+           UpgradeCode="F2A4E7B5-02FB-41C2-8012-914E3FE6B9A0" Scope="perUser" Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Tau is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="tau.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="tau.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Tau">
+          <Component Id="MainExecutable" Guid="6B0F3C1E-5D0A-4E0B-9A57-3C1E8D7F2A10">
+            <File Id="TauExe" Source="$(var.ExePath)" Name="tau.exe" />
+            <RegistryValue Root="HKCU" Key="Software\Tau\Install" Name="Path" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+            <RemoveFolder Id="RemoveUserProgramsFolder" Directory="UserProgramsFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="A91D4E72-3B6C-4F18-8E25-7D0C6B1F9E34">
+        <Shortcut Id="TauShortcut" Name="Tau" Description="Drag a file, tap a key, drop it on the dial."
+                  Target="[INSTALLFOLDER]tau.exe" WorkingDirectory="INSTALLFOLDER" Icon="tau.ico" />
+        <RegistryValue Root="HKCU" Key="Software\Tau\Install" Name="Shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Tau">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- A real uninstall stops the app and removes its startup entry and Send To link. An upgrade keeps them. -->
+    <CustomAction Id="TauCleanup" FileRef="TauExe" ExeCommand="--uninstall" Execute="deferred" Impersonate="yes" Return="ignore" />
+    <!-- Start the app after a double-clicked install. The updater runs quietly and starts it itself. -->
+    <CustomAction Id="TauLaunch" FileRef="TauExe" ExeCommand="" Execute="immediate" Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="TauCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom Action="TauLaunch" After="InstallFinalize" Condition="NOT REMOVE AND UILevel &gt; 3" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

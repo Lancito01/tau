@@ -130,7 +130,7 @@ fn show_share(paths: &[PathBuf]) -> Result<()> {
             None => {
                 // Windows shows nothing for a hidden owner, so the sheet gets a one-pixel, click-through, nearly invisible one.
                 let inst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
-                let h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, w!("STATIC"), w!("Orrery share"), WS_POPUP | WS_VISIBLE, 0, 0, 1, 1, None, None, Some(inst.into()), None)?;
+                let h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, w!("STATIC"), w!("Tau share"), WS_POPUP | WS_VISIBLE, 0, 0, 1, 1, None, None, Some(inst.into()), None)?;
                 let _ = SetLayeredWindowAttributes(h, COLORREF(0), 1, LWA_ALPHA);
                 h
             }
@@ -153,8 +153,7 @@ fn show_share(paths: &[PathBuf]) -> Result<()> {
 
 fn share(paths: &[PathBuf]) {
     if let Err(e) = show_share(paths) {
-        let text = wz(&format!("Could not open Share: {}", e.message()));
-        unsafe { MessageBoxW(None, PCWSTR(text.as_ptr()), w!("Orrery"), MB_OK | MB_ICONWARNING); }
+        crate::tools::fail("Share", format!("Could not open Share: {}", e.message()));
     }
 }
 

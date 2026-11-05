@@ -1,8 +1,8 @@
 [package]
-name = "orrery"
+name = "tau"
 version = "0.1.0"
 edition = "2021"
-description = "Drag a file, tap a key, drop it on an orbit. Offline file conversion for Windows."
+description = "Drag a file, tap a key, drop it on the dial. Offline file conversion for Windows."
 
 [dependencies]
 lopdf = { version = "0.38", default-features = false }

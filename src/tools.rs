@@ -70,14 +70,14 @@ fn strip(input: &Path, dur: f64) -> Result<Bmp, String> {
     let tmp = TempDir::new()?;
     if classify(input) == Cat::Audio {
         let png = tmp.file("w.png");
-        run(None, &ff, &sv(&["-y", "-hide_banner", "-i", &input.display().to_string(), "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=1400x220:colors=0x6D4AFF", "-frames:v", "1", &png.display().to_string()]), None)?;
+        run(None, &ff, &sv(&["-y", "-hide_banner", "-i", &input.display().to_string(), "-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=1400x220:colors=0xC8F135", "-frames:v", "1", &png.display().to_string()]), None)?;
         let mut b = image::load(&png)?;
         for p in b.px.chunks_exact_mut(4) {
-            if p[3] == 0 { p.copy_from_slice(&[0x3A, 0x25, 0x23, 255]); }
+            if p[3] == 0 { p.copy_from_slice(&[0x1E, 0x1B, 0x19, 255]); }
         }
         return Ok(b);
     }
-    let mut out = Bmp::new(STRIP_FRAMES * 160, 90, [0x1A, 0x11, 0x10, 255]);
+    let mut out = Bmp::new(STRIP_FRAMES * 160, 90, [0x12, 0x10, 0x0F, 255]);
     for i in 0..STRIP_FRAMES {
         let at = dur * (i as f64 + 0.5) / STRIP_FRAMES as f64;
         if let Ok(f) = frame_at(input, at).and_then(|f| f.scaled(160, 90)) { out.blit(&f, (i * 160) as i32, 0); }
@@ -105,7 +105,20 @@ fn pick_shapes(title: &str, bmp: Result<Bmp, String>, mode: canvas::Mode, init: 
     }
 }
 
-/// Faces and words found in the picture, offered as starting redactions the user can remove with Undo.
+/// The video editors look at one frame, with a scrubber to find the right one.
+fn pick_shapes_video(title: &str, input: &Path, mode: canvas::Mode, ok: &str) -> Option<String> {
+    let p = input.to_path_buf();
+    let loaded = pump_job("Reading file", move |_| {
+        let dur = media::duration(&p);
+        Ok((frame_at(&p, 1f64.min(dur / 2.0))?, dur))
+    });
+    let (first, dur) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let p = input.to_path_buf();
+    let source = canvas::FrameSource { dur, load: Arc::new(move |t| frame_at(&p, t)) };
+    canvas::edit_video(title, first, mode, ok, source).map(|v| canvas::encode_all(&v))
+}
+
+/// Faces and words found in the picture, offered as starting redactions the user can remove one by one.
 fn suggest(p: &Path, b: &Bmp) -> Vec<Shape> {
     crate::detect::regions(p, b.w, b.h).unwrap_or_default().into_iter().map(|(x, y, w, h)| Shape::rect(x, y, x + w, y + h)).collect()
 }
@@ -125,33 +138,33 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             Opts::new()
         }
         "img.edit" => {
-            let v = form::show("Edit photo", &[text("Brightness (-100 to 100)", "0"), text("Contrast (-100 to 100)", "0"), text("Saturation (-100 to 100)", "0"), choice("Rotate", &["None", "90 right", "90 left", "180"], 0), choice("Flip", &["None", "Horizontal", "Vertical"], 0)], "Apply")?;
+            let p = first.clone();
+            let v = match pump_job("Reading file", move |_| image::load(&p)) {
+                Ok(b) => crate::photo::show(b, paths.len())?,
+                Err(_) => form::show("Edit photo", &[Field::Slider("Brightness", -100, 100, 0), Field::Slider("Contrast", -100, 100, 0), Field::Slider("Saturation", -100, 100, 0), choice("Rotate", &["None", "90 right", "90 left", "180"], 0), choice("Flip", &["None", "Horizontal", "Vertical"], 0)], "Apply")?,
+            };
             opts(&[("brightness", v[0].clone()), ("contrast", v[1].clone()), ("saturation", v[2].clone()), ("rotate", v[3].clone()), ("flip", v[4].clone())])
         }
         "img.background" => {
-            let v = form::show("Add background", &[text("Colour", "#FFFFFF")], "Apply")?;
+            let v = form::show("Add background", &[Field::Color("Colour", "#FFFFFF".into())], "Apply")?;
             opts(&[("color", v[0].clone())])
         }
         "img.collage" => {
-            let v = form::show("Collage", &[choice("Columns", &["Auto", "2", "3", "4", "5"], 0), text("Gap (pixels)", "12"), text("Background", "#FFFFFF")], "Create")?;
+            let v = form::show("Collage", &[choice("Columns", &["Auto", "2", "3", "4", "5"], 0), Field::Slider("Gap (pixels)", 0, 80, 12), Field::Color("Background", "#FFFFFF".into())], "Create")?;
             opts(&[("columns", v[0].clone()), ("gap", v[1].clone()), ("color", v[2].clone())])
         }
         "img.crop" => {
             let p = first.clone();
             let b = pump_job("Reading file", move |_| image::load(&p));
-            let sh = pick_shapes("Crop: drag the area to keep", b, canvas::Mode::Crop, vec![], "Crop")?;
+            let sh = pick_shapes("Crop", b, canvas::Mode::Crop, vec![], "Crop")?;
             opts(&[("shapes", sh)])
         }
         "vid.crop" => {
-            let p = first.clone();
-            let b = pump_job("Reading file", move |_| frame_at(&p, 1.0));
-            let sh = pick_shapes("Crop: drag the area to keep", b, canvas::Mode::Crop, vec![], "Crop")?;
+            let sh = pick_shapes_video("Crop video", first, canvas::Mode::Crop, "Crop")?;
             opts(&[("shapes", sh)])
         }
         "vid.redact" => {
-            let p = first.clone();
-            let b = pump_job("Reading file", move |_| frame_at(&p, 1.0));
-            let sh = pick_shapes("Redact: draw boxes to black out for the whole video", b, canvas::Mode::Redact, vec![], "Redact")?;
+            let sh = pick_shapes_video("Redact video", first, canvas::Mode::Redact, "Redact")?;
             opts(&[("shapes", sh)])
         }
         "vid.compress" => {
@@ -214,14 +227,19 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
 
 /// From the wheel.
 pub fn run_ui(id: &str, paths: Vec<PathBuf>) {
+    form::set_context(match paths.as_slice() {
+        [one] => one.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        many => format!("{} files", many.len()),
+    });
     if matches!(id, "img.annotate" | "img.redact") {
         // Each picture needs its own marks, so these open one editor per file.
         for p in paths {
             let pp = p.clone();
             let loaded = pump_job("Reading file", move |_| { let b = image::load(&pp)?; let s = suggest(&pp, &b); Ok((b, s)) });
             let (bmp, found) = match loaded { Ok((b, f)) => (Ok(b), f), Err(e) => (Err(e), vec![]) };
+            form::set_context(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             let (mode, init, title, ok) = if id == "img.redact" {
-                (canvas::Mode::Redact, found, "Redact: faces and text are already marked. Draw more, or Undo.", "Redact")
+                (canvas::Mode::Redact, found, "Redact", "Redact")
             } else {
                 (canvas::Mode::Annotate, vec![], "Annotate", "Save")
             };
@@ -516,7 +534,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         }),
         "aud.normalize" => each("Normalizing", paths, |j, p| media::transform(j, p, " normalized", None, sv(&["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"]))),
         "aud.visualize" => each("Rendering video", paths, |j, p| {
-            let a = sv(&["-filter_complex", "[0:a]showwaves=s=1280x720:mode=cline:rate=30:colors=0x6D4AFF,format=yuv420p[v]", "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest"]);
+            let a = sv(&["-filter_complex", "[0:a]showwaves=s=1280x720:mode=cline:rate=30:colors=0xC8F135,format=yuv420p[v]", "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest"]);
             media::transform(j, p, " visualized", Some("mp4"), a)
         }),
         "aud.channels" => each("Changing channels", paths, move |j, p| media::transform(j, p, " channels", None, vec!["-af".into(), channels_filter(get(&o, "mode", "Mono")).into()])),

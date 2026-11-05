@@ -51,7 +51,7 @@ pub fn parse_release(doc: &str) -> Option<Release> {
 
 fn curl(args: &[&str]) -> Result<String, String> {
     let exe = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\curl.exe");
-    let mut a: Vec<String> = ["-fsSL", "--retry", "2", "--max-time", "300", "-A", "orrery-updater"].iter().map(|s| s.to_string()).collect();
+    let mut a: Vec<String> = ["-fsSL", "--retry", "2", "--max-time", "300", "-A", "tau-updater"].iter().map(|s| s.to_string()).collect();
     a.extend(args.iter().map(|s| s.to_string()));
     run(None, &exe, &a, None)
 }
@@ -72,9 +72,9 @@ fn check() -> Result<Option<Release>, String> {
 
 /// Downloads, verifies, then hands over to msiexec and exits so the files are free to replace.
 fn install(r: &Release) -> Result<(), String> {
-    let dir = std::env::temp_dir().join("orrery-update");
+    let dir = std::env::temp_dir().join("tau-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let msi = dir.join("Orrery.msi");
+    let msi = dir.join("Tau.msi");
     curl(&["-o", &msi.display().to_string(), &r.msi_url])?;
     // Without a published hash there is nothing to check a corrupted download against, so refuse it.
     let sha_url = r.sha_url.as_deref().ok_or("The release has no checksum")?;
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn picks_assets_from_release_json() {
         let d = r#"{"tag_name": "v0.1.5", "assets":[
-            {"name":"x","browser_download_url":"https://e/Orrery-0.1.5.msi.sha256"},
-            {"name":"y","browser_download_url":"https://e/Orrery-0.1.5.msi"}]}"#;
+            {"name":"x","browser_download_url":"https://e/Tau-0.1.5.msi.sha256"},
+            {"name":"y","browser_download_url":"https://e/Tau-0.1.5.msi"}]}"#;
         let r = parse_release(d).unwrap();
         assert_eq!(r.tag, "v0.1.5");
         assert!(r.msi_url.ends_with(".msi"));

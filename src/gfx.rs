@@ -8,16 +8,20 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Tokens from replica/design/tokens.json.
-pub const BG: u32 = 0x10111A;
-pub const SURFACE: u32 = 0x23253A;
-pub const BORDER: u32 = 0x3A3D58;
-pub const TEXT: u32 = 0xF3F4FA;
-pub const MUTED: u32 = 0xA9ADC4;
-pub const ACCENT: u32 = 0x6D4AFF;
-pub const ON_ACCENT: u32 = 0xFFFFFF;
-pub const DANGER: u32 = 0xFF6B6B;
-pub const SUCCESS: u32 = 0x3DD68C;
+// Tokens from replica/design/tokens.json. Neutral graphite with one signal colour, used sparingly.
+pub const BG: u32 = 0x0F1012;
+pub const SURFACE: u32 = 0x191B1E;
+pub const RAISED: u32 = 0x26282C;
+pub const BORDER: u32 = 0x33363B;
+pub const TEXT: u32 = 0xF5F6F7;
+pub const MUTED: u32 = 0xA2A7AF;
+pub const FAINT: u32 = 0x6F747C;
+pub const ACCENT: u32 = 0xC8F135;
+pub const ON_ACCENT: u32 = 0x12140A;
+pub const DANGER: u32 = 0xFF6B5E;
+pub const SUCCESS: u32 = 0x7EE8A8;
+pub const FONT: &str = "Segoe UI";
+pub const ICONS: &str = "Segoe MDL2 Assets";
 
 pub fn rgba(c: u32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
@@ -32,6 +36,59 @@ pub fn pt(x: f32, y: f32) -> windows_numerics::Vector2 { windows_numerics::Vecto
 
 pub fn ellipse(x: f32, y: f32, r: f32) -> D2D1_ELLIPSE {
     D2D1_ELLIPSE { point: pt(x, y), radiusX: r, radiusY: r }
+}
+
+pub fn rrect(x: f32, y: f32, w: f32, h: f32, r: f32) -> D2D1_ROUNDED_RECT {
+    D2D1_ROUNDED_RECT { rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h }, radiusX: r, radiusY: r }
+}
+
+/// An open arc. Angles are radians clockwise from twelve o'clock, as on the dial.
+pub fn arc(g: &Gfx, cx: f32, cy: f32, r: f32, from: f32, sweep: f32) -> Result<ID2D1PathGeometry> {
+    let at = |a: f32| pt(cx + a.sin() * r, cy - a.cos() * r);
+    let sweep = sweep.clamp(-std::f32::consts::TAU * 0.9999, std::f32::consts::TAU * 0.9999);
+    unsafe {
+        let geo = g.d2d.CreatePathGeometry()?;
+        let sink = geo.Open()?;
+        sink.BeginFigure(at(from), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddArc(&D2D1_ARC_SEGMENT {
+            point: at(from + sweep), size: D2D_SIZE_F { width: r, height: r }, rotationAngle: 0.0,
+            sweepDirection: if sweep >= 0.0 { D2D1_SWEEP_DIRECTION_CLOCKWISE } else { D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE },
+            arcSize: if sweep.abs() > std::f32::consts::PI { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+        });
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        sink.Close()?;
+        Ok(geo)
+    }
+}
+
+pub fn round_stroke(g: &Gfx) -> Result<ID2D1StrokeStyle> {
+    let props = D2D1_STROKE_STYLE_PROPERTIES {
+        startCap: D2D1_CAP_STYLE_ROUND, endCap: D2D1_CAP_STYLE_ROUND, dashCap: D2D1_CAP_STYLE_ROUND,
+        lineJoin: D2D1_LINE_JOIN_ROUND, miterLimit: 4.0, dashStyle: D2D1_DASH_STYLE_SOLID, dashOffset: 0.0,
+    };
+    unsafe { g.d2d.CreateStrokeStyle(&props, None) }
+}
+
+/// The mark: a signal disc with a dark tau. Same geometry as the icon in build.rs.
+pub fn draw_logo(g: &Gfx, rt: &ID2D1RenderTarget, x: f32, y: f32, size: f32) -> Result<()> {
+    let p = |u: f32, v: f32| pt(x + u * size, y + v * size);
+    unsafe {
+        let disc = rt.CreateSolidColorBrush(&rgba(ACCENT, 1.0), None)?;
+        let ink = rt.CreateSolidColorBrush(&rgba(ON_ACCENT, 1.0), None)?;
+        rt.FillEllipse(&ellipse(x + size / 2.0, y + size / 2.0, size / 2.0), &disc);
+        let geo = g.d2d.CreatePathGeometry()?;
+        let sink = geo.Open()?;
+        sink.BeginFigure(p(0.27, 0.36), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddLine(p(0.75, 0.36));
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        sink.BeginFigure(p(0.50, 0.36), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink.AddLine(p(0.50, 0.60));
+        sink.AddQuadraticBezier(&D2D1_QUADRATIC_BEZIER_SEGMENT { point1: p(0.50, 0.72), point2: p(0.64, 0.72) });
+        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+        sink.Close()?;
+        rt.DrawGeometry(&geo, &ink, size * 0.09, &round_stroke(g)?);
+    }
+    Ok(())
 }
 
 pub fn wide(s: &str) -> Vec<u16> { s.encode_utf16().collect() }

@@ -238,7 +238,7 @@ pub fn zip_store(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 pub fn write_epub(title: &str, html_body: &str, out: &Path) -> Result<(), String> {
     let xhtml = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>{0}</title></head><body>{1}</body></html>", escape(title), to_xhtml(html_body));
-    let opf = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"id\">orrery-{1}</dc:identifier><dc:title>{0}</dc:title><dc:language>en</dc:language><meta property=\"dcterms:modified\">2000-01-01T00:00:00Z</meta></metadata><manifest><item id=\"c\" href=\"c.xhtml\" media-type=\"application/xhtml+xml\"/><item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/></manifest><spine><itemref idref=\"c\"/></spine></package>", escape(title), crc32(title.as_bytes()));
+    let opf = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"id\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"id\">tau-{1}</dc:identifier><dc:title>{0}</dc:title><dc:language>en</dc:language><meta property=\"dcterms:modified\">2000-01-01T00:00:00Z</meta></metadata><manifest><item id=\"c\" href=\"c.xhtml\" media-type=\"application/xhtml+xml\"/><item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/></manifest><spine><itemref idref=\"c\"/></spine></package>", escape(title), crc32(title.as_bytes()));
     let nav = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\"><head><title>Contents</title></head><body><nav epub:type=\"toc\"><ol><li><a href=\"c.xhtml\">{}</a></li></ol></nav></body></html>", escape(title));
     let container = "<?xml version=\"1.0\"?>\n<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>";
     let z = zip_store(&[
@@ -568,7 +568,7 @@ pub fn convert_epub(job: &Job, input: &Path, target: &str) -> Result<PathBuf, St
         "html" => std::fs::write(&out, page(&stem(input), &body)).map_err(rerr)?,
         "pdf" | "docx" => {
             // Beside the chapters so relative image links still resolve.
-            let f = base.join("__orrery.html");
+            let f = base.join("__tau.html");
             std::fs::write(&f, page(&stem(input), &body)).map_err(rerr)?;
             if target == "pdf" { html_to_pdf(job, &f, &out)?; } else { word(job, &f, &out, 12)?; }
         }
