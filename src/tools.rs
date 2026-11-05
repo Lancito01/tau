@@ -6,7 +6,7 @@ use crate::form::{self, choice, text, Field};
 use crate::image::{self, Bmp, SaveOpts};
 use crate::job::*;
 use crate::media::{self, s as sv};
-use crate::preview::{self, format_bytes, Sampler};
+use crate::preview::{self, Control, Preset};
 use crate::quality;
 use crate::timeline;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub fn parse_marks(s: &str) -> Vec<f64> {
     v.sort_by(f64::total_cmp);
     v
 }
-fn marks_str(m: &[f64]) -> String { m.iter().map(|t| format!("{t:.3}")).collect::<Vec<_>>().join(",") }
+fn marks_str(m: &[f64]) -> String { m.iter().map(|t| format!("{t:.6}")).collect::<Vec<_>>().join(",") }
 
 /// Runs slow setup off the UI thread and keeps the message loop alive meanwhile, so the keyboard hook never stalls input.
 pub fn pump_job<T: Send + 'static>(title: &str, f: impl FnOnce(&Job) -> Result<T, String> + Send + 'static) -> Result<T, String> {
@@ -56,11 +56,23 @@ pub fn fail(title: &str, msg: String) {
 
 // ---- preview material for the editors ----
 
-fn frame_at(input: &Path, t: f64) -> Result<Bmp, String> {
+fn frame_at(input: &Path, t: f64) -> Result<Bmp, String> { still_at(input, t, None) }
+
+/// A frame, through a filter when it would not look right as a picture without one.
+fn still_at(input: &Path, t: f64, filter: Option<&str>) -> Result<Bmp, String> {
+    // A file's length can run past its last picture when the sound goes on longer. The last picture is the nearest then.
+    still_exactly(input, t, filter).or_else(|e| if t > 0.0 { still_exactly(input, (t - END_MARGIN).max(0.0), filter) } else { Err(e) })
+}
+
+const END_MARGIN: f64 = 0.25;
+
+fn still_exactly(input: &Path, t: f64, filter: Option<&str>) -> Result<Bmp, String> {
     let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
     let tmp = TempDir::new()?;
     let png = tmp.file("f.png");
-    run(None, &ff, &sv(&["-y", "-hide_banner", "-ss", &format!("{t:.3}"), "-i", &input.display().to_string(), "-frames:v", "1", &png.display().to_string()]), None)?;
+    let vf = filter.map(|f| vec!["-vf".to_string(), f.to_string()]).unwrap_or_default();
+    let (before, after) = quality::still_seek(&ext_of(input), t);
+    run(None, &ff, &sv(&["-y", "-hide_banner"]).into_iter().chain(before).chain(sv(&["-i", &input.display().to_string()])).chain(after).chain(vf).chain(sv(&["-frames:v", "1", &png.display().to_string()])).collect::<Vec<_>>(), None)?;
     image::load(&png)
 }
 
@@ -87,17 +99,28 @@ fn strip(input: &Path, dur: f64) -> Result<Bmp, String> {
     Ok(out)
 }
 
+/// Frames per second of a video, 0 for anything without pictures.
+fn frame_rate(p: &Path) -> f64 {
+    media::probe(p).video.as_ref().map(|v| v.fps).unwrap_or(0.0)
+}
+
 fn pick_times(title: &str, input: &Path, mode: timeline::Mode, ok: &str) -> Option<Vec<f64>> {
     let p = input.to_path_buf();
     let r = pump_job("Reading file", move |_| {
         let dur = media::duration(&p);
         if dur <= 0.0 { return Err("Could not read the length of this file".to_string()); }
-        Ok((dur, strip(&p, dur).ok()))
+        let video = media::probe(&p).video;
+        Ok((dur, video, strip(&p, dur).ok()))
     });
-    match r {
-        Ok((dur, st)) => timeline::pick(title, st, dur, mode, ok),
-        Err(e) => { fail(title, e); None }
-    }
+    let (dur, video, st) = match r { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let fps = video.as_ref().map(|v| v.fps).unwrap_or(0.0);
+    let filter = video.as_ref().and_then(quality::still_filter);
+    // Only pictures have a frame to look at.
+    let load: Option<timeline::FrameLoader> = (classify(input) == Cat::Video).then(|| {
+        let p = input.to_path_buf();
+        Arc::new(move |t| still_at(&p, t, filter.as_deref()).and_then(thumbnail)) as timeline::FrameLoader
+    });
+    timeline::pick(title, st, dur, fps, mode, ok, load)
 }
 
 fn pick_shapes(title: &str, bmp: Result<Bmp, String>, mode: canvas::Mode, init: Vec<Shape>, ok: &str) -> Option<String> {
@@ -112,11 +135,11 @@ fn pick_shapes_video(title: &str, input: &Path, mode: canvas::Mode, ok: &str) ->
     let p = input.to_path_buf();
     let loaded = pump_job("Reading file", move |_| {
         let dur = media::duration(&p);
-        Ok((frame_at(&p, 1f64.min(dur / 2.0))?, dur))
+        Ok((frame_at(&p, 1f64.min(dur / 2.0))?, dur, frame_rate(&p)))
     });
-    let (first, dur) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let (first, dur, fps) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
     let p = input.to_path_buf();
-    let source = canvas::FrameSource { dur, load: Arc::new(move |t| frame_at(&p, t)) };
+    let source = canvas::FrameSource { dur, fps, load: Arc::new(move |t| frame_at(&p, t)) };
     canvas::edit_video(title, first, mode, ok, source).map(|v| canvas::encode_all(&v))
 }
 
@@ -127,7 +150,6 @@ fn suggest(p: &Path, b: &Bmp) -> Vec<Shape> {
 
 // ---- what each compress level would give ----
 
-const QUALITY_LEVELS: &[&str] = &["Smaller file", "Balanced", "Higher quality"];
 const THUMB_MAX: u32 = 900;
 
 /// A copy small enough to redraw while a slider moves.
@@ -140,72 +162,194 @@ fn thumbnail(b: Bmp) -> Result<Bmp, String> {
 
 fn file_size(p: &Path) -> u64 { std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) }
 
-fn compress_choice(title: &str, sampler: Sampler, option_label: &str, options: &[&str], levels: &[&str], default: usize) -> Option<(String, String)> {
-    preview::show(preview::Spec {
-        title: title.into(), ok: "Compress".into(),
-        levels: levels.iter().map(|s| s.to_string()).collect(), default,
-        option_label: option_label.into(), options: options.iter().map(|s| s.to_string()).collect(), sampler,
+/// "Keep" and every limit under what the file already has, largest first. A limit above it would do nothing.
+fn limits_under(keep: &str, source: u32, limits: &[u32], label: impl Fn(u32) -> String) -> Vec<(String, i32)> {
+    std::iter::once((keep.to_string(), 0)).chain(limits.iter().filter(|l| source == 0 || **l < source).map(|l| (label(*l), *l as i32))).collect()
+}
+
+/// The name of a level, with the size it shrinks to when it shrinks the picture.
+fn level_name(name: &str, shrink: i32, suffix: &str) -> String {
+    if shrink > 0 { format!("{name}, {shrink}{suffix}") } else { name.to_string() }
+}
+
+/// (name, picture quality, tallest picture, audio allowance in kbps). Audio stays as it is until the level is modest,
+/// and only the bottom levels ask much of it.
+const VIDEO_LEVELS: [(&str, i32, u32, i32); 5] = [
+    ("Very high quality", 94, 0, 0),
+    ("High quality", 80, 0, 256),
+    ("Medium quality", 66, 1080, 160),
+    ("Low quality", 54, 720, 96),
+    ("Very low quality", 43, 480, 64),
+];
+const AUDIO_ALLOWANCES: [i32; 11] = [320, 256, 192, 160, 128, 96, 64, 48, 32, 16, 8];
+
+fn squeeze_of(v: &[i32]) -> quality::Squeeze {
+    let some = |x: i32| (x > 0).then_some(x as u32);
+    quality::Squeeze { crf: quality::crf_for(v[0]), height: some(v[1]), audio_kbps: some(v[2]), fps: some(v[3]) }
+}
+
+/// Encodes a stretch of the video exactly as the tool will.
+fn encode_sample(input: &Path, args: &[String], start: f64, len: f64, out: &Path) -> Result<(), String> {
+    let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
+    let mut a = sv(&["-y", "-hide_banner", "-nostdin", "-ss", &format!("{start:.3}"), "-t", &format!("{len:.3}"), "-i", &input.display().to_string()]);
+    a.extend_from_slice(args);
+    a.push(out.display().to_string());
+    run(None, &ff, &a, None).map(|_| ())
+}
+
+/// The frame at a moment comes from a second of video encoded around it, so it is a typical frame that has been
+/// predicted from others and not the unusually clean one a stream starts with. The size comes from two short pieces,
+/// scaled up to the whole length.
+fn video_spec(input: &Path) -> Result<preview::Spec, String> {
+    let pr = media::probe(input);
+    let dur = media::duration(input);
+    if dur <= 0.0 { return Err("Could not read the length of this file".to_string()); }
+    let (height, fps) = pr.video.as_ref().map(|v| (v.display_size().1, v.fps)).unwrap_or((0, 0.0));
+    let heights = limits_under("Keep size", height, &[2160, 1440, 1080, 720, 480, 360, 240, 144], |h| format!("{h}p"));
+    let rates = limits_under("Keep rate", fps.ceil() as u32, &[60, 30, 24, 15, 10, 5], |r| format!("{r} fps"));
+    let audio: Vec<(String, i32)> = if pr.audio.is_empty() { vec![("No audio in this file".to_string(), 0)] } else {
+        std::iter::once(("Keep as it is".to_string(), 0)).chain(AUDIO_ALLOWANCES.iter().map(|k| (format!("{k} kbps"), *k))).collect()
+    };
+    let presets = VIDEO_LEVELS.iter().map(|(name, q, h, a)| {
+        let h = if height == 0 || *h < height { *h as i32 } else { 0 };
+        Preset { name: level_name(name, h, "p"), values: vec![*q, h, if pr.audio.is_empty() { 0 } else { *a }, 0] }
+    }).collect();
+    let controls = vec![
+        Control::Slider { label: "Picture quality".into(), min: 0, max: 100, unit: "%" },
+        Control::Choice { label: "Resolution".into(), options: heights },
+        Control::Choice { label: "Audio".into(), options: audio },
+        Control::Choice { label: "Frame rate".into(), options: rates },
+    ];
+    let still = pr.video.as_ref().and_then(quality::still_filter);
+    let (p, probe) = (input.to_path_buf(), pr.clone());
+    let picture: preview::Picture = Arc::new(move |values, t| {
+        let Some(values) = values else { return still_at(&p, t, still.as_deref()) };
+        let args = quality::compress_video_args(&probe, &squeeze_of(values));
+        let start = (t - 0.6).max(0.0);
+        let tmp = TempDir::new()?;
+        let out = tmp.file("frame.mp4");
+        encode_sample(&p, &args, start, 1.0, &out)?;
+        // What the encode left may still have pixels that are not square, and it may be shorter than asked for.
+        let filter = media::probe(&out).video.as_ref().and_then(quality::still_filter);
+        still_at(&out, t - start, filter.as_deref()).or_else(|_| still_at(&out, 0.0, filter.as_deref()))
+    });
+    let (p, probe) = (input.to_path_buf(), pr);
+    let size: preview::Size = Arc::new(move |values| {
+        let len = 2f64.min(dur / 3.0).max(0.1);
+        let starts = if dur > len * 3.0 { vec![dur * 0.3, dur * 0.7] } else { vec![0.0] };
+        let args = quality::compress_video_args(&probe, &squeeze_of(values));
+        let tmp = TempDir::new()?;
+        let mut bytes = 0u64;
+        for (i, start) in starts.iter().enumerate() {
+            let out = tmp.file(&format!("s{i}.mp4"));
+            encode_sample(&p, &args, *start, len, &out)?;
+            bytes += file_size(&out);
+        }
+        Ok((bytes as f64 / (starts.len() as f64 * len) * dur) as u64)
+    });
+    Ok(preview::Spec {
+        title: "Compress video".into(), ok: "Compress".into(), presets, default: 1, controls,
+        custom_start: vec![40, 0, 0, 0], original_bytes: file_size(input), dur, fps, visual: true, note: String::new(), picture, size,
     })
+}
+
+const IMAGE_LEVELS: [(&str, i32, u32); 5] = [
+    ("Very high quality", 90, 0),
+    ("High quality", 80, 0),
+    ("Medium quality", 65, 0),
+    ("Low quality", 45, 1920),
+    ("Very low quality", 25, 1280),
+];
+
+/// The picture no longer than `max` on its longest side. Zero, or a picture already within it, stays as it is.
+fn shrink_to(b: &Bmp, max: u32) -> Result<Bmp, String> {
+    let long = b.w.max(b.h);
+    if max == 0 || long <= max { return Ok(b.clone()); }
+    let f = max as f64 / long as f64;
+    b.scaled(((b.w as f64 * f) as u32).max(1), ((b.h as f64 * f) as u32).max(1))
 }
 
 /// An image compressed for real at each level, since a picture takes no time.
-fn image_sampler(input: &Path) -> Sampler {
-    const MAXES: [&str; 5] = ["Keep size", "3840", "2560", "1920", "1280"];
-    let input = input.to_path_buf();
-    Arc::new(move |level, opt| {
-        let mut b = image::load(&input)?;
-        if level == 0 { return Ok((b, file_size(&input))); }
-        if let Ok(max) = MAXES[opt].parse::<u32>() {
-            let long = b.w.max(b.h);
-            if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; }
+fn image_spec(input: &Path) -> Result<preview::Spec, String> {
+    let source = Arc::new(image::load(input)?);
+    let long = source.w.max(source.h);
+    let presets = IMAGE_LEVELS.iter().map(|(name, q, m)| {
+        let m = if *m < long { *m as i32 } else { 0 };
+        Preset { name: level_name(name, m, " px"), values: vec![*q, m] }
+    }).collect();
+    let sides = limits_under("Keep size", long, &[3840, 2560, 1920, 1280, 800, 480, 240, 120], |m| format!("{m} px"));
+    let encode = {
+        let (input, source) = (input.to_path_buf(), source.clone());
+        move |values: &[i32]| -> Result<(TempDir, PathBuf), String> {
+            let b = shrink_to(&source, values[1] as u32)?;
+            let t = TempDir::new()?;
+            let out = t.file(&format!("o.{}", compress_ext(&ext_of(&input), b.has_alpha())));
+            image::save(&b, &out, &SaveOpts { quality: values[0] as f32 / 100.0, fit: None })?;
+            Ok((t, out))
         }
-        let t = TempDir::new()?;
-        let out = t.file(&format!("o.{}", compress_ext(&ext_of(&input), b.has_alpha())));
-        image::save(&b, &out, &SaveOpts { quality: quality_of(QUALITY_LEVELS[level - 1]), fit: None })?;
-        Ok((image::load(&out)?, file_size(&out)))
-    })
-}
-
-/// Two short pieces of the video, encoded with exactly the settings the tool will use. One gives the picture, and both
-/// give the size per second, scaled up to the whole length. The first piece is taken as a typical part of the file.
-fn video_sampler(input: &Path) -> Sampler {
-    const HEIGHTS: [&str; 4] = ["Keep size", "1080", "720", "480"];
-    let input = input.to_path_buf();
-    Arc::new(move |level, opt| {
-        let dur = media::duration(&input);
-        let len = 2f64.min(dur / 3.0).max(0.1);
-        let starts = if dur > len * 3.0 { vec![dur * 0.3, dur * 0.7] } else { vec![0.0] };
-        if level == 0 { return Ok((frame_at(&input, starts[0] + len / 2.0)?, file_size(&input))); }
-        let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
-        let args = quality::compress_video_args(&media::probe(&input), crf_of(QUALITY_LEVELS[level - 1]), HEIGHTS[opt].parse().ok());
-        let t = TempDir::new()?;
-        let (mut picture, mut bytes, mut seconds) = (None, 0u64, 0f64);
-        for (i, start) in starts.iter().enumerate() {
-            let out = t.file(&format!("s{i}.mp4"));
-            let mut a = sv(&["-y", "-hide_banner", "-nostdin", "-ss", &format!("{start:.3}"), "-t", &format!("{len:.3}"), "-i", &input.display().to_string()]);
-            a.extend_from_slice(&args);
-            a.push(out.display().to_string());
-            run(None, &ff, &a, None)?;
-            bytes += file_size(&out);
-            seconds += len;
-            if picture.is_none() { picture = Some(frame_at(&out, len / 2.0)?); }
-        }
-        Ok((picture.ok_or("No sample")?, (bytes as f64 / seconds * dur) as u64))
+    };
+    let enc = encode.clone();
+    let original = source.clone();
+    let picture: preview::Picture = Arc::new(move |values, _| match values {
+        None => Ok((*original).clone()),
+        Some(v) => { let (_t, out) = enc(v)?; image::load(&out) }
+    });
+    let size: preview::Size = Arc::new(move |v| { let (_t, out) = encode(v)?; Ok(file_size(&out)) });
+    let note = if source.has_alpha() { "This picture has transparency, so it stays a PNG. Only a smaller size saves space.".to_string() } else { String::new() };
+    Ok(preview::Spec {
+        title: "Compress image".into(), ok: "Compress".into(), presets, default: 1,
+        controls: vec![
+            Control::Slider { label: "Picture quality".into(), min: 1, max: 99, unit: "%" },
+            Control::Choice { label: "Longest side".into(), options: sides },
+        ],
+        custom_start: vec![40, 0], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: true, note, picture, size,
     })
 }
 
 /// A PDF's first page in each form. Tidying is really done for its size, and a rebuild is scaled up from that one page.
-fn pdf_sampler(input: &Path) -> Sampler {
-    let input = input.to_path_buf();
-    Arc::new(move |level, _| {
-        let pages = crate::pdf::page_count(&input)? as u64;
-        match level {
-            0 => Ok((crate::pdf::first_page(&input, 200.0, false)?.0, file_size(&input))),
-            1 => Ok((crate::pdf::first_page(&input, 200.0, false)?.0, crate::pdf::tidied_size(&input)?)),
-            2 => { let (b, n) = crate::pdf::first_page(&input, 150.0, true)?; Ok((b, n * pages)) }
-            _ => { let (b, n) = crate::pdf::first_page(&input, 96.0, true)?; Ok((b, n * pages)) }
-        }
+fn pdf_spec(input: &Path) -> Result<preview::Spec, String> {
+    let pages = crate::pdf::page_count(input)? as u64;
+    let p = input.to_path_buf();
+    let picture: preview::Picture = Arc::new(move |values, _| match values.map(|v| v[0]) {
+        None | Some(0) => Ok(crate::pdf::first_page(&p, 200.0, false)?.0),
+        Some(dpi) => Ok(crate::pdf::first_page(&p, dpi as f64, true)?.0),
+    });
+    let p = input.to_path_buf();
+    let size: preview::Size = Arc::new(move |v| match v[0] {
+        0 => crate::pdf::tidied_size(&p),
+        dpi => Ok(crate::pdf::first_page(&p, dpi as f64, true)?.1 * pages),
+    });
+    let level = |name: &str, dpi| Preset { name: name.to_string(), values: vec![dpi] };
+    Ok(preview::Spec {
+        title: "Compress PDF".into(), ok: "Compress".into(), presets: vec![level("Tidy only", 0), level("Scan at 150 DPI", 150), level("Scan at 96 DPI", 96)], default: 0,
+        controls: vec![Control::Slider { label: "Scan resolution".into(), min: 20, max: 300, unit: " DPI" }],
+        custom_start: vec![72], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: true,
+        note: "Tidying keeps the text. A scan turns every page into a picture, so its text can no longer be selected.".into(), picture, size,
     })
+}
+
+/// A sound file has nothing to look at, so the view is its waveform and each level is its bitrate.
+fn audio_spec(input: &Path) -> Result<preview::Spec, String> {
+    let dur = media::duration(input);
+    let wave = Arc::new(strip(input, dur));
+    let picture: preview::Picture = Arc::new(move |_, _| (*wave).clone());
+    let size: preview::Size = Arc::new(move |v| if dur > 0.0 { Ok((v[0] as f64 * 125.0 * dur) as u64) } else { Err("Could not read the length of this file".into()) });
+    let level = |name: &str, k: i32| Preset { name: format!("{name}, {k} kbps"), values: vec![k] };
+    Ok(preview::Spec {
+        title: "Compress audio".into(), ok: "Compress".into(),
+        presets: vec![level("High", 192), level("Good", 128), level("Medium", 96), level("Low", 64)], default: 1,
+        controls: vec![Control::Slider { label: "Bitrate".into(), min: 8, max: 320, unit: " kbps" }],
+        custom_start: vec![64], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: false, note: String::new(), picture, size,
+    })
+}
+
+/// Reads what the window needs off the UI thread, then shows it.
+fn compress_choice(title: &str, input: &Path, make: fn(&Path) -> Result<preview::Spec, String>) -> Option<Vec<i32>> {
+    let p = input.to_path_buf();
+    match pump_job("Reading file", move |_| make(&p)) {
+        Ok(spec) => preview::show(spec),
+        Err(e) => { fail(title, e); None }
+    }
 }
 
 // ---- options UI ----
@@ -215,13 +359,10 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
     let first = paths.first()?;
     Some(match id {
         "img.compress" => {
-            let (q, m) = compress_choice("Compress image", image_sampler(first), "Longest side", &["Keep size", "3840", "2560", "1920", "1280"], QUALITY_LEVELS, 1)?;
-            opts(&[("quality", q), ("max", m)])
+            let v = compress_choice("Compress image", first, image_spec)?;
+            opts(&[("quality", v[0].to_string()), ("max", v[1].to_string())])
         }
-        "img.metadata" => {
-            form::show("Image metadata", &[Field::Note("Saves a copy with camera, location and other metadata removed.".into())], "Remove")?;
-            Opts::new()
-        }
+        "img.metadata" => metadata_flow("Image metadata", paths, |p| crate::metadata::read_image(p), "Remove everything else")?,
         "img.edit" => {
             let p = first.clone();
             let v = match pump_job("Reading file", move |_| image::load(&p)) {
@@ -235,19 +376,20 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
                 let names: Vec<String> = crate::fade::DIRECTIONS.iter().map(|(n, _)| n.to_string()).collect();
                 vec![
                     Field::Colors("Colours. Two or more fade in this order", vec!["#FFFFFF".to_string()]),
-                    Field::Choice("Fade direction", names, 0),
+                    Field::ChoiceIfMany(0, "Fade direction", names, 0),
                     Field::Slider("Margin (% of the longest side)", 0, 50, margin),
+                    Field::Slider("Corner radius (% of the shortest side)", 0, 50, 0),
                 ]
             };
             let p = first.clone();
             let v = match pump_job("Reading file", move |_| image::load(&p).and_then(thumbnail)) {
                 // An opaque picture has nowhere for the colour to show except around it.
                 Ok(b) => form::show_with_preview("Add background", &fields(if b.has_alpha() { 0 } else { 5 }), "Apply", Box::new(move |v| {
-                    Some(with_background(&b, &stops_of(v.first()?), crate::fade::direction_named(v.get(1)?), v.get(2)?.trim().parse().unwrap_or(0)))
+                    Some(background_preview(&b, &stops_of(v.first()?), crate::fade::direction_named(v.get(1)?), v.get(2)?.trim().parse().unwrap_or(0), v.get(3)?.trim().parse().unwrap_or(0)))
                 }))?,
                 Err(_) => form::show("Add background", &fields(5), "Apply")?,
             };
-            opts(&[("colors", v[0].clone()), ("direction", v[1].clone()), ("margin", v[2].clone())])
+            opts(&[("colors", v[0].clone()), ("direction", v[1].clone()), ("margin", v[2].clone()), ("radius", v[3].clone())])
         }
         "img.collage" => {
             let fields = [choice("Columns", &["Auto", "2", "3", "4", "5"], 0), Field::Slider("Gap (pixels)", 0, 80, 12), Field::Color("Background", "#FFFFFF".into())];
@@ -289,13 +431,10 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("shapes", sh)])
         }
         "vid.compress" => {
-            let (q, h) = compress_choice("Compress video", video_sampler(first), "Height", &["Keep size", "1080", "720", "480"], QUALITY_LEVELS, 1)?;
-            opts(&[("quality", q), ("height", h)])
+            let v = compress_choice("Compress video", first, video_spec)?;
+            opts(&[("quality", v[0].to_string()), ("height", v[1].to_string()), ("audio", v[2].to_string()), ("fps", v[3].to_string())])
         }
-        "vid.metadata" | "aud.metadata" => {
-            let v = form::show("Metadata", &[text("Title", ""), text("Artist or author", ""), text("Comment", ""), Field::Check("Remove everything else", false)], "Save")?;
-            opts(&[("title", v[0].clone()), ("artist", v[1].clone()), ("comment", v[2].clone()), ("strip", v[3].clone())])
-        }
+        "vid.metadata" | "aud.metadata" => metadata_flow("Metadata", paths, |p| crate::metadata::read_media(p), "Remove everything else")?,
         "vid.speed" => {
             let v = form::show("Change speed", &[choice("Speed", &["0.25x", "0.5x", "0.75x", "1.25x", "1.5x", "2x", "4x"], 5)], "Apply")?;
             opts(&[("speed", v[0].trim_end_matches('x').to_string())])
@@ -320,28 +459,18 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("marks", marks_str(&m))])
         }
         "aud.compress" => {
-            // Each choice says what it comes to. The first word is the bitrate.
-            let p = first.clone();
-            let dur = pump_job("Reading file", move |_| Ok(media::duration(&p))).unwrap_or(0.0);
-            let labels: Vec<String> = [64u64, 96, 128, 192].iter().map(|k| {
-                if dur > 0.0 { format!("{k} kbps (about {})", format_bytes((k * 125) as u64 * dur as u64)) } else { format!("{k} kbps") }
-            }).collect();
-            let v = form::show("Compress audio", &[Field::Choice("Bitrate", labels, 2)], "Compress")?;
-            opts(&[("bitrate", v[0].split(' ').next().unwrap_or("128").to_string())])
+            let v = compress_choice("Compress audio", first, audio_spec)?;
+            opts(&[("bitrate", v[0].to_string())])
         }
         "aud.channels" => {
             let v = form::show("Channels", &[choice("Output", &["Mono", "Stereo from mono", "Swap left and right", "Left only", "Right only"], 0)], "Apply")?;
             opts(&[("mode", v[0].clone())])
         }
         "pdf.compress" => {
-            let (m, _) = compress_choice("Compress PDF", pdf_sampler(first), "", &[], &["Tidy structure, text stays", "150 DPI, text becomes images", "96 DPI, text becomes images"], 0)?;
-            let dpi = if m.contains("150") { "150" } else if m.contains("96") { "96" } else { "" };
-            opts(&[("dpi", dpi.to_string())])
+            let v = compress_choice("Compress PDF", first, pdf_spec)?;
+            opts(&[("dpi", if v[0] > 0 { v[0].to_string() } else { String::new() })])
         }
-        "pdf.metadata" => {
-            let v = form::show("PDF metadata", &[text("Title", ""), text("Author", ""), text("Subject", ""), Field::Check("Remove all existing metadata first", false)], "Save")?;
-            opts(&[("title", v[0].clone()), ("author", v[1].clone()), ("subject", v[2].clone()), ("strip", v[3].clone())])
-        }
+        "pdf.metadata" => metadata_flow("PDF metadata", paths, |p| crate::metadata::read_pdf(p), "Remove everything else")?,
         "pdf.organize" => {
             let p = first.clone();
             let n = pump_job("Reading file", move |_| crate::pdf::page_count(&p)).unwrap_or(0);
@@ -399,8 +528,23 @@ fn only_if_smaller(j: &Job, input: &Path, res: Result<PathBuf, String>) -> Resul
     Ok(input.to_path_buf())
 }
 
-pub fn quality_of(s: &str) -> f32 { match s { "Smaller file" => 0.6, "Higher quality" => 0.9, _ => 0.78 } }
-fn crf_of(s: &str) -> &'static str { match s { "Smaller file" => "28", "Higher quality" => "18", _ => "23" } }
+/// A quality from 0 to 100, or one of the names the command line has always taken.
+fn quality_percent(s: &str) -> i32 {
+    match s { "Smaller file" => 60, "Higher quality" => 90, _ => s.trim().parse().unwrap_or(78) }
+}
+pub fn quality_of(s: &str) -> f32 { quality_percent(s).clamp(0, 99) as f32 / 100.0 }
+fn crf_of(s: &str) -> u32 {
+    match s { "Smaller file" => 28, "Higher quality" => 18, _ => s.trim().parse().map(quality::crf_for).unwrap_or(23) }
+}
+
+/// Output format for compressed audio: the same one if it is lossy and can go that low, otherwise one that can.
+fn compressed_audio_ext(input_ext: &str, kbps: u32) -> String {
+    match input_ext {
+        "wma" if kbps < quality::WMA_FLOOR_KBPS => "m4a".to_string(),
+        e @ ("mp3" | "m4a" | "ogg" | "opus" | "aac" | "wma") => e.to_string(),
+        _ => "mp3".to_string(),
+    }
+}
 
 /// Output format for compression: opaque lossless formats become JPEG, since that is where the saving is.
 pub fn compress_ext(input_ext: &str, has_alpha: bool) -> String {
@@ -449,13 +593,53 @@ pub fn auto_columns(n: usize) -> usize { (n as f64).sqrt().ceil() as usize }
 fn stops_of(colors: &str) -> Vec<[u8; 4]> { colors.split(',').map(image::parse_color).collect() }
 
 /// The colours show through transparent pixels and around the picture, fading across the whole canvas when there are
-/// several. `margin` is a percentage of the longest side, and the picture itself is copied across without being resampled.
-pub fn with_background(src: &Bmp, stops: &[[u8; 4]], direction: crate::fade::Direction, margin: u32) -> Bmp {
+/// several. `margin` is a percentage of the longest side and `radius` of the shortest, and the picture itself is copied
+/// across without being resampled.
+pub fn with_background(src: &Bmp, stops: &[[u8; 4]], direction: crate::fade::Direction, margin: u32, radius: u32) -> Bmp {
     let m = (src.w.max(src.h) as u64 * margin.min(100) as u64 / 100) as u32;
     let (w, h) = (src.w + m * 2, src.h + m * 2);
     let mut out = Bmp { w, h, px: crate::fade::paint(w, h, stops, direction) };
-    out.blit(src, m as i32, m as i32);
+    let rad = src.w.min(src.h) as f32 * radius.min(50) as f32 / 100.0;
+    if rad > 0.0 {
+        let mut round = src.clone();
+        round_corners(&mut round, rad);
+        out.blit(&round, m as i32, m as i32);
+    } else {
+        out.blit(src, m as i32, m as i32);
+    }
     out
+}
+
+/// Fades the corners out with a smooth edge. Everything past the curves stays exactly as it was.
+fn round_corners(b: &mut Bmp, rad: f32) {
+    let span = rad.ceil() as u32;
+    for y in 0..b.h {
+        // Only the rows and columns within a radius of a corner can change.
+        if y >= span && y + span < b.h { continue; }
+        let dy = rad - (y.min(b.h - 1 - y) as f32 + 0.5);
+        for x in (0..b.w).filter(|x| *x < span || *x + span >= b.w) {
+            let dx = rad - (x.min(b.w - 1 - x) as f32 + 0.5);
+            if dx <= 0.0 || dy <= 0.0 { continue; }
+            let cover = (rad - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            let a = ((y * b.w + x) * 4 + 3) as usize;
+            b.px[a] = (b.px[a] as f32 * cover).round() as u8;
+        }
+    }
+}
+
+/// The share of the longest side the preview always leaves room for.
+const PREVIEW_ROOM: u32 = 15;
+
+/// The result on a clear canvas big enough for a small margin, so the picture holds still while the colour grows around
+/// it, and only shrinks to fit once a margin outgrows the room.
+pub fn background_preview(src: &Bmp, stops: &[[u8; 4]], direction: crate::fade::Direction, margin: u32, radius: u32) -> Bmp {
+    let done = with_background(src, stops, direction, margin, radius);
+    let room = (src.w.max(src.h) as u64 * PREVIEW_ROOM as u64 / 100) as u32;
+    let (w, h) = (src.w + room * 2, src.h + room * 2);
+    if done.w >= w { return done; }
+    let mut canvas = Bmp::new(w, h, [0, 0, 0, 0]);
+    canvas.blit(&done, ((w - done.w) / 2) as i32, ((h - done.h) / 2) as i32);
+    canvas
 }
 
 fn save_new(b: &Bmp, out: PathBuf, o: &SaveOpts) -> Result<PathBuf, String> {
@@ -479,11 +663,39 @@ fn edit_filter(o: &Opts) -> Vec<String> {
 fn metadata_args(o: &Opts) -> Vec<String> {
     let mut a = vec![];
     if get(o, "strip", "0") == "1" { a.extend(sv(&["-map_metadata", "-1"])); }
+    // Only what was changed gets here. An empty one was cleared, and that is how ffmpeg is told to remove it.
     for k in ["title", "artist", "comment"] {
-        let v = get(o, k, "").trim();
-        if !v.is_empty() { a.push("-metadata".into()); a.push(format!("{k}={v}")); }
+        if let Some(v) = o.get(k) { a.push("-metadata".into()); a.push(format!("{k}={}", v.trim())); }
     }
     a
+}
+
+/// Shows what a file holds, and only on Edit asks what to change. Cancelling the edit comes back to the view. Returns
+/// only what changed, so that several files keep whatever else makes each of them different.
+fn metadata_flow(title: &str, paths: &[PathBuf], read: impl Fn(&Path) -> Result<crate::metadata::Info, String> + Send + 'static, strip_label: &'static str) -> Option<Opts> {
+    let first = paths.first()?.clone();
+    let mut info = match pump_job("Reading file", move |_| read(&first)) {
+        Ok(i) => i,
+        Err(e) => { fail(title, e); return None; }
+    };
+    let sub = if paths.len() > 1 { format!("{}, first of {} files", form::context(), paths.len()) } else { form::context() };
+    loop {
+        let (back, edit) = crate::metadata::show(title, &sub, info);
+        info = back;
+        if !edit { return None; }
+        let mut fields: Vec<Field> = info.editable.iter().map(|e| text(e.label, &e.value)).collect();
+        if fields.is_empty() { fields.push(Field::Note("Details in this format can be removed, but not changed here.".into())); }
+        fields.push(Field::Check(strip_label, false));
+        let Some(v) = form::show(title, &fields, "Save") else { continue };
+        let strip = v.last().cloned().unwrap_or_default();
+        let mut out: Opts = info.editable.iter().zip(&v).filter(|(e, new)| new.trim() != e.value.trim()).map(|(e, new)| (e.key.to_string(), new.clone())).collect();
+        if strip == "1" {
+            // Whatever stays has to be written back, as the old copy is going.
+            for (e, new) in info.editable.iter().zip(&v) { if !new.trim().is_empty() { out.insert(e.key.to_string(), new.clone()); } }
+            out.insert("strip".to_string(), strip);
+        }
+        if !out.is_empty() { return Some(out); }
+    }
 }
 
 const NO_LOSSLESS: &str = "Could not read this video's format, so it cannot be edited without loss. Put ffprobe.exe next to ffmpeg.exe";
@@ -503,18 +715,21 @@ fn lossless_edit(j: &Job, p: &Path, suffix: &str, filter: Option<&str>, audio: O
 /// Cuts a range of video exactly. Copies the original bits when the range allows that, otherwise encodes losslessly.
 fn cut_video(j: &Job, p: &Path, a: f64, b: f64, out: impl Fn(&str) -> PathBuf) -> Result<PathBuf, String> {
     let e = ext_of(p);
-    let seek = quality::seek_args(a, b);
+    let (seek, from) = quality::cut_seek(&e, a, b);
+    let with_seek = |args: &[String]| -> Vec<String> { from.iter().chain(args).cloned().collect() };
     let total = b - a;
     if e == "gif" {
         let o = out("gif");
-        return atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &quality::gif_edit_args(None), tmp, total));
+        return atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &with_seek(&quality::gif_edit_args(None)), tmp, total));
     }
     let pr = media::probe(p);
     let fps = pr.video.as_ref().map(|v| v.fps).unwrap_or(0.0);
-    if quality::trim_can_copy(media::is_keyframe(p, a, fps), b, media::duration(p), fps) {
+    // Where seeking is loose, only the very start is certain to be a keyframe.
+    let startable = if quality::seeks_loosely(&e) { a <= 0.0 } else { media::is_keyframe(p, a, fps) };
+    if quality::trim_can_copy(startable, b, media::duration(p), fps) {
         let o = out(&e);
         for args in quality::copy_attempts(&[], &quality::trim_copy_tail()) {
-            match atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &args, tmp, total)) {
+            match atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &with_seek(&args), tmp, total)) {
                 Ok(r) => return Ok(r),
                 Err(x) if j.cancelled() => return Err(x),
                 Err(_) => {}
@@ -524,7 +739,7 @@ fn cut_video(j: &Job, p: &Path, a: f64, b: f64, out: impl Fn(&str) -> PathBuf) -
     let l = quality::lossless_args(&pr, &e, None, None, false).ok_or(NO_LOSSLESS)?;
     if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
     let o = out(&l.ext);
-    atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &l.args, tmp, total))
+    atomically(&o, |tmp| media::ffmpeg_from(j, &seek, &[p], &with_seek(&l.args), tmp, total))
 }
 
 /// Two clips from the same encode join without touching a frame.
@@ -564,13 +779,19 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None });
             if resized { res } else { only_if_smaller(j, p, res) }
         }),
-        "img.metadata" => each("Removing metadata", paths, |j, p| {
+        "img.metadata" => each("Saving metadata", paths, move |j, p| {
             let e = ext_of(p);
-            let out = sibling(p, " clean", &e);
-            // JPEG and PNG lose it without being re-encoded.
-            if let Some(clean) = std::fs::read(p).ok().and_then(|b| image::strip_metadata(&e, &b)) {
+            let tags: Vec<(&str, &str)> = ["title", "artist", "copyright"].iter().filter_map(|k| o.get(*k).map(|v| (*k, v.trim()))).collect();
+            // Asked for nothing in particular, it means taking everything off.
+            let strip = get(&o, "strip", "0") == "1" || tags.is_empty();
+            let out = sibling(p, if tags.is_empty() { " clean" } else { " edited" }, &e);
+            // JPEG and PNG change without being re-encoded.
+            let original = std::fs::read(p).map_err(|x| x.to_string())?;
+            let base = if strip { image::strip_metadata(&e, &original) } else { Some(original) };
+            if let Some(base) = base {
                 j.set_frac(0.5);
-                return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|x| x.to_string()));
+                let done = if tags.is_empty() { base } else { crate::metadata::write_image_tags(&e, &base, &tags)? };
+                return atomically(&out, |tmp| std::fs::write(tmp, &done).map_err(|x| x.to_string()));
             }
             // Decoding and saving again carries no metadata across, only the colour profile.
             let n = image::load_native(p)?;
@@ -584,13 +805,14 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         "img.background" => each("Adding background", paths, move |j, p| {
             let src = image::load(p)?;
             let margin: u32 = get(&o, "margin", "0").trim().parse().unwrap_or(0);
+            let radius: u32 = get(&o, "radius", "0").trim().parse().unwrap_or(0);
             // The result would be the same picture under a new name.
-            if margin == 0 && !src.has_alpha() {
-                tell(j, "No transparent areas to fill. Add a margin.".to_string());
+            if margin == 0 && radius == 0 && !src.has_alpha() {
+                tell(j, "No transparent areas to fill. Add a margin or round the corners.".to_string());
                 return Ok(p.to_path_buf());
             }
             let colors = get(&o, "colors", get(&o, "color", "#FFFFFF"));
-            let bg = with_background(&src, &stops_of(colors), crate::fade::direction_named(get(&o, "direction", "")), margin);
+            let bg = with_background(&src, &stops_of(colors), crate::fade::direction_named(get(&o, "direction", "")), margin, radius);
             save_new(&bg, sibling(p, " background", "png"), &SaveOpts::default())
         }),
         "img.crop" => each("Cropping", paths, move |_, p| {
@@ -634,8 +856,9 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
 
         "vid.compress" => each("Compressing", paths, move |j, p| {
             let pr = media::probe(p);
-            let h = get(&o, "height", "").parse::<u32>().ok();
-            let a = quality::compress_video_args(&pr, crf_of(get(&o, "quality", "")), h);
+            let positive = |k: &str| get(&o, k, "").parse::<u32>().ok().filter(|n| *n > 0);
+            let h = positive("height");
+            let a = quality::compress_video_args(&pr, &quality::Squeeze { crf: crf_of(get(&o, "quality", "")), height: h, audio_kbps: positive("audio"), fps: positive("fps") });
             let resized = match (h, &pr.video) { (Some(h), Some(v)) => v.display_size().1 > h, _ => false };
             let res = media::transform(j, p, " compressed", Some("mp4"), a);
             if resized { res } else { only_if_smaller(j, p, res) }
@@ -715,11 +938,18 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
             let dir = if marks.len() > 1 { Some(sibling_dir(p, " snapshots")?) } else { None };
             let mut last = PathBuf::new();
+            let filter = media::probe(p).video.as_ref().and_then(quality::still_filter);
+            let vf = filter.map(|f| vec!["-vf".to_string(), f]).unwrap_or_default();
             for (i, t) in marks.iter().enumerate() {
                 j.set_frac(i as f32 / marks.len() as f32);
                 last = match &dir { Some(d) => d.join(format!("frame-{:03}.png", i + 1)), None => sibling(p, " snapshot", "png") };
-                run(Some(j), &ff, &sv(&["-y", "-hide_banner", "-ss", &format!("{t:.3}"), "-i", &p.display().to_string(), "-frames:v", "1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", &last.display().to_string()]), None)?;
+                for at in [*t, (*t - END_MARGIN).max(0.0)] {
+                    let (before, after) = quality::still_seek(&ext_of(p), at);
+                    run(Some(j), &ff, &sv(&["-y", "-hide_banner"]).into_iter().chain(before).chain(sv(&["-i", &p.display().to_string()])).chain(after).chain(vf.clone()).chain(sv(&["-frames:v", "1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", &last.display().to_string()])).collect::<Vec<_>>(), None)?;
+                    if last.exists() { break; }
+                }
             }
+            if !last.exists() { return Err("No picture could be read at that moment".into()); }
             Ok(dir.unwrap_or(last))
         }),
         "vid.join" => together("Joining videos", paths, |j, ps| {
@@ -742,8 +972,12 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
         }),
 
         "aud.compress" => each("Compressing", paths, move |j, p| {
-            let ext = match ext_of(p).as_str() { e @ ("mp3" | "m4a" | "ogg" | "opus" | "aac" | "wma") => e.to_string(), _ => "mp3".to_string() };
-            only_if_smaller(j, p, media::transform(j, p, " compressed", Some(&ext), vec!["-vn".into(), "-b:a".into(), format!("{}k", get(&o, "bitrate", "128"))]))
+            let kbps = get(&o, "bitrate", "128").trim().parse().unwrap_or(128);
+            let ext = compressed_audio_ext(&ext_of(p), kbps);
+            let info = media::probe(p).audio.first().cloned().unwrap_or_default();
+            let mut a = sv(&["-vn", "-b:a", &format!("{kbps}k")]);
+            a.extend(quality::audio_squeeze_args(":a", &ext, &info, kbps));
+            only_if_smaller(j, p, media::transform(j, p, " compressed", Some(&ext), a))
         }),
         "aud.normalize" => each("Normalizing", paths, |j, p| {
             media::transform(j, p, " normalized", None, quality::audio_edit_args(&media::probe(p), &ext_of(p), "loudnorm=I=-16:TP=-1.5:LRA=11"))
@@ -768,7 +1002,8 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
 
         "pdf.compress" => each("Compressing", paths, move |j, p| only_if_smaller(j, p, crate::pdf::compress(j, p, get(&o, "dpi", "").parse().ok()))),
         "pdf.metadata" => each("Saving metadata", paths, move |_, p| {
-            let f = [("Title", get(&o, "title", "").to_string()), ("Author", get(&o, "author", "").to_string()), ("Subject", get(&o, "subject", "").to_string())];
+            // Only what was changed gets here. An empty one was cleared.
+            let f: Vec<(&str, String)> = [("Title", "title"), ("Author", "author"), ("Subject", "subject")].iter().filter_map(|(name, k)| o.get(*k).map(|v| (*name, v.clone()))).collect();
             crate::pdf::set_metadata(p, &f, get(&o, "strip", "0") == "1")
         }),
         "pdf.split" => each("Splitting", paths, |j, p| crate::pdf::split(j, p)),
@@ -794,6 +1029,20 @@ mod tests {
     use super::*;
     #[test]
     fn marks_parse_sorted() { assert_eq!(parse_marks("5, 1.5,x,3"), vec![1.5, 3.0, 5.0]); }
+    #[test]
+    fn compressed_audio_keeps_its_format_while_the_format_can_go_that_low() {
+        assert_eq!(compressed_audio_ext("wma", 64), "wma");
+        assert_eq!(compressed_audio_ext("wma", 8), "m4a");
+        assert_eq!(compressed_audio_ext("opus", 8), "opus");
+        assert_eq!(compressed_audio_ext("wav", 128), "mp3");
+    }
+    #[test]
+    fn levels_are_read_as_percentages_and_old_names_still_work() {
+        assert_eq!(quality_of("45"), 0.45);
+        assert_eq!(quality_of("Higher quality"), 0.9);
+        assert_eq!(crf_of("80"), 23);
+        assert_eq!(crf_of("Smaller file"), 28);
+    }
     #[test]
     fn compression_only_changes_format_when_it_helps() {
         assert_eq!(compress_ext("png", false), "jpg");
@@ -825,22 +1074,51 @@ mod tests {
         let red = [0, 0, 255, 255];
         let opaque = Bmp::new(100, 50, [10, 20, 30, 255]);
         let dir = crate::fade::DIRECTIONS[0].1;
-        let plain = with_background(&opaque, &[red], dir, 0);
+        let plain = with_background(&opaque, &[red], dir, 0, 0);
         assert_eq!(plain.px, opaque.px, "with no margin an opaque picture has nowhere to show it");
-        let framed = with_background(&opaque, &[red], dir, 10);
+        let framed = with_background(&opaque, &[red], dir, 10, 0);
         assert_eq!((framed.w, framed.h), (120, 70));
         assert_eq!(&framed.px[..4], &red, "corner is the colour");
         let at = ((10 * framed.w + 10) * 4) as usize;
         assert_eq!(&framed.px[at..at + 4], &[10, 20, 30, 255], "picture starts past the margin, unchanged");
-        let clear = with_background(&Bmp::new(4, 4, [9, 9, 9, 0]), &[red], dir, 0);
+        let clear = with_background(&Bmp::new(4, 4, [9, 9, 9, 0]), &[red], dir, 0, 0);
         assert_eq!(&clear.px[..4], &red, "transparent pixels fill in");
         let blue = [255, 0, 0, 255];
-        let faded = with_background(&opaque, &[red, blue], dir, 10);
+        let faded = with_background(&opaque, &[red, blue], dir, 10, 0);
         assert_eq!(&faded.px[..4], &red, "first colour at the top left");
         assert_eq!(&faded.px[faded.px.len() - 4..], &blue, "last at the bottom right");
         let at = ((10 * faded.w + 10) * 4) as usize;
         assert_eq!(&faded.px[at..at + 4], &[10, 20, 30, 255], "the picture is untouched by the fade");
         assert_eq!(stops_of("#FF0000,#0000FF"), vec![red, blue]);
+    }
+    #[test]
+    fn rounded_corners_show_the_colour_and_leave_the_rest_alone() {
+        let red = [0, 0, 255, 255];
+        let pic = [10, 20, 30, 255];
+        let dir = crate::fade::DIRECTIONS[0].1;
+        let round = with_background(&Bmp::new(100, 100, pic), &[red], dir, 0, 20);
+        assert_eq!((round.w, round.h), (100, 100), "no margin, so the size stays");
+        for (x, y) in [(0u32, 0u32), (99, 0), (0, 99), (99, 99)] {
+            let at = ((y * 100 + x) * 4) as usize;
+            assert_eq!(&round.px[at..at + 4], &red, "corner {x},{y} is the colour");
+        }
+        for (x, y) in [(50u32, 0u32), (0, 50), (99, 50), (50, 99), (50, 50), (20, 20)] {
+            let at = ((y * 100 + x) * 4) as usize;
+            assert_eq!(&round.px[at..at + 4], &pic, "{x},{y} is untouched");
+        }
+        let full = with_background(&Bmp::new(100, 100, pic), &[red], dir, 0, 50);
+        let at = ((10 * 100 + 10) * 4) as usize;
+        assert_eq!(&full.px[at..at + 4], &red, "at 50% the picture is a circle");
+    }
+    #[test]
+    fn preview_holds_the_picture_still_until_the_margin_outgrows_its_room() {
+        let dir = crate::fade::DIRECTIONS[0].1;
+        let pic = Bmp::new(100, 50, [10, 20, 30, 255]);
+        let size = |m| { let b = background_preview(&pic, &[[0, 0, 255, 255]], dir, m, 0); (b.w, b.h) };
+        assert_eq!(size(0), (130, 80));
+        assert_eq!(size(10), (130, 80), "same canvas, so the picture does not change size");
+        assert_eq!(size(15), (130, 80));
+        assert_eq!(size(30), (160, 110), "past the room the whole result fits instead");
     }
     #[test]
     fn columns_are_square_ish() { assert_eq!(auto_columns(4), 2); assert_eq!(auto_columns(5), 3); }

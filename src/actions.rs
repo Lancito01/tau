@@ -1,20 +1,15 @@
-//! The six file actions. They work on anything, including folders and unknown types.
+//! The five file actions. They work on anything, including folders and unknown types.
 use crate::gfx::wz;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::core::*;
-use windows::ApplicationModel::DataTransfer::{DataRequestedEventArgs, DataTransferManager};
-use windows::Foundation::TypedEventHandler;
-use windows::Storage::{IStorageItem, StorageFile, StorageFolder};
-use windows_collections::IIterable;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::*;
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 unsafe fn global_from(bytes: &[u8]) -> Option<HGLOBAL> {
     let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).ok()?;
@@ -97,66 +92,6 @@ fn open_terminal(dir: &Path) {
     }
 }
 
-// The stock iterable is a free-threaded object and the items it holds are agile, so it can cross threads.
-struct ShareList(IIterable<IStorageItem>);
-unsafe impl Send for ShareList {}
-impl ShareList { fn get(&self) -> &IIterable<IStorageItem> { &self.0 } }
-
-thread_local! {
-    // The share manager has to outlive the call: Windows asks for the data after the sheet opens.
-    static SHARE: std::cell::RefCell<Option<(DataTransferManager, i64, HWND)>> = const { std::cell::RefCell::new(None) };
-}
-
-fn show_share(paths: &[PathBuf]) -> Result<()> {
-    let mut items: Vec<Option<IStorageItem>> = vec![];
-    for p in paths {
-        let path = HSTRING::from(p.as_os_str());
-        let item: IStorageItem = if p.is_dir() {
-            StorageFolder::GetFolderFromPathAsync(&path)?.join()?.cast()?
-        } else {
-            StorageFile::GetFileFromPathAsync(&path)?.join()?.cast()?
-        };
-        items.push(Some(item));
-    }
-    let list = ShareList(items.into());
-    let title = HSTRING::from(match paths {
-        [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        many => format!("{} files", many.len()),
-    });
-    unsafe {
-        let interop = factory::<DataTransferManager, IDataTransferManagerInterop>()?;
-        let hwnd = match SHARE.with(|s| s.borrow().as_ref().map(|(_, _, h)| *h)) {
-            Some(h) => h,
-            None => {
-                // Windows shows nothing for a hidden owner, so the sheet gets a one-pixel, click-through, nearly invisible one.
-                let inst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
-                let h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST, w!("STATIC"), w!("Tau share"), WS_POPUP | WS_VISIBLE, 0, 0, 1, 1, None, None, Some(inst.into()), None)?;
-                let _ = SetLayeredWindowAttributes(h, COLORREF(0), 1, LWA_ALPHA);
-                h
-            }
-        };
-        let _ = SetForegroundWindow(hwnd);
-        let manager: DataTransferManager = interop.GetForWindow(hwnd)?;
-        SHARE.with(|s| if let Some((m, t, _)) = s.borrow_mut().take() { let _ = m.RemoveDataRequested(t); });
-        let token = manager.DataRequested(&TypedEventHandler::new(move |_, args: Ref<DataRequestedEventArgs>| {
-            if let Some(args) = args.as_ref() {
-                let data = args.Request()?.Data()?;
-                data.Properties()?.SetTitle(&title)?;
-                data.SetStorageItemsReadOnly(list.get())?;
-            }
-            Ok(())
-        }))?;
-        SHARE.with(|s| *s.borrow_mut() = Some((manager, token, hwnd)));
-        interop.ShowShareUIForWindow(hwnd)
-    }
-}
-
-fn share(paths: &[PathBuf]) {
-    if let Err(e) = show_share(paths) {
-        crate::tools::fail("Share", format!("Could not open Share: {}", e.message()));
-    }
-}
-
 pub fn reveal(p: &Path) {
     let _ = Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", p.display())).spawn();
 }
@@ -167,7 +102,6 @@ pub fn run(id: &str, paths: Vec<PathBuf>) {
         "act.path" => { copy_paths(&paths); }
         "act.move" => { if let Some(d) = pick_folder() { move_files(&paths, &d); } }
         "act.terminal" => { if let Some(p) = paths.first() { open_terminal(&terminal_dir(p)); } }
-        "act.share" => { if !paths.is_empty() { share(&paths); } }
         "act.shelf" => crate::shelf::add(paths),
         _ => {}
     }

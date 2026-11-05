@@ -12,10 +12,12 @@ mod fade;
 mod form;
 mod gfx;
 mod gif;
+mod heif;
 mod hud;
 mod image;
 mod job;
 mod media;
+mod metadata;
 mod pdf;
 mod photo;
 mod preview;
@@ -103,7 +105,12 @@ pub fn engines() -> Engines {
 pub fn dispatch(kind: Kind, id: &str, paths: Vec<PathBuf>) {
     match kind {
         Kind::Convert => { convert::run(id, paths); }
-        Kind::Tools => tools::run_ui(id, paths),
+        // Each tool gets a thread and message loop of its own. Sharing the dial's would stack their loops, so an older
+        // window could not close, whatever was clicked, until every newer one had.
+        Kind::Tools => {
+            let id = id.to_string();
+            std::thread::spawn(move || { job::com_init(); tools::run_ui(&id, paths); });
+        }
         Kind::Actions => actions::run(id, paths),
     }
 }

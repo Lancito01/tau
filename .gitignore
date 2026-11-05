@@ -5,3 +5,5 @@
 *.msi.sha256
 # Reference screenshots of the original app. Never shipped or published.
 /replica/screens/
+# Test footage from other people. Private, never published.
+/tests/private/

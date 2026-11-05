@@ -400,7 +400,9 @@ pub fn set_metadata(input: &Path, fields: &[(&str, String)], strip: bool) -> std
                 Some(id) => d.get_object(id).and_then(|o| o.as_dict()).cloned().unwrap_or_default(),
                 None => lopdf::Dictionary::new(),
             };
-            for (k, v) in fields { if !v.is_empty() { info.set(*k, Object::string_literal(v.as_str())); } }
+            for (k, v) in fields {
+                if v.is_empty() { info.remove(k.as_bytes()); } else { info.set(*k, Object::string_literal(v.as_str())); }
+            }
             let id = d.add_object(info);
             d.trailer.set("Info", id);
         }

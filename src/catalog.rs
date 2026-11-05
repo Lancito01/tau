@@ -34,7 +34,9 @@ pub fn classify(p: &Path) -> Cat {
     if p.is_dir() { return Cat::Folder; }
     match ext_of(p).as_str() {
         "jpg" | "jpeg" | "png" | "webp" | "heic" | "heif" | "tif" | "tiff" | "avif" | "bmp" | "svg" => Cat::Image,
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "gif" | "m4v" => Cat::Video,
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "gif" | "m4v"
+        // Camcorder and disc formats: AVCHD and Blu-ray transport streams, then MPEG-2 program streams.
+        | "mts" | "m2ts" | "m2t" | "mod" | "tod" | "vob" | "mpg" | "mpeg" => Cat::Video,
         "mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "aiff" | "aif" | "wma" | "aac" => Cat::Audio,
         "pdf" => Cat::Pdf,
         "docx" | "doc" | "md" | "markdown" | "txt" | "rtf" | "html" | "htm" | "odt" => Cat::Doc,
@@ -74,7 +76,7 @@ fn convert_targets(cat: Cat, src_ext: &str, e: &Engines) -> Vec<Entry> {
         Cat::Image => vec![
             fmt("jpg", "JPG"), fmt("png", "PNG"),
             needs(fmt("webp", "WEBP"), e.ffmpeg, NEED_FFMPEG),
-            fmt("heic", "HEIC"), fmt("tiff", "TIFF"),
+            needs(fmt("heic", "HEIC"), e.ffmpeg, NEED_FFMPEG), fmt("tiff", "TIFF"),
             needs(fmt("avif", "AVIF"), e.ffmpeg, NEED_FFMPEG),
             fmt("bmp", "BMP"), fmt("pdf", "PDF"),
         ],
@@ -180,7 +182,7 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
 
 pub fn action_entries() -> Vec<Entry> {
     vec![
-        tool("act.share", "SHARE", 0xE72D), tool("act.shelf", "SHELF", 0xE718),
+        tool("act.shelf", "SHELF", 0xE718),
         tool("act.copy", "COPY", 0xE8C8), tool("act.move", "MOVE", 0xE8DE),
         tool("act.path", "COPY PATH", 0xE71B), tool("act.terminal", "TERMINAL", 0xE756),
     ]
@@ -222,7 +224,7 @@ mod tests {
     fn unknown_type_only_has_actions() {
         assert!(entries(Kind::Convert, &p("a.xyz"), &all()).is_empty());
         assert!(entries(Kind::Tools, &p("a.xyz"), &all()).is_empty());
-        assert_eq!(entries(Kind::Actions, &p("a.xyz"), &all()).len(), 6);
+        assert_eq!(entries(Kind::Actions, &p("a.xyz"), &all()).len(), 5);
     }
     #[test]
     fn multi_select_adds_batch_tools() {

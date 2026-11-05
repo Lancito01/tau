@@ -17,7 +17,7 @@ Tau is a small Windows utility for converting and working with files without ope
 
 - **Convert** images, audio, video, PDFs, documents, spreadsheets, slides, EPUBs, subtitles, and archives.
 - **Use file tools** to compress, crop, redact, annotate, trim, merge, split, and edit supported files.
-- **Run file actions** to copy, move, share, copy a path, open a terminal, or collect files on a shelf.
+- **Run file actions** to copy, move, copy a path, open a terminal, or collect files on a shelf.
 - **Work with batches** where an operation supports multiple selected files.
 - **Stay in control:** conversions run locally, a progress window supports cancellation, and existing files are never overwritten.
 
@@ -34,9 +34,9 @@ For keyboard use, select a file in Explorer and press **Ctrl+Alt+Space** (the de
 
 ## Formats and optional engines
 
-Tau includes support for common image formats (JPG, PNG, TIFF, BMP, HEIC), PDF, documents, spreadsheets, slides, EPUB, subtitles, and archives. Audio and video conversion, plus WebP and AVIF image conversion, use **ffmpeg**. Put `ffmpeg.exe` on `PATH` or next to `tau.exe` to enable those options; it is not bundled with the installer.
+Tau includes support for common image formats (JPG, PNG, TIFF, BMP), PDF, documents, spreadsheets, slides, EPUB, subtitles, and archives. Audio and video conversion, including camcorder files (MTS, M2TS, MOD, TOD, VOB), plus WebP, AVIF and HEIC image conversion, use **ffmpeg**. Put `ffmpeg.exe` on `PATH` or next to `tau.exe` to enable those options; it is not bundled with the installer.
 
-Some document conversions use Microsoft Word, Excel, or PowerPoint, and HTML-to-PDF uses Microsoft Edge. HEIC output depends on the Windows HEIF/HEVC codecs. Options that need unavailable software remain visible but disabled.
+Some document conversions use Microsoft Word, Excel, or PowerPoint, and HTML-to-PDF uses Microsoft Edge. Options that need unavailable software remain visible but disabled.
 
 ## Quality
 
@@ -47,7 +47,7 @@ Tau keeps as much of the original as the target format allows, in this order:
 3. **What the source is worth, when converting.** A lossless source stays lossless wherever the target can hold it. A lossy source goes to the new codec at very high quality, capped at a bitrate matched to the source: a 5 Mbps MP4 has 5 Mbps of detail, so a lossless copy would be many times the size and show nothing more. The cap allows for how efficient each codec is, so HEVC to H.264 gets more bits and H.264 to WMV more again. Resolution, frame rate and bit depth are kept (GIF stops at the 50 fps the format can show).
 4. **The top setting, for formats that are lossy by nature.** The progress card says so when a format has to give something up.
 
-Only **Compress** gives quality away, by the amount you choose.
+Only **Compress** gives quality away, by the amount you choose. Its window shows one view of the file as it would come out, with a dropdown of levels that each say what they come to. On a video you can scrub to see other frames, and each view is a real encode of that moment. Audio stays untouched at the gentler levels and is reduced further down. **Custom** goes as far as you like, down to a few kbps and a thumbnail-sized picture, at a heavy cost in fidelity. The original file is never changed.
 
 Lossless H.264 uses a profile that the default Windows player and many editors and phones cannot decode, so redacted, cropped and trimmed videos may need VLC or mpv, and they are much larger than the original. AVI, WMV and sources H.264 cannot store exactly are saved as MKV with FFV1 instead. Lossless editing also needs `ffprobe.exe`, which comes with ffmpeg, next to `ffmpeg.exe`, and ffmpeg 5.1 or newer.
 

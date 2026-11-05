@@ -11,6 +11,8 @@ pub enum Field {
     Choice(&'static str, Vec<String>, usize),
     /// A choice that only applies while the toggle at the given field index is on.
     ChoiceIf(usize, &'static str, Vec<String>, usize),
+    /// A choice that only means something, and so only shows, while the colour list at the given index has two or more.
+    ChoiceIfMany(usize, &'static str, Vec<String>, usize),
     Check(&'static str, bool),
     Slider(&'static str, i32, i32, i32),
     Color(&'static str, String),
@@ -76,7 +78,7 @@ impl Form {
             let mut v = Value { text: String::new(), sel: 0, on: false, num: 0.0, list: vec![] };
             match f {
                 Field::Text(_, s) | Field::Color(_, s) => v.text = s.clone(),
-                Field::Choice(_, _, d) | Field::ChoiceIf(_, _, _, d) => v.sel = *d,
+                Field::Choice(_, _, d) | Field::ChoiceIf(_, _, _, d) | Field::ChoiceIfMany(_, _, _, d) => v.sel = *d,
                 Field::Check(_, b) => v.on = *b,
                 Field::Slider(_, _, _, d) => v.num = *d as f32,
                 Field::Colors(_, l) => v.list = l.clone(),
@@ -92,7 +94,7 @@ impl Form {
     fn output(&self) -> Vec<String> {
         self.fields.iter().zip(&self.values).map(|(f, v)| match f {
             Field::Text(..) | Field::Color(..) => v.text.clone(),
-            Field::Choice(_, o, _) | Field::ChoiceIf(_, _, o, _) => o.get(v.sel).cloned().unwrap_or_default(),
+            Field::Choice(_, o, _) | Field::ChoiceIf(_, _, o, _) | Field::ChoiceIfMany(_, _, o, _) => o.get(v.sel).cloned().unwrap_or_default(),
             Field::Check(..) => if v.on { "1".into() } else { "0".into() },
             Field::Slider(..) => format!("{}", v.num as i32),
             Field::Colors(..) => v.list.join(","),
@@ -190,6 +192,13 @@ impl Form {
                     ui.text(l, r(x, y, w - 220.0, 38.0), 13.0, 400, if on { TEXT } else { FAINT }, Align::Left);
                     ui.select(&key, r(x + w - 210.0, y, 210.0, 38.0), o, &mut self.values[i].sel, on);
                     y += 44.0;
+                }
+                Field::ChoiceIfMany(dep, l, o, _) => {
+                    if self.values.get(*dep).is_some_and(|v| v.list.len() >= 2) {
+                        ui.text(l, r(x, y, w - 220.0, 38.0), 13.0, 400, TEXT, Align::Left);
+                        ui.select(&key, r(x + w - 210.0, y, 210.0, 38.0), o, &mut self.values[i].sel, true);
+                        y += 44.0;
+                    }
                 }
                 Field::Slider(l, min, max, _) => {
                     let n = self.values[i].num as i32;
