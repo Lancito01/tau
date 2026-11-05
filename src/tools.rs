@@ -231,17 +231,20 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             opts(&[("brightness", v[0].clone()), ("contrast", v[1].clone()), ("saturation", v[2].clone()), ("rotate", v[3].clone()), ("flip", v[4].clone())])
         }
         "img.background" => {
-            let fields = [Field::Color("Colour", "#FFFFFF".into())];
+            let color = Field::Color("Colour", "#FFFFFF".into());
+            let margin = |default| Field::Slider("Margin (% of the longest side)", 0, 50, default);
             let p = first.clone();
             let v = match pump_job("Reading file", move |_| image::load(&p).and_then(thumbnail)) {
-                Ok(b) => form::show_with_preview("Add background", &fields, "Apply", Box::new(move |v| {
-                    let mut out = Bmp::new(b.w, b.h, image::parse_color(v.first()?));
-                    out.blit(&b, 0, 0);
-                    Some(out)
-                }))?,
-                Err(_) => form::show("Add background", &fields, "Apply")?,
+                Ok(b) => {
+                    // An opaque picture has nowhere for the colour to show except around it.
+                    let fields = [color, margin(if b.has_alpha() { 0 } else { 5 })];
+                    form::show_with_preview("Add background", &fields, "Apply", Box::new(move |v| {
+                        Some(with_background(&b, image::parse_color(v.first()?), v.get(1)?.trim().parse().unwrap_or(0)))
+                    }))?
+                }
+                Err(_) => form::show("Add background", &[color, margin(5)], "Apply")?,
             };
-            opts(&[("color", v[0].clone())])
+            opts(&[("color", v[0].clone()), ("margin", v[1].clone())])
         }
         "img.collage" => {
             let fields = [choice("Columns", &["Auto", "2", "3", "4", "5"], 0), Field::Slider("Gap (pixels)", 0, 80, 12), Field::Color("Background", "#FFFFFF".into())];
@@ -440,6 +443,15 @@ pub fn collage(imgs: &[Bmp], cols: usize, gap: u32, bg: [u8; 4]) -> Result<Bmp, 
 
 pub fn auto_columns(n: usize) -> usize { (n as f64).sqrt().ceil() as usize }
 
+/// The colour shows through transparent pixels and around the picture. `margin` is a percentage of the longest side,
+/// and the picture itself is copied across without being resampled.
+pub fn with_background(src: &Bmp, color: [u8; 4], margin: u32) -> Bmp {
+    let m = (src.w.max(src.h) as u64 * margin.min(100) as u64 / 100) as u32;
+    let mut out = Bmp::new(src.w + m * 2, src.h + m * 2, color);
+    out.blit(src, m as i32, m as i32);
+    out
+}
+
 fn save_new(b: &Bmp, out: PathBuf, o: &SaveOpts) -> Result<PathBuf, String> {
     atomically(&out, |tmp| image::save(b, tmp, o))
 }
@@ -563,10 +575,15 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             a.extend(quality::image_encode_args(&ext_of(p)));
             media::transform(j, p, " edited", None, a)
         }),
-        "img.background" => each("Adding background", paths, move |_, p| {
+        "img.background" => each("Adding background", paths, move |j, p| {
             let src = image::load(p)?;
-            let mut bg = Bmp::new(src.w, src.h, image::parse_color(get(&o, "color", "#FFFFFF")));
-            bg.blit(&src, 0, 0);
+            let margin: u32 = get(&o, "margin", "0").trim().parse().unwrap_or(0);
+            // The result would be the same picture under a new name.
+            if margin == 0 && !src.has_alpha() {
+                tell(j, "No transparent areas to fill. Add a margin.".to_string());
+                return Ok(p.to_path_buf());
+            }
+            let bg = with_background(&src, image::parse_color(get(&o, "color", "#FFFFFF")), margin);
             save_new(&bg, sibling(p, " background", "png"), &SaveOpts::default())
         }),
         "img.crop" => each("Cropping", paths, move |_, p| {
@@ -795,6 +812,20 @@ mod tests {
         let c = collage(&imgs, 2, 10, [255, 255, 255, 255]).unwrap();
         assert_eq!(c.w, 2 * 110 + 10, "tiles fit the largest picture");
         assert_eq!(c.h, 2 * 110 + 10);
+    }
+    #[test]
+    fn background_shows_around_an_opaque_picture_and_through_a_clear_one() {
+        let red = [0, 0, 255, 255];
+        let opaque = Bmp::new(100, 50, [10, 20, 30, 255]);
+        let plain = with_background(&opaque, red, 0);
+        assert_eq!(plain.px, opaque.px, "with no margin an opaque picture has nowhere to show it");
+        let framed = with_background(&opaque, red, 10);
+        assert_eq!((framed.w, framed.h), (120, 70));
+        assert_eq!(&framed.px[..4], &red, "corner is the colour");
+        let at = ((10 * framed.w + 10) * 4) as usize;
+        assert_eq!(&framed.px[at..at + 4], &[10, 20, 30, 255], "picture starts past the margin, unchanged");
+        let clear = with_background(&Bmp::new(4, 4, [9, 9, 9, 0]), red, 0);
+        assert_eq!(&clear.px[..4], &red, "transparent pixels fill in");
     }
     #[test]
     fn columns_are_square_ish() { assert_eq!(auto_columns(4), 2); assert_eq!(auto_columns(5), 3); }
