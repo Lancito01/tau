@@ -5,7 +5,7 @@
 pub enum Fill {
     /// RGB.
     Solid([u8; 3]),
-    /// Gaussian blur with this sigma, in pixels.
+    /// Blur as soft as a Gaussian with this sigma, in pixels.
     Blur(f64),
 }
 
@@ -54,8 +54,9 @@ pub struct Layout { pub w: u32, pub h: u32, pub stride: usize, pub sample_bytes:
 impl Layout {
     fn max(&self) -> f32 { if self.sample_bytes == 1 { 255.0 } else { 65535.0 } }
     fn at(&self, x: u32, y: u32, c: usize) -> usize { y as usize * self.stride + (x as usize * self.channels + c) * self.sample_bytes }
-    fn read(&self, b: &[u8], i: usize) -> f32 {
-        if self.sample_bytes == 1 { b[i] as f32 } else { u16::from_le_bytes([b[i], b[i + 1]]) as f32 }
+    fn read(&self, b: &[u8], i: usize) -> f32 { self.read_int(b, i) as f32 }
+    fn read_int(&self, b: &[u8], i: usize) -> u32 {
+        if self.sample_bytes == 1 { b[i] as u32 } else { u16::from_le_bytes([b[i], b[i + 1]]) as u32 }
     }
     fn write(&self, b: &mut [u8], i: usize, v: f32) {
         let v = v.round().clamp(0.0, self.max());
@@ -64,30 +65,76 @@ impl Layout {
     fn is_grey(&self) -> bool { self.rgb[0] == self.rgb[1] && self.rgb[1] == self.rgb[2] }
 }
 
-fn kernel(sigma: f64) -> Vec<f32> {
-    let radius = (sigma * 3.0).ceil().max(1.0) as i32;
-    let raw: Vec<f64> = (-radius..=radius).map(|i| (-(i as f64 * i as f64) / (2.0 * sigma * sigma)).exp()).collect();
-    let sum: f64 = raw.iter().sum();
-    raw.into_iter().map(|v| (v / sum) as f32).collect()
+/// Widths of three box blurs that together come close to a Gaussian of this sigma. Each pass costs the same however
+/// wide it is, so a strong blur on a large area is no slower than a weak one.
+fn boxes(sigma: f64) -> [usize; 3] {
+    let n = 3.0;
+    let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut lo = ideal.floor() as i64;
+    if lo % 2 == 0 { lo -= 1; }
+    let lo = lo.max(1);
+    let hi = lo + 2;
+    let lo_f = lo as f64;
+    let m = ((12.0 * sigma * sigma - n * lo_f * lo_f - 4.0 * n * lo_f - 3.0 * n) / (-4.0 * lo_f - 4.0)).round() as i64;
+    let mut out = [0usize; 3];
+    for (i, o) in out.iter_mut().enumerate() { *o = if (i as i64) < m { lo as usize } else { hi as usize }; }
+    // The weakest blur still does something.
+    if out.iter().all(|w| *w < 3) { out[2] = 3; }
+    out
 }
 
-/// A blurred copy of one channel of a region. Pixels past the picture's edge repeat the last one.
-fn blur(src: &[f32], w: usize, h: usize, k: &[f32]) -> Vec<f32> {
-    let radius = (k.len() / 2) as i32;
-    let mut across = vec![0f32; w * h];
+/// Samples carry 8 fractional bits through the passes. Whole numbers keep the sums exact, so a region gives the same
+/// result wherever it starts, and painting part of a picture matches painting all of it.
+const FRAC: u32 = 8;
+
+/// 2^32 over a box's width, so each average is a multiply rather than a divide. Sums stay under 2^24 times the width, so
+/// the product fits, and the rounding it adds is under a hundredth of a sample.
+fn recip(r: usize) -> u64 { let n = 2 * r as u64 + 1; ((1u64 << 32) + n - 1) / n }
+fn average(sum: u64, n: u64, k: u64) -> u32 { (((sum + n / 2) * k) >> 32) as u32 }
+
+/// One running-sum box pass along rows. Pixels past the edge repeat the last one.
+fn box_rows(src: &[u32], dst: &mut [u32], w: usize, h: usize, r: usize) {
+    let (ri, last) = (r as isize, w as isize - 1);
+    let (n, k) = (2 * r as u64 + 1, recip(r));
     for y in 0..h {
         let row = &src[y * w..(y + 1) * w];
-        for x in 0..w {
-            across[y * w + x] = k.iter().enumerate().map(|(i, g)| g * row[(x as i32 + i as i32 - radius).clamp(0, w as i32 - 1) as usize]).sum();
+        let out = &mut dst[y * w..(y + 1) * w];
+        let at = |i: isize| row[i.clamp(0, last) as usize] as u64;
+        let mut sum: u64 = (-ri..=ri).map(at).sum();
+        for x in 0..w as isize {
+            out[x as usize] = average(sum, n, k);
+            sum = sum + at(x + ri + 1) - at(x - ri);
         }
     }
-    let mut out = vec![0f32; w * h];
-    for x in 0..w {
-        for y in 0..h {
-            out[y * w + x] = k.iter().enumerate().map(|(i, g)| g * across[(y as i32 + i as i32 - radius).clamp(0, h as i32 - 1) as usize * w + x]).sum();
-        }
+}
+
+/// The same down columns, a whole row at a time so memory is read in order.
+fn box_cols(src: &[u32], dst: &mut [u32], w: usize, h: usize, r: usize, sums: &mut Vec<u64>) {
+    let (ri, last) = (r as isize, h as isize - 1);
+    let (n, k) = (2 * r as u64 + 1, recip(r));
+    let row = |i: isize| &src[i.clamp(0, last) as usize * w..][..w];
+    sums.clear();
+    sums.resize(w, 0);
+    for i in -ri..=ri { for (s, v) in sums.iter_mut().zip(row(i)) { *s += *v as u64; } }
+    for y in 0..h as isize {
+        let out = &mut dst[y as usize * w..][..w];
+        for (o, s) in out.iter_mut().zip(sums.iter()) { *o = average(*s, n, k); }
+        let (add, sub) = (row(y + ri + 1), row(y - ri));
+        for ((s, a), b) in sums.iter_mut().zip(add).zip(sub) { *s = *s + *a as u64 - *b as u64; }
     }
-    out
+}
+
+/// Blurs one channel of a region in place, in samples shifted up by `FRAC`: three box blurs each way, close to a
+/// Gaussian.
+fn blur(a: &mut [u32], w: usize, h: usize, widths: [usize; 3]) {
+    let mut b = vec![0u32; w * h];
+    let mut sums = Vec::new();
+    for bw in widths {
+        let r = bw / 2;
+        if r == 0 { continue; }
+        box_rows(a, &mut b, w, h, r);
+        box_cols(&b, a, w, h, r, &mut sums);
+    }
 }
 
 /// Paints the marks in order. A sample is only written where a mark covers it, so the rest stay bit for bit.
@@ -98,7 +145,8 @@ pub fn apply(buf: &mut [u8], l: &Layout, marks: &[Mark]) {
 /// A part of a picture as x0, y0, x1, y1.
 pub type Area = (u32, u32, u32, u32);
 
-fn blur_pad(sigma: f64) -> u32 { (sigma.max(0.5) * 3.0).ceil() as u32 }
+/// How far a blur reads past its mark: the three box radii together.
+fn blur_pad(sigma: f64) -> u32 { boxes(sigma.max(0.5)).iter().map(|w| (w / 2) as u32).sum::<u32>().max(1) }
 
 fn grown(a: Area, by: u32, w: u32, h: u32) -> Area {
     (a.0.saturating_sub(by), a.1.saturating_sub(by), (a.2 + by).min(w), (a.3 + by).min(h))
@@ -176,17 +224,38 @@ pub fn apply_within(buf: &mut [u8], l: &Layout, marks: &[Mark], clip: Area) {
                 let pad = blur_pad(sigma);
                 let (rx0, ry0, rx1, ry1) = (x0.saturating_sub(pad).max(clip.0), y0.saturating_sub(pad).max(clip.1), (x1 + pad).min(clip.2), (y1 + pad).min(clip.3));
                 let (rw, rh) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
-                let k = kernel(sigma);
-                for c in 0..l.channels {
-                    let mut src = Vec::with_capacity(rw * rh);
-                    for y in ry0..ry1 { for x in rx0..rx1 { src.push(l.read(buf, l.at(x, y, c))); } }
-                    let soft = blur(&src, rw, rh, &k);
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            let a = m.coverage(x, y);
-                            if a <= 0.0 { continue; }
-                            let at = (y - ry0) as usize * rw + (x - rx0) as usize;
-                            l.write(buf, l.at(x, y, c), src[at] + (soft[at] - src[at]) * a);
+                let widths = boxes(sigma);
+                // Every channel in one walk over the region, then each blurred on its own thread.
+                let mut planes: Vec<Vec<u32>> = (0..l.channels).map(|_| Vec::with_capacity(rw * rh)).collect();
+                for y in ry0..ry1 {
+                    let row = l.at(rx0, y, 0);
+                    for x in 0..rw {
+                        for (c, plane) in planes.iter_mut().enumerate() {
+                            plane.push(l.read_int(buf, row + (x * l.channels + c) * l.sample_bytes) << FRAC);
+                        }
+                    }
+                }
+                // Opaque alpha blurs to itself.
+                let opaque = (l.max() as u32) << FRAC;
+                let busy: Vec<bool> = planes.iter().enumerate().map(|(c, p)| Some(c) != l.alpha || p.iter().any(|v| *v != opaque)).collect();
+                std::thread::scope(|s| {
+                    for (plane, busy) in planes.iter_mut().zip(&busy) {
+                        if *busy { s.spawn(move || blur(plane, rw, rh, widths)); }
+                    }
+                });
+                let one = (1u32 << FRAC) as f32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let a = m.coverage(x, y);
+                        if a <= 0.0 { continue; }
+                        let at = (y - ry0) as usize * rw + (x - rx0) as usize;
+                        for (c, plane) in planes.iter().enumerate() {
+                            if !busy[c] { continue; }
+                            let i = l.at(x, y, c);
+                            let soft = plane[at] as f32 / one;
+                            if a >= 1.0 { l.write(buf, i, soft); continue; }
+                            let old = l.read(buf, i);
+                            l.write(buf, i, old + (soft - old) * a);
                         }
                     }
                 }
@@ -313,6 +382,24 @@ mod tests {
         let step = |d: &[u8]| (41..79).map(|x| (px(d, &l, x, 40)[1] as i32 - px(d, &l, x + 1, 40)[1] as i32).abs()).sum::<i32>();
         assert!(step(&b) * 5 < step(&before), "{} vs {}", step(&b), step(&before));
         assert_eq!(px(&b, &l, 60, 40)[3], 255, "alpha stays");
+    }
+    #[test]
+    fn three_boxes_match_the_gaussian_they_stand_for() {
+        for sigma in [0.6, 2.0, 7.5, 40.0, 240.0] {
+            let var: f64 = boxes(sigma).iter().map(|w| ((w * w) as f64 - 1.0) / 12.0).sum();
+            assert!((var.sqrt() - sigma).abs() < sigma * 0.15 + 0.6, "{sigma}: {}", var.sqrt());
+        }
+    }
+    #[test]
+    fn a_flat_area_stays_flat_however_strong_the_blur() {
+        let mut b = vec![77u8; 300 * 200 * 4];
+        let l = Layout { w: 300, h: 200, stride: 1200, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
+        apply(&mut b, &l, &[Mark { x: 0, y: 0, w: 300, h: 200, ellipse: false, fill: Fill::Blur(240.0), feather: 0 }]);
+        assert!(b.iter().all(|v| *v == 77));
+        let mut b: Vec<u8> = std::iter::repeat(65535u16.to_le_bytes()).take(300 * 200 * 3).flatten().collect();
+        let l = Layout { w: 300, h: 200, stride: 1800, sample_bytes: 2, channels: 3, rgb: [0, 1, 2], alpha: None };
+        apply(&mut b, &l, &[Mark { x: 0, y: 0, w: 300, h: 200, ellipse: false, fill: Fill::Blur(240.0), feather: 0 }]);
+        assert!(b.iter().all(|v| *v == 255), "sixteen-bit white stays white");
     }
     #[test]
     fn sixteen_bit_keeps_its_depth() {

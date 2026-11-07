@@ -139,8 +139,30 @@ fn pick_shapes_video(title: &str, input: &Path, mode: canvas::Mode, ok: &str) ->
     });
     let (first, dur, fps) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
     let p = input.to_path_buf();
-    let source = canvas::FrameSource { dur, fps, load: Arc::new(move |t| frame_at(&p, t)) };
+    let source = canvas::FrameSource { dur, fps, pages: 0, load: Arc::new(move |t| frame_at(&p, t)) };
     canvas::edit_video(title, first, mode, ok, source).map(|v| canvas::encode_all(&v))
+}
+
+/// A PDF's redaction editor, a page at a time. Gives "page<TAB>shape" lines for the pages that have marks.
+fn pick_pdf_redactions(input: &Path) -> Option<String> {
+    const LONG: u32 = 1600;
+    let p = input.to_path_buf();
+    let loaded = pump_job("Reading file", move |_| Ok((crate::pdf::page_count(&p)?, crate::pdf::page_preview(&p, 0, LONG)?)));
+    let (count, first) = match loaded { Ok(v) => v, Err(e) => { fail("Redact", e); return None; } };
+    let p = input.to_path_buf();
+    let pages = canvas::redact_pages("Redact", first, count, "Redact", Arc::new(move |i| crate::pdf::page_preview(&p, i, LONG)))?;
+    Some(pages.iter().enumerate().flat_map(|(i, v)| v.iter().map(move |s| format!("{i}\t{}", s.encode()))).collect::<Vec<_>>().join("\n"))
+}
+
+/// The marks of each page from `pick_pdf_redactions`, in page order.
+fn decode_pages(s: &str) -> Vec<(u32, Vec<Shape>)> {
+    let mut out: std::collections::BTreeMap<u32, Vec<Shape>> = Default::default();
+    for line in s.lines() {
+        let Some((n, rest)) = line.split_once('\t') else { continue };
+        let (Ok(n), Some(sh)) = (n.parse::<u32>(), Shape::decode(rest)) else { continue };
+        out.entry(n).or_default().push(sh);
+    }
+    out.into_iter().collect()
 }
 
 /// Faces and words found in the picture, offered as starting redactions the user can remove one by one.
@@ -487,6 +509,15 @@ pub fn run_ui(id: &str, paths: Vec<PathBuf>) {
         [one] => one.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         many => format!("{} files", many.len()),
     });
+    if id == "pdf.redact" {
+        // Each document needs its own marks too.
+        for p in paths {
+            form::set_context(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            let Some(pages) = pick_pdf_redactions(&p) else { return };
+            exec(id, vec![p], opts(&[("pages", pages)]));
+        }
+        return;
+    }
     if matches!(id, "img.annotate" | "img.redact") {
         // Each picture needs its own marks, so these open one editor per file.
         for p in paths {
@@ -1007,6 +1038,13 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             crate::pdf::set_metadata(p, &f, get(&o, "strip", "0") == "1")
         }),
         "pdf.split" => each("Splitting", paths, |j, p| crate::pdf::split(j, p)),
+        "pdf.redact" => each("Redacting", paths, move |j, p| {
+            let marked = decode_pages(get(&o, "pages", ""));
+            let n = marked.len();
+            let out = crate::pdf::redact(j, p, &marked)?;
+            tell(j, format!("{n} redacted {} saved as {}, so nothing under a mark survives", if n == 1 { "page" } else { "pages" }, if n == 1 { "an image" } else { "images" }));
+            Ok(out)
+        }),
         "pdf.organize" => each("Organizing", paths, move |_, p| {
             let doc = crate::pdf::load_doc(p)?;
             let order = crate::pdf::parse_order(get(&o, "order", ""), doc.get_pages().len() as u32)?;

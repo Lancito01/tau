@@ -171,6 +171,7 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
             let mut v = vec![
                 tool("pdf.compress", "COMPRESS", 0xE73F), tool("pdf.metadata", "METADATA", 0xE8EC),
                 tool("pdf.split", "SPLIT", 0xE8A4), tool("pdf.organize", "ORGANIZE", 0xE8CB),
+                tool("pdf.redact", "REDACT", 0xED1A),
             ];
             if count > 1 { v.push(tool("pdf.merge", "MERGE", 0xE71B)); }
             v
