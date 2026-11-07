@@ -788,6 +788,7 @@ impl Editor {
 
     fn recolor(&mut self, c: u32) {
         self.pen = c;
+        if self.mode == Mode::Redact { return; }
         if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
             if self.items[i].shape.color != c {
                 self.checkpoint();
@@ -798,7 +799,7 @@ impl Editor {
 
     /// A row of colours and a button for any other. Shows the selected shape's colour when there is one.
     fn swatches(&mut self, ui: &mut Ui, x: f32, y: f32, colors: &[u32]) {
-        let current = self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen);
+        let current = if self.mode == Mode::Redact { self.pen } else { self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen) };
         for (i, c) in colors.iter().enumerate() {
             let cx = x + 14.0 + i as f32 * 36.0;
             let (hov, _, clicked) = ui.hit(id(&format!("ed.col{i}")), r(cx - 14.0, y, 28.0, 28.0));
@@ -814,31 +815,20 @@ impl Editor {
         if ui.icon_button("ed.custom", if custom { glyph::CHECK } else { glyph::ADD }, r(cx - 14.0, y, 28.0, 28.0), 11.0, false) { self.pending_color = true; }
     }
 
+    /// Shape, fill and colour here set up the next mark only; marks already drawn keep theirs.
     fn redact_controls(&mut self, ui: &mut Ui, x: f32, w: f32, mut y: f32) -> f32 {
-        let sel = self.sel.filter(|i| *i < self.items.len());
-        let fx = sel.map(|i| self.items[i].shape.fx).unwrap_or(self.fx);
-        let is_oval = sel.map(|i| self.items[i].shape.tool == Tool::Ellipse).unwrap_or(self.oval);
+        let fx = self.fx;
 
-        let mut shape = is_oval as usize;
+        let mut shape = self.oval as usize;
         let names: Vec<String> = ["Box", "Ellipse"].iter().map(|s| s.to_string()).collect();
         ui.segmented("ed.shape", r(x, y, w, 32.0), &names, &mut shape);
-        if (shape == 1) != is_oval {
-            self.oval = shape == 1;
-            if let Some(i) = sel {
-                self.checkpoint();
-                self.items[i].shape.tool = if shape == 1 { Tool::Ellipse } else { Tool::Rect };
-            }
-        }
+        self.oval = shape == 1;
         y += 40.0;
 
         let mut fill = fx.blur as usize;
         let names: Vec<String> = ["Colour", "Blur"].iter().map(|s| s.to_string()).collect();
         ui.segmented("ed.fill", r(x, y, w, 32.0), &names, &mut fill);
-        if (fill == 1) != fx.blur {
-            let blur = fill == 1;
-            self.slider_open = false;
-            self.restyle(|f| f.blur = blur);
-        }
+        self.fx.blur = fill == 1;
         y += 40.0;
 
         // Strength belongs to each blur, so it sits in that mark's row.
@@ -1097,7 +1087,7 @@ impl Page for Editor {
     }
     fn after(&mut self) -> bool {
         if std::mem::take(&mut self.pending_color) {
-            let current = self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen);
+            let current = if self.mode == Mode::Redact { self.pen } else { self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen) };
             if let Some(v) = form::show("Custom colour", &[form::Field::Color("Colour", format!("#{current:06X}"))], "Use") {
                 let c = crate::image::parse_color(&v[0]);
                 self.recolor(((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32);
