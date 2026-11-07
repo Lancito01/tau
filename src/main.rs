@@ -270,13 +270,35 @@ fn tray_menu(hwnd: HWND) {
     items.push(MenuItem::separator());
     items.push(MenuItem::new("Quit Tau", glyph::POWER));
     let quit = items.len() - 1;
-    let chosen = ui::show_menu(Menu::new(230.0, items, None, Some(format!("Tau {VERSION}"))), at, at.y);
+    // From the hidden-icons flyout, open below it, or above it if there is no room, never over
+    // it: the flyout can stay on top of the menu (seen with GlazeWM running).
+    let (at, flip_y) = match overflow_rect(at) {
+        Some(f) => (POINT { x: at.x, y: f.bottom }, f.top),
+        None => (at, at.y),
+    };
+    let chosen = ui::show_menu(Menu::new(230.0, items, None, Some(format!("Tau {VERSION}"))), at, flip_y);
     match chosen {
         Some(i) if i == quit => unsafe { let _ = DestroyWindow(hwnd); },
         Some(0) => { if let Some(s) = settings::show(&Settings::load()) { apply_settings(&s); } }
         Some(1) if updates => update::check_now(),
         _ => {}
     }
+}
+
+/// The hidden-icons flyout's bounds, if it is open under the cursor.
+fn overflow_rect(at: POINT) -> Option<RECT> {
+    // Windows 11, then Windows 10.
+    for class in [w!("TopLevelWindowForOverflowXamlIsland"), w!("NotifyIconOverflowWindow")] {
+        unsafe {
+            let Ok(h) = FindWindowW(class, None) else { continue };
+            let mut r = RECT::default();
+            if IsWindowVisible(h).as_bool() && GetWindowRect(h, &mut r).is_ok()
+                && (r.left..r.right).contains(&at.x) && (r.top..r.bottom).contains(&at.y) {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 
 fn open_wheel_for(paths: Vec<PathBuf>) {
