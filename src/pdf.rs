@@ -44,6 +44,29 @@ fn render_page(doc: &PdfDocument, i: u32, dpi: f64, stream: &InMemoryRandomAcces
 
 pub fn page_count(p: &Path) -> std::result::Result<u32, String> { open(p)?.PageCount().map_err(es) }
 
+/// A page as a picture, white where the page has nothing.
+fn page_bmp(doc: &PdfDocument, i: u32, dpi: f64) -> std::result::Result<Bmp, String> {
+    let st = InMemoryRandomAccessStream::new().map_err(es)?;
+    render_page(doc, i, dpi, &st, Some(BitmapEncoder::PngEncoderId().map_err(es)?))?;
+    let t = TempDir::new()?;
+    let f = t.file("page.png");
+    std::fs::write(&f, read_stream(&st)?).map_err(|e| e.to_string())?;
+    image::load(&f)
+}
+
+/// A page's size in inches, as it is shown: cropped and turned.
+fn page_inches(doc: &PdfDocument, i: u32) -> std::result::Result<(f64, f64), String> {
+    let s = doc.GetPage(i).map_err(es)?.Size().map_err(es)?;
+    Ok((s.Width as f64 / 96.0, s.Height as f64 / 96.0))
+}
+
+/// A page drawn with its longer side `long` pixels, for the redaction editor.
+pub fn page_preview(input: &Path, i: u32, long: u32) -> std::result::Result<Bmp, String> {
+    let doc = open(input)?;
+    let (w, h) = page_inches(&doc, i)?;
+    page_bmp(&doc, i, long as f64 / w.max(h).max(0.01))
+}
+
 /// PNG or JPEG at 600 DPI: one file for a single page, a folder for several.
 pub fn to_images(job: &Job, input: &Path, ext: &str) -> std::result::Result<PathBuf, String> { images_at(job, input, ext, 600.0) }
 
@@ -384,6 +407,106 @@ pub fn compress(job: &Job, input: &Path, dpi: Option<f64>) -> std::result::Resul
             }
         }
     })
+}
+
+// ---- redaction ----
+
+/// Redacted pages are drawn at this resolution, which keeps small print readable.
+const REDACT_DPI: f64 = 300.0;
+/// And never larger than this on their longer side, for posters and drawings.
+const REDACT_MAX_PX: f64 = 8000.0;
+
+/// Redacts each listed page (0-based) by replacing it with a picture of itself with the marks painted in. Nothing that
+/// was on the page survives under a mark: its text, fonts, vector drawing and images go, along with its annotations,
+/// form fields and thumbnail. Pages without marks are kept exactly as they were.
+pub fn redact(job: &Job, input: &Path, marked: &[(u32, Vec<crate::canvas::Shape>)]) -> std::result::Result<PathBuf, String> {
+    if marked.is_empty() { return Err("Nothing marked to redact".into()); }
+    let out = sibling(input, " redacted", "pdf");
+    atomically(&out, |tmp| {
+        let src = open(input)?;
+        let mut d = load_doc(input)?;
+        if d.is_encrypted() { return Err("This PDF is password-protected. Remove the password first.".into()); }
+        let ids = d.get_pages();
+        let mut dropped = std::collections::BTreeSet::new();
+        for (n, (page, shapes)) in marked.iter().enumerate() {
+            if job.cancelled() { return Err("Cancelled".into()); }
+            job.set_frac(n as f32 / marked.len() as f32 * 0.9);
+            let id = *ids.get(&(page + 1)).ok_or_else(|| format!("No page {}", page + 1))?;
+            let (wi, hi) = page_inches(&src, *page)?;
+            let mut b = page_bmp(&src, *page, REDACT_DPI.min(REDACT_MAX_PX / wi.max(hi).max(0.01)))?;
+            let l = crate::redact::Layout { w: b.w, h: b.h, stride: b.w as usize * 4, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
+            crate::redact::apply(&mut b.px, &l, &crate::canvas::marks_for(shapes, b.w, b.h, false));
+            dropped.extend(page_as_picture(&mut d, id, &b, (wi * 72.0) as f32, (hi * 72.0) as f32)?);
+        }
+        forget_fields(&mut d, &dropped);
+        // The structure tree can hold a page's words as alternate text, so it goes too.
+        if let Ok(root) = d.trailer.get(b"Root").and_then(|o| o.as_reference()) {
+            if let Ok(cat) = d.get_object_mut(root).and_then(|o| o.as_dict_mut()) { cat.remove(b"StructTreeRoot"); }
+        }
+        // Without this the old page content would still be in the file, only unused.
+        d.prune_objects();
+        d.compress();
+        d.save(tmp).map(|_| ()).map_err(|e| e.to_string())
+    })
+}
+
+/// Makes a page show only this picture, at the size it had. Gives the annotations it had, which are gone now.
+fn page_as_picture(d: &mut Document, page: ObjectId, b: &Bmp, pw: f32, ph: f32) -> std::result::Result<Vec<ObjectId>, String> {
+    let mut rgb = Vec::with_capacity(b.px.len() / 4 * 3);
+    for p in b.px.chunks_exact(4) { rgb.extend_from_slice(&[p[2], p[1], p[0]]); }
+    let img = d.add_object(Stream::new(dictionary! {
+        "Type" => "XObject", "Subtype" => "Image", "Width" => b.w as i64, "Height" => b.h as i64,
+        "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+    }, rgb));
+    let content = d.add_object(Stream::new(dictionary! {}, format!("q {pw} 0 0 {ph} 0 0 cm /Redacted Do Q").into_bytes()));
+    let dict = d.get_object_mut(page).and_then(|o| o.as_dict_mut()).map_err(|e| e.to_string())?;
+    let annots: Vec<ObjectId> = dict.get(b"Annots").and_then(|o| o.as_array()).map(|a| a.iter().filter_map(|o| o.as_reference().ok()).collect()).unwrap_or_default();
+    // Everything that described or decorated the old content. The picture is already cropped and turned upright.
+    for k in ["Annots", "Thumb", "B", "StructParents", "PieceInfo", "Metadata", "Group", "CropBox", "BleedBox", "TrimBox", "ArtBox", "AA", "SeparationInfo", "VP"] {
+        dict.remove(k.as_bytes());
+    }
+    dict.set("MediaBox", vec![0.into(), 0.into(), Object::Real(pw), Object::Real(ph)]);
+    dict.set("Rotate", 0);
+    dict.set("Contents", content);
+    dict.set("Resources", dictionary! { "XObject" => dictionary! { "Redacted" => img } });
+    Ok(annots)
+}
+
+/// Takes form fields whose widgets were on a redacted page out of the form, since a field holds its value as text.
+fn forget_fields(d: &mut Document, gone: &std::collections::BTreeSet<ObjectId>) {
+    if gone.is_empty() { return; }
+    let Ok(root) = d.trailer.get(b"Root").and_then(|o| o.as_reference()) else { return };
+    let form = match d.get_object(root).and_then(|o| o.as_dict()).and_then(|c| c.get(b"AcroForm")) {
+        Ok(Object::Reference(r)) => Some(*r),
+        Ok(Object::Dictionary(_)) => None,
+        _ => return,
+    };
+    fn keep(d: &mut Document, field: &Object, gone: &std::collections::BTreeSet<ObjectId>, depth: u32) -> bool {
+        let Ok(id) = field.as_reference() else { return true };
+        if gone.contains(&id) { return false; }
+        if depth > 32 { return true; }
+        let kids = match d.get_object(id).and_then(|o| o.as_dict()).and_then(|f| f.get(b"Kids")).and_then(|k| k.as_array()) {
+            Ok(k) => k.clone(),
+            Err(_) => return true,
+        };
+        let left: Vec<Object> = kids.into_iter().filter(|k| keep(d, k, gone, depth + 1)).collect();
+        if left.is_empty() { return false; }
+        if let Ok(f) = d.get_object_mut(id).and_then(|o| o.as_dict_mut()) { f.set("Kids", left); }
+        true
+    }
+    let fields = {
+        let dict = match form {
+            Some(r) => d.get_object(r).and_then(|o| o.as_dict()),
+            None => d.get_object(root).and_then(|o| o.as_dict()).and_then(|c| c.get(b"AcroForm")).and_then(|o| o.as_dict()),
+        };
+        match dict.and_then(|f| f.get(b"Fields")).and_then(|o| o.as_array()) { Ok(a) => a.clone(), Err(_) => return }
+    };
+    let left: Vec<Object> = fields.into_iter().filter(|f| keep(d, f, gone, 0)).collect();
+    let dict = match form {
+        Some(r) => d.get_object_mut(r).and_then(|o| o.as_dict_mut()),
+        None => d.get_object_mut(root).and_then(|o| o.as_dict_mut()).and_then(|c| c.get_mut(b"AcroForm")).and_then(|o| o.as_dict_mut()),
+    };
+    if let Ok(f) = dict { f.set("Fields", left); }
 }
 
 pub fn set_metadata(input: &Path, fields: &[(&str, String)], strip: bool) -> std::result::Result<PathBuf, String> {

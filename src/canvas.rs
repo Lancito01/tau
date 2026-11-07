@@ -295,16 +295,25 @@ const GRAB: f32 = 10.0;
 const PREVIEW_MAX: u32 = 2400;
 /// Redacting repaints the picture as marks move, so it works on a copy no bigger than a window can show.
 const REDACT_PREVIEW_MAX: u32 = 1600;
-/// What a selected redaction's row adds for its own settings.
-const ROW_FEATHER: f32 = 48.0;
+/// What a selected redaction's row adds for each of its own sliders: feather, and strength when it blurs.
+const ROW_SLIDER: f32 = 48.0;
+/// A blur this many preview pixels or smaller repaints live while a mark or slider is dragged. A larger one waits for
+/// the mouse button, so the window keeps up.
+const LIVE_BLUR_PX: u64 = 800_000;
 const STAGE_BG: u32 = 0x0A0B0C;
 
-/// Lets the video editors fetch other frames while the window is open.
+/// Lets the video editors fetch other frames while the window is open. With `pages` set it is a document instead: the
+/// position is a page index, and each page keeps its own marks.
 pub struct FrameSource {
     pub dur: f64,
     pub fps: f64,
+    pub pages: u32,
     pub load: Arc<dyn Fn(f64) -> std::result::Result<Bmp, String> + Send + Sync>,
 }
+
+/// The marks and history of a page that is not the one on screen.
+#[derive(Default)]
+struct PageState { items: Vec<Item>, undo: Vec<Vec<Item>>, redo: Vec<Vec<Item>> }
 
 struct Scrub {
     source: FrameSource,
@@ -358,6 +367,9 @@ struct Editor {
     list_sel: Option<usize>,
     aspect: usize,
     scrub: Option<Scrub>,
+    /// Every page of a document, with the one on screen left empty while its marks live in `items`.
+    pages: Vec<PageState>,
+    page: usize,
     start_size: (f32, f32),
     result: Option<bool>,
 }
@@ -390,12 +402,13 @@ impl Editor {
         let at = cursor_pos();
         let (wa, s) = (work_area_at(at), dpi_scale_at(at));
         let start_size = (((wa.right - wa.left) as f32 / s * 0.75).max(900.0), ((wa.bottom - wa.top) as f32 / s * 0.75).max(600.0));
+        let pages = scrub.as_ref().map(|f| (0..f.pages).map(|_| PageState::default()).collect()).unwrap_or_default();
         let scrub = scrub.filter(|f| f.dur > 0.0).map(|source| Scrub { source, pos: 0.0, requested: 0.0, loading: false, slot: Arc::new(Mutex::new(None)), error: None });
         Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
             pen: if mode == Mode::Redact { 0 } else { COLORS[0] }, fx: Fx::default(), oval: false, aspect: 0,
-            pending_text: None, pending_color: false, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, start_size, result: None,
+            pending_text: None, pending_color: false, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, pages, page: 0, start_size, result: None,
         }
     }
 
@@ -407,7 +420,17 @@ impl Editor {
     }
 
     fn ready(&self) -> bool {
-        if self.mode == Mode::Crop { !self.is_full_frame() } else { !self.items.is_empty() }
+        if self.mode == Mode::Crop { !self.is_full_frame() } else { !self.items.is_empty() || self.pages.iter().any(|p| !p.items.is_empty()) }
+    }
+
+    fn paged(&self) -> bool { !self.pages.is_empty() }
+
+    /// The marks of every page of a document, in page order.
+    fn output_pages(&self) -> Vec<Vec<Shape>> {
+        (0..self.pages.len()).map(|i| {
+            let items = if i == self.page { &self.items } else { &self.pages[i].items };
+            items.iter().map(|it| it.shape.clone()).collect()
+        }).collect()
     }
 
     fn output(&self) -> Vec<Shape> {
@@ -591,7 +614,7 @@ impl Editor {
     fn refresh_shown(&mut self, ui: &mut Ui) {
         use crate::redact::{apply, apply_within, change_between, Layout};
         let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).collect();
-        if let Some(Drag::New(s)) = &self.drag { if !s.fx.blur { now.push(s.clone()); } }
+        if let Some(Drag::New(s)) = &self.drag { now.push(s.clone()); }
         if self.shown_for.as_ref() == Some(&now) { return; }
         let (w, h) = (self.preview.w, self.preview.h);
         let marks = marks_for(&now, w, h, false);
@@ -603,7 +626,8 @@ impl Editor {
             self.shown_gen += 1;
             self.shown = b;
         } else if let Some(c) = change_between(&self.shown_marks, &marks, w, h) {
-            if ui.down && c.blur { return; }
+            let area = (c.work.2 - c.work.0) as u64 * (c.work.3 - c.work.1) as u64;
+            if ui.down && c.blur && area > LIVE_BLUR_PX { return; }
             if self.scratch.len() != self.preview.px.len() { self.scratch = self.preview.px.clone(); }
             let row = |y: u32, a: (u32, u32, u32, u32)| (y as usize * w as usize + a.0 as usize) * 4..(y as usize * w as usize + a.2 as usize) * 4;
             for y in c.work.1..c.work.3 { self.scratch[row(y, c.work)].copy_from_slice(&self.preview.px[row(y, c.work)]); }
@@ -817,14 +841,8 @@ impl Editor {
         }
         y += 40.0;
 
-        if fx.blur {
-            let mut v = fx.strength;
-            ui.text("Strength", r(x, y, w - 50.0, 18.0), 12.5, 500, MUTED, Align::Left);
-            ui.text(&format!("{}", v as i32), r(x + w - 50.0, y, 50.0, 18.0), 12.5, 600, MUTED, Align::Right);
-            ui.slider("ed.strength", r(x - 9.0, y + 18.0, w + 18.0, 28.0), 1.0, 100.0, 40.0, &mut v);
-            if v != fx.strength { self.restyle(|f| f.strength = v); }
-            y += 50.0;
-        } else {
+        // Strength belongs to each blur, so it sits in that mark's row.
+        if !fx.blur {
             self.swatches(ui, x, y, &REDACT_COLORS);
             y += 38.0;
         }
@@ -838,9 +856,20 @@ impl Editor {
         y
     }
 
+    /// One of a selected mark's own sliders. A drag makes one undo step, taken before the first change.
+    fn row_slider(&mut self, ui: &mut Ui, key: &str, label: &str, x: f32, w: f32, y: f32, range: (f32, f32, f32), was: f32) -> f32 {
+        let mut v = was;
+        ui.text(label, r(x, y, w - 50.0, 18.0), 12.0, 500, MUTED, Align::Left);
+        ui.text(&format!("{}", v as i32), r(x + w - 50.0, y, 50.0, 18.0), 12.0, 600, MUTED, Align::Right);
+        ui.slider(key, r(x - 9.0, y + 16.0, w + 18.0, 28.0), range.0, range.1, range.2, &mut v);
+        if v != was && !self.slider_open { self.checkpoint(); self.slider_open = true; }
+        v
+    }
+
     fn clear_button(&mut self, ui: &mut Ui, x: f32, w: f32, q: R) {
         let any = !self.items.is_empty();
-        if ui.button("ed.clear", "Clear all", r(x, q.bottom() - 48.0, w, 34.0), Style::Secondary, any) {
+        let label = if self.paged() { "Clear this page" } else { "Clear all" };
+        if ui.button("ed.clear", label, r(x, q.bottom() - 48.0, w, 34.0), Style::Secondary, any) {
             self.checkpoint();
             self.items.clear();
             self.sel = None;
@@ -856,8 +885,9 @@ impl Editor {
         }
         // The selected redaction's row opens to hold the settings that belong to that mark alone.
         let redact = self.mode == Mode::Redact;
-        let extra = move |sel: Option<usize>, i: usize| if redact && sel == Some(i) { ROW_FEATHER } else { 0.0 };
-        let top_of = move |sel: Option<usize>, i: usize| (0..i).map(|n| ROW + extra(sel, n)).sum::<f32>();
+        let blurred: Vec<bool> = self.items.iter().map(|it| it.shape.fx.blur).collect();
+        let extra = |sel: Option<usize>, i: usize| if redact && sel == Some(i) { ROW_SLIDER * if blurred[i] { 2.0 } else { 1.0 } } else { 0.0 };
+        let top_of = |sel: Option<usize>, i: usize| (0..i).map(|n| ROW + extra(sel, n)).sum::<f32>();
         let content = top_of(self.sel, self.items.len());
         if self.sel != self.list_sel {
             self.list_sel = self.sel;
@@ -918,16 +948,16 @@ impl Editor {
                 ui.text(&detail, r(row.x + 38.0, row.y + 21.0, tw, 16.0), 11.0, 400, MUTED, Align::Left);
             }
             if extra(self.sel, i) > 0.0 {
-                let was = self.items[i].shape.fx.feather;
-                let mut v = was;
-                let (fx, fw, fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
-                ui.text("Feather", r(fx, fy, fw - 50.0, 18.0), 12.0, 500, MUTED, Align::Left);
-                ui.text(&format!("{}", v as i32), r(fx + fw - 50.0, fy, 50.0, 18.0), 12.0, 600, MUTED, Align::Right);
-                ui.slider(&format!("ed.feather{i}"), r(fx - 9.0, fy + 16.0, fw + 18.0, 28.0), 0.0, 100.0, 0.0, &mut v);
-                if v != was {
-                    if !self.slider_open { self.checkpoint(); self.slider_open = true; }
-                    self.items[i].shape.fx.feather = v;
+                let (fx, fw, mut fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
+                if blurred[i] {
+                    let was = self.items[i].shape.fx.strength;
+                    let v = self.row_slider(ui, &format!("ed.strength{i}"), "Strength", fx, fw, fy, (1.0, 100.0, 40.0), was);
+                    if v != was { self.items[i].shape.fx.strength = v; }
+                    fy += ROW_SLIDER;
                 }
+                let was = self.items[i].shape.fx.feather;
+                let v = self.row_slider(ui, &format!("ed.feather{i}"), "Feather", fx, fw, fy, (0.0, 100.0, 0.0), was);
+                if v != was { self.items[i].shape.fx.feather = v; }
             }
         }
         ui.mouse = real;
@@ -938,26 +968,56 @@ impl Editor {
     // ---- video ----
 
     fn scrubber(&mut self, ui: &mut Ui, q: R) {
+        let marked = self.pages.iter().enumerate().filter(|(i, p)| if *i == self.page { !self.items.is_empty() } else { !p.items.is_empty() }).count();
         let Some(sc) = self.scrub.as_mut() else { return };
         ui.fill(q, 0.0, SURFACE, 0.6);
         ui.fill(r(q.x, q.y, q.w, 1.0), 0.0, BORDER, 0.7);
         let fps = sc.source.fps;
-        let t = (sc.pos / 1000.0) as f64 * sc.source.dur;
-        ui.slider("ed.scrub", r(q.x + PAD - 9.0, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0, 28.0), 0.0, 1000.0, 0.0, &mut sc.pos);
-        let label = format!("{} / {}", timecode(t, fps), timecode(sc.source.dur, fps));
-        ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
+        let paged = sc.source.pages > 0;
+        if paged {
+            let (n, cur) = (sc.source.pages, sc.pos as u32);
+            let (bw, by) = (34.0, q.y + (q.h - 34.0) / 2.0);
+            if ui.icon_button_if("ed.prev", glyph::PREV, r(q.x + PAD, by, bw, bw), 12.0, cur > 0) { sc.pos = cur.saturating_sub(1) as f32; }
+            if ui.icon_button_if("ed.next", glyph::NEXT, r(q.x + PAD + bw + 4.0, by, bw, bw), 12.0, cur + 1 < n) { sc.pos = (cur + 1) as f32; }
+            ui.text(&format!("Page {} of {n}", cur + 1), r(q.x + PAD + bw * 2.0 + 16.0, q.y, 160.0, q.h), 13.0, 600, TEXT, Align::Left);
+            let note = match marked { 0 => String::new(), 1 => "Marks on 1 page".to_string(), m => format!("Marks on {m} pages") };
+            ui.text(&note, r(q.right() - PAD - 200.0, q.y, 200.0, q.h), 12.0, 500, MUTED, Align::Right);
+        } else {
+            let t = (sc.pos / 1000.0) as f64 * sc.source.dur;
+            ui.slider("ed.scrub", r(q.x + PAD - 9.0, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0, 28.0), 0.0, 1000.0, 0.0, &mut sc.pos);
+            let label = format!("{} / {}", timecode(t, fps), timecode(sc.source.dur, fps));
+            ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
+        }
 
         if let Some(res) = sc.slot.lock().unwrap().take() {
             sc.loading = false;
             match res {
-                Ok(b) => { sc.error = None; self.preview = shrink(b, self.mode); self.shown_for = None; ui.forget_image(id("ed.image")); }
+                Ok(b) => {
+                    sc.error = None;
+                    if paged {
+                        // The marks follow the page they were drawn on.
+                        let to = (sc.requested as usize).min(self.pages.len() - 1);
+                        if to != self.page {
+                            self.pages[self.page] = PageState { items: std::mem::take(&mut self.items), undo: std::mem::take(&mut self.undo), redo: std::mem::take(&mut self.redo) };
+                            let next = std::mem::take(&mut self.pages[to]);
+                            (self.items, self.undo, self.redo, self.page) = (next.items, next.undo, next.redo, to);
+                            (self.sel, self.drag, self.before, self.list_sel) = (None, None, None, None);
+                        }
+                        self.full = (b.w, b.h);
+                    }
+                    self.preview = shrink(b, self.mode);
+                    self.shown_for = None;
+                    self.scratch.clear();
+                    ui.forget_image(id("ed.image"));
+                }
                 Err(e) => sc.error = Some(e),
             }
         }
         if !sc.loading && sc.pos != sc.requested {
             sc.requested = sc.pos;
             sc.loading = true;
-            let (load, slot, at) = (sc.source.load.clone(), sc.slot.clone(), snap((sc.pos / 1000.0) as f64 * sc.source.dur, fps));
+            let at = if paged { sc.pos as f64 } else { snap((sc.pos / 1000.0) as f64 * sc.source.dur, fps) };
+            let (load, slot) = (sc.source.load.clone(), sc.slot.clone());
             std::thread::spawn(move || {
                 crate::job::com_init();
                 let res = load(at);
@@ -967,14 +1027,22 @@ impl Editor {
         if sc.loading { ui.want_anim = true; }
     }
 
+    /// Moves to another page of a document. The marks change over once it has loaded.
+    fn turn_page(&mut self, by: i32) {
+        let Some(sc) = self.scrub.as_mut().filter(|s| s.source.pages > 0) else { return };
+        sc.pos = (sc.pos as i32 + by).clamp(0, sc.source.pages as i32 - 1) as f32;
+    }
+
     // ---- footer and keys ----
 
     fn footer(&mut self, ui: &mut Ui, w: f32, h: f32) {
         let fy = h - FOOT_H;
         ui.divider(fy, 0.0, w);
-        let video = self.scrub.is_some();
-        let err = self.scrub.as_ref().and_then(|s| s.error.as_ref()).map(|_| "Could not read that frame. Pick another point in the video.");
+        let paged = self.paged();
+        let video = self.scrub.is_some() && !paged;
+        let err = self.scrub.as_ref().and_then(|s| s.error.as_ref()).map(|_| if paged { "Could not read that page. Try another one." } else { "Could not read that frame. Pick another point in the video." });
         let hint = err.unwrap_or(match self.mode {
+            Mode::Redact if paged => "Marks apply to this page only. Page Up and Page Down move between pages.",
             Mode::Crop if video => "Applies to the whole video. Drag the handles, or drag outside to start over.",
             Mode::Crop => "Drag the handles, or drag outside the box to start over.",
             Mode::Redact if video => "Applies to the whole video. Click a mark to select and restyle it, right-click to remove it.",
@@ -1003,6 +1071,8 @@ impl Editor {
         }
         match ui.ctrl_key(VK_Z) { Some(true) => self.step_redo(), Some(false) => self.step_undo(), None => {} }
         if ui.ctrl_key(VK_Y).is_some() { self.step_redo(); }
+        if ui.key(VK_PRIOR) { self.turn_page(-1); }
+        if ui.key(VK_NEXT) { self.turn_page(1); }
     }
 }
 
@@ -1047,9 +1117,19 @@ impl Page for Editor {
     }
 }
 
-fn run(title: &str, bmp: Bmp, mode: Mode, initial: Vec<Shape>, save_label: &str, scrub: Option<FrameSource>) -> Option<Vec<Shape>> {
+fn open(title: &str, bmp: Bmp, mode: Mode, initial: Vec<Shape>, save_label: &str, scrub: Option<FrameSource>) -> Option<Editor> {
     let e = ui::run_modal(Editor::new(title, bmp, mode, initial, save_label, scrub), title, None)?;
-    (e.result == Some(true)).then(|| e.output())
+    (e.result == Some(true)).then_some(e)
+}
+
+fn run(title: &str, bmp: Bmp, mode: Mode, initial: Vec<Shape>, save_label: &str, scrub: Option<FrameSource>) -> Option<Vec<Shape>> {
+    open(title, bmp, mode, initial, save_label, scrub).map(|e| e.output())
+}
+
+/// The redaction editor over a document, one page at a time. Gives the marks of every page, in page order.
+pub fn redact_pages(title: &str, first: Bmp, count: u32, save_label: &str, load: Arc<dyn Fn(u32) -> std::result::Result<Bmp, String> + Send + Sync>) -> Option<Vec<Vec<Shape>>> {
+    let source = FrameSource { dur: count.max(1) as f64, fps: 0.0, pages: count.max(1), load: Arc::new(move |at| load(at as u32)) };
+    open(title, first, Mode::Redact, vec![], save_label, Some(source)).map(|e| e.output_pages())
 }
 
 /// Opens the editor and blocks, pumping messages, until saved or cancelled.
@@ -1070,7 +1150,7 @@ pub fn render(mode: Mode, bmp: Bmp, shapes: Vec<Shape>, sel: usize, video: Optio
         (Mode::Redact, true) => "Redact video",
         (Mode::Annotate, _) => "Annotate",
     };
-    let source = video.map(|dur| FrameSource { dur, fps: 30.0, load: Arc::new(|_| Err(String::new())) });
+    let source = video.map(|dur| FrameSource { dur, fps: 30.0, pages: 0, load: Arc::new(|_| Err(String::new())) });
     let mut e = Editor::new(title, bmp, mode, shapes, title, source);
     e.sub = "holiday.jpg".into();
     e.start_size = (1180.0, 720.0);

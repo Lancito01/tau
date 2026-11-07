@@ -166,9 +166,12 @@ impl Surface {
     }
 
     /// Push the bitmap to a layered window at screen position (x, y).
-    pub fn present(&self, hwnd: HWND, x: i32, y: i32) {
+    pub fn present(&self, hwnd: HWND, x: i32, y: i32) { self.present_alpha(hwnd, x, y, 255) }
+
+    /// Presents with the whole window faded by `alpha`.
+    pub fn present_alpha(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) {
         unsafe {
-            let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
+            let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: 1 };
             let pos = POINT { x, y };
             let size = SIZE { cx: self.w, cy: self.h };
             let src = POINT { x: 0, y: 0 };

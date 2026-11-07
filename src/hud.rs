@@ -17,6 +17,10 @@ const GAP: f32 = 8.0;
 const MAX_CARDS: usize = 4;
 const DONE_SECS: f32 = 3.5;
 const ERROR_SECS: f32 = 9.0;
+/// Opacity while the pointer is over a card, so what is behind it shows through.
+const HOVER_OPACITY: f32 = 0.22;
+/// How often the window re-asserts that it is topmost.
+const TOPMOST_EVERY: std::time::Duration = std::time::Duration::from_millis(400);
 
 static JOBS: Mutex<Vec<Arc<Job>>> = Mutex::new(Vec::new());
 static HWND_ADDR: AtomicIsize = AtomicIsize::new(0);
@@ -46,7 +50,7 @@ fn status(j: &Job) -> (String, u32) {
     }
     if let Some(n) = j.note.lock().unwrap().as_ref() { return (n.clone(), MUTED); }
     let name = j.last_output.lock().unwrap().as_ref().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
-    match name { Some(n) => (format!("Saved {n}. Click to show."), MUTED), None => ("Done".into(), MUTED) }
+    match name { Some(n) => (format!("Saved {n}"), MUTED), None => ("Done".into(), MUTED) }
 }
 
 fn prune() {
@@ -66,7 +70,7 @@ fn card_height(j: &Job) -> f32 {
     if failed(j) { ERROR_H } else if j.detail.lock().unwrap().is_some() { CARD_H + DETAIL_H } else { CARD_H }
 }
 
-struct Hud { shown: bool, preview: bool }
+struct Hud { shown: bool, preview: bool, topped: Option<std::time::Instant> }
 
 impl Page for Hud {
     fn size(&self) -> (f32, f32) {
@@ -87,6 +91,9 @@ impl Page for Hud {
         if !self.preview { prune(); }
         let jobs = snapshot();
         if !jobs.is_empty() { ui.want_anim = true; }
+        // Clicks fall through the cards to whatever is behind, except on the buttons.
+        ui.ghost = !self.preview;
+        let mut over_card = false;
         let mut y = 0.0;
         for j in &jobs {
             let finished = j.finished.load(Ordering::Relaxed);
@@ -98,19 +105,19 @@ impl Page for Hud {
 
             let key = Arc::as_ptr(j) as usize as u64;
             let hovered = q.has(ui.mouse);
+            over_card |= hovered;
             let x_q = r(q.right() - 36.0, q.y + 8.0, 26.0, 26.0);
-            let mut removed = false;
+            let output = if finished { j.last_output.lock().unwrap().clone() } else { None };
             if hovered && ui.icon_button(&format!("hud.x{key}"), glyph::CLOSE, x_q, 9.0, false) {
-                if finished { remove(j); removed = true; } else { j.cancel.store(true, Ordering::Relaxed); }
+                if finished { remove(j); } else { j.cancel.store(true, Ordering::Relaxed); }
             }
-            let (_, _, clicked) = ui.hit(key, q);
-            if clicked && finished && !removed {
-                if let Some(p) = j.last_output.lock().unwrap().clone() {
-                    crate::actions::reveal(&p);
+            if let Some(p) = &output {
+                let show_q = r(x_q.x - 30.0, x_q.y, 26.0, 26.0);
+                if hovered && ui.icon_button(&format!("hud.show{key}"), glyph::FOLDER, show_q, 11.0, false) {
+                    crate::actions::reveal(p);
                     remove(j);
                 }
             }
-            if hovered && finished && j.last_output.lock().unwrap().is_some() { ui.cursor = IDC_HAND; }
 
             // Progress ring, or the outcome once it is finished.
             let (cx, cy) = (q.x + 32.0, q.y + CARD_H / 2.0);
@@ -126,7 +133,7 @@ impl Page for Hud {
             }
 
             let tx = q.x + 58.0;
-            let tw = q.w - 58.0 - 40.0;
+            let tw = q.w - 58.0 - if output.is_some() { 70.0 } else { 40.0 };
             let (msg, col) = status(j);
             ui.text(&j.title, r(tx, q.y + 11.0, tw, 20.0), 13.0, 600, TEXT, Align::Left);
             if is_failed {
@@ -140,15 +147,24 @@ impl Page for Hud {
                 }
             }
         }
+        // Fade while the pointer rests on a card, but not on a button, so the button stays readable.
+        let target = if over_card && !ui.hot && !ui.down { HOVER_OPACITY } else { 1.0 };
+        ui.opacity = ui.anim(0x0FAC_17, target, 16.0);
     }
     fn after(&mut self) -> bool {
         let want = !JOBS.lock().unwrap().is_empty();
+        let h = HWND(HWND_ADDR.load(Ordering::Relaxed) as *mut _);
+        if h.is_invalid() { return false; }
         if want != self.shown {
             self.shown = want;
-            let h = HWND(HWND_ADDR.load(Ordering::Relaxed) as *mut _);
-            if !h.is_invalid() {
-                unsafe { let _ = ShowWindow(h, if want { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
-            }
+            self.topped = None;
+            unsafe { let _ = ShowWindow(h, if want { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
+        }
+        // WS_EX_TOPMOST alone loses to windows that push themselves forward (Explorer, other
+        // topmost windows), so keep putting the cards back on top while they are showing.
+        if want && self.topped.is_none_or(|t| t.elapsed() >= TOPMOST_EVERY) {
+            self.topped = Some(std::time::Instant::now());
+            unsafe { let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER); }
         }
         false
     }
@@ -156,7 +172,7 @@ impl Page for Hud {
 
 pub fn init() -> Result<()> {
     let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-    let hwnd = ui::open(Hud { shown: false, preview: false }, "Tau progress", POINT::default(), ex).ok_or_else(|| Error::new(E_FAIL, "Could not create the progress window"))?;
+    let hwnd = ui::open(Hud { shown: false, preview: false, topped: None }, "Tau progress", POINT::default(), ex).ok_or_else(|| Error::new(E_FAIL, "Could not create the progress window"))?;
     unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
     HWND_ADDR.store(hwnd.0 as isize, Ordering::Relaxed);
     Ok(())
@@ -168,7 +184,7 @@ pub fn render(out: &std::path::Path) -> std::result::Result<(), String> {
     let saved = Arc::new(Job { title: "Compressing".into(), total: 1, done: 1.into(), finished: true.into(), last_output: Mutex::new(Some("C:\\holiday compressed.jpg".into())), ..Default::default() });
     let bad = Arc::new(Job { title: "Rendering video".into(), total: 1, done: 1.into(), finished: true.into(), errors: Mutex::new(vec!["ffmpeg stopped: the input has no audio stream, so there is nothing to draw a waveform from.".into()]), ..Default::default() });
     { let mut j = JOBS.lock().unwrap(); j.push(running); j.push(saved); j.push(bad); }
-    let res = ui::render_png(&mut Hud { shown: true, preview: true }, 1.0, Some((200.0, 100.0)), out);
+    let res = ui::render_png(&mut Hud { shown: true, preview: true, topped: None }, 1.0, Some((200.0, 100.0)), out);
     JOBS.lock().unwrap().clear();
     res
 }

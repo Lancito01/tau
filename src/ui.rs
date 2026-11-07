@@ -41,6 +41,8 @@ pub mod glyph {
     pub const MAXIMIZE: u16 = 0xE922;
     pub const RESTORE: u16 = 0xE923;
     pub const CHEVRON: u16 = 0xE70D;
+    pub const PREV: u16 = 0xE76B;
+    pub const NEXT: u16 = 0xE76C;
     pub const FILE: u16 = 0xE8A5;
     pub const FOLDER: u16 = 0xE8B7;
     pub const PHOTO: u16 = 0xEB9F;
@@ -126,6 +128,13 @@ pub struct Ui {
     pub maximized: bool,
     pub cursor: PCWSTR,
     pub tooltip: Option<(String, (f32, f32))>,
+    /// Set by a page whose window lets clicks fall through to what is behind it, except on its
+    /// controls. The pointer is polled, since such a window gets no mouse messages.
+    pub ghost: bool,
+    /// Whether the pointer is over a control this frame.
+    pub hot: bool,
+    /// Whole-window opacity, 0 to 1.
+    pub opacity: f32,
 }
 
 impl Ui {
@@ -137,6 +146,7 @@ impl Ui {
             w: 0.0, h: 0.0, mouse: (-1000.0, -1000.0), down: false, pressed: false, released: false, rpressed: false, double: false, scroll: 0.0,
             keys: vec![], chars: vec![], active: 0, focus: 0, order: vec![], tab: 0, carets: HashMap::new(), bitmaps: HashMap::new(),
             popup: None, popup_result: None, want_anim: false, want_drag: false, want_max: false, maximized: false, cursor: IDC_ARROW, tooltip: None,
+            ghost: false, hot: false, opacity: 1.0,
         })
     }
 
@@ -317,6 +327,7 @@ impl Ui {
     pub fn hit(&mut self, key: u64, q: R) -> (bool, bool, bool) {
         let inside = q.has(self.mouse);
         let hover = inside && (self.active == 0 || self.active == key);
+        if hover { self.hot = true; }
         if hover && self.pressed { self.active = key; self.focus = 0; }
         let held = self.active == key && self.down;
         let clicked = self.released && self.active == key && inside;
@@ -591,6 +602,7 @@ impl Ui {
         self.want_anim = false;
         self.cursor = IDC_ARROW;
         self.tooltip = None;
+        self.hot = false;
         if self.tab != 0 && !self.order.is_empty() {
             let n = self.order.len() as i32;
             let i = self.order.iter().position(|k| *k == self.focus).map(|i| i as i32);
@@ -672,6 +684,8 @@ struct Host {
     modal: bool,
     restore: RECT,
     tracking: bool,
+    /// The window currently lets clicks through (WS_EX_TRANSPARENT).
+    through: bool,
 }
 
 fn card_bg(ui: &Ui, w: f32, h: f32, maximized: bool) {
@@ -721,6 +735,7 @@ impl Host {
     fn paint(&mut self) {
         if self.busy { return; }
         self.busy = true;
+        if self.ui.ghost && !self.ui.down { self.poll_mouse(); }
         let had_input = self.ui.pressed || self.ui.released || self.ui.rpressed || self.ui.double || !self.ui.keys.is_empty() || !self.ui.chars.is_empty() || self.ui.tab != 0;
         if !self.page.resizable() { self.size = self.page.size(); }
         self.pass();
@@ -734,12 +749,35 @@ impl Host {
             let mut wr = RECT::default();
             let _ = GetWindowRect(self.hwnd, &mut wr);
             let (x, y) = placed.map(|p| (p.x, p.y)).unwrap_or((wr.left, wr.top));
-            if let Some(s) = &self.surface { s.present(self.hwnd, x, y); }
+            let alpha = (self.ui.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+            if let Some(s) = &self.surface { s.present_alpha(self.hwnd, x, y, alpha); }
+            if self.ui.ghost { self.set_through(!self.ui.hot && !self.ui.down); }
             if self.ui.want_anim { SetTimer(Some(self.hwnd), 1, 16, None); } else { let _ = KillTimer(Some(self.hwnd), 1); }
         }
         self.after_frame();
         self.busy = false;
         if self.page.done() && !self.modal { unsafe { let _ = PostMessageW(Some(self.hwnd), WM_APP_DESTROY, WPARAM(0), LPARAM(0)); } }
+    }
+
+    /// Reads the pointer directly, for windows that clicks pass through.
+    fn poll_mouse(&mut self) {
+        unsafe {
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut wr);
+            let c = cursor_pos();
+            let m = margin(self);
+            self.ui.mouse = ((c.x - wr.left) as f32 / self.scale - m, (c.y - wr.top) as f32 / self.scale - m);
+        }
+    }
+
+    fn set_through(&mut self, on: bool) {
+        if on == self.through { return; }
+        self.through = on;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let t = WS_EX_TRANSPARENT.0 as isize;
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, if on { ex | t } else { ex & !t });
+        }
     }
 
     fn repaint_nested(&mut self) {
@@ -935,7 +973,7 @@ fn create(page: Box<dyn Page>, title: &str, at: Option<POINT>, ex: WINDOW_EX_STY
         let target = at.unwrap_or(cursor_pos());
         let scale = dpi_scale_at(target);
         let size = page.size();
-        let host = Box::new(Host { hwnd, ui: Ui::new().ok()?, page, surface: None, scale, size, busy: false, modal, restore: RECT::default(), tracking: false });
+        let host = Box::new(Host { hwnd, ui: Ui::new().ok()?, page, surface: None, scale, size, busy: false, modal, restore: RECT::default(), tracking: false, through: false });
         let raw = Box::into_raw(host);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
         let h = &mut *raw;
