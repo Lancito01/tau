@@ -59,7 +59,30 @@ pub fn run(target: &str, paths: Vec<PathBuf>) -> Arc<Job> {
             atomically(&out, |tmp| crate::pdf::images_to_pdf(j, ps, tmp))
         });
     }
-    spawn(title, paths, move |j, p: &PathBuf| one(j, p, &t))
+    // Files whose outputs could compete for a name go one at a time, so each still gets the name it always would.
+    let workers = if names_may_clash(&paths) { 1 } else { workers_for(dominant(&paths), &t) };
+    spawn_with(title, paths, workers, move |j, p: &PathBuf| one(j, p, &t))
+}
+
+/// True when two files in one folder share a name, or one name is another's with " (n)" added, as "photo.jpg" and
+/// "photo.png" or "photo (2).jpg" are. Their outputs are numbered in the order they are made.
+fn names_may_clash(paths: &[PathBuf]) -> bool {
+    let key = |p: &PathBuf| (p.parent().map(Path::to_path_buf), p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default());
+    let keys: Vec<_> = paths.iter().map(key).collect();
+    keys.iter().enumerate().any(|(i, (d, a))| keys.iter().skip(i + 1).any(|(e, b)| d == e && (a == b || a.starts_with(&format!("{b} (")) || b.starts_with(&format!("{a} (")))))
+}
+
+/// How many files of a batch convert at once. Pictures, sound and text each keep about one core busy, so several run
+/// side by side. Video already uses every core. Office, Edge and PDF rendering stay one at a time, as they are driven
+/// through one application.
+fn workers_for(cat: Cat, target: &str) -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    match cat {
+        Cat::Video if target == "gif" => 1,
+        Cat::Image | Cat::Audio | Cat::Sub => cores.min(6),
+        Cat::Video | Cat::Archive => 2.min(cores),
+        _ => 1,
+    }
 }
 
 #[cfg(test)]
@@ -69,5 +92,13 @@ mod tests {
     fn mixed_selection_keeps_the_dominant_type() {
         let v = vec![PathBuf::from("a.jpg"), PathBuf::from("b.png"), PathBuf::from("c.pdf")];
         assert_eq!(matching(v), vec![PathBuf::from("a.jpg"), PathBuf::from("b.png")]);
+    }
+    #[test]
+    fn files_that_could_share_an_output_name_are_noticed() {
+        let p = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert!(names_may_clash(&p(&["d/photo.jpg", "d/Photo.png"])));
+        assert!(names_may_clash(&p(&["d/photo.jpg", "d/photo (2).png"])));
+        assert!(!names_may_clash(&p(&["d/photo.jpg", "e/photo.png"])));
+        assert!(!names_may_clash(&p(&["d/a.jpg", "d/b.jpg", "d/ab.jpg"])));
     }
 }

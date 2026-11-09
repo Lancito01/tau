@@ -112,13 +112,21 @@ struct Viewport {
     load: FrameLoader,
     /// The frame on screen, and the time it is from.
     shown: Option<(i64, f64)>,
-    /// A frame is being fetched.
-    loading: Option<i64>,
-    slot: Arc<Mutex<Option<(i64, f64, Result<Bmp, String>)>>>,
+    /// When the frame on screen was asked for, counted in requests.
+    shown_seq: u64,
+    seq: u64,
+    /// Frames being fetched.
+    loading: Vec<i64>,
+    /// Finished fetches: frame, time, request number, picture.
+    slot: Arc<Mutex<Vec<(i64, f64, u64, Result<Bmp, String>)>>>,
     frames: HashMap<i64, Bmp>,
     order: Vec<i64>,
-    failed: bool,
+    /// The frame that could not be read.
+    failed: Option<i64>,
 }
+
+/// Frames fetched side by side while the pointer moves.
+const LOADS_AT_ONCE: usize = 3;
 
 /// What the viewport is showing and why.
 struct Focus { t: f64, label: String }
@@ -145,7 +153,7 @@ struct Timeline {
 impl Timeline {
     fn new(title: &str, sub: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok: &str, load: Option<FrameLoader>) -> Timeline {
         let marks = if mode == Mode::Range { vec![0.0, dur] } else { vec![] };
-        let view = load.map(|load| Viewport { load, shown: None, loading: None, slot: Arc::new(Mutex::new(None)), frames: HashMap::new(), order: vec![], failed: false });
+        let view = load.map(|load| Viewport { load, shown: None, shown_seq: 0, seq: 0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), frames: HashMap::new(), order: vec![], failed: None });
         // A small screen gets a smaller viewport, not a window that runs off it.
         let at = cursor_pos();
         let wa = work_area_at(at);
@@ -232,37 +240,45 @@ impl Timeline {
         let want = index(focus.t);
         let Some(v) = self.view.as_mut() else { return };
 
-        if let Some((n, t, res)) = v.slot.lock().unwrap().take() {
-            v.loading = None;
+        let arrived: Vec<_> = std::mem::take(&mut *v.slot.lock().unwrap());
+        for (n, t, seq, res) in arrived {
+            v.loading.retain(|l| *l != n);
             match res {
                 Ok(b) => {
-                    v.failed = false;
-                    if v.order.len() >= CACHE_FRAMES {
-                        let old = v.order.remove(0);
-                        v.frames.remove(&old);
-                        ui.forget_image(id(&format!("tl.view{old}")));
+                    if v.failed == Some(n) { v.failed = None; }
+                    if !v.frames.contains_key(&n) {
+                        if v.order.len() >= CACHE_FRAMES {
+                            let old = v.order.remove(0);
+                            v.frames.remove(&old);
+                            ui.forget_image(id(&format!("tl.view{old}")));
+                        }
+                        v.frames.insert(n, b);
+                        v.order.push(n);
                     }
-                    v.frames.insert(n, b);
-                    v.order.push(n);
-                    v.shown = Some((n, t));
+                    // Loads can finish out of order. An older one must not replace a newer picture.
+                    if seq > v.shown_seq || n == want { v.shown = Some((n, t)); v.shown_seq = seq; }
                 }
-                Err(_) => v.failed = n == want,
+                Err(_) => v.failed = Some(n),
             }
         }
         if v.frames.contains_key(&want) {
             let t = if want == v.shown.map(|s| s.0).unwrap_or(i64::MIN) { v.shown.map(|s| s.1).unwrap_or(focus.t) } else { focus.t };
             v.shown = Some((want, t));
-            v.failed = false;
-        } else if v.loading.is_none() && !v.failed {
-            v.loading = Some(want);
-            let (load, slot, t) = (v.load.clone(), v.slot.clone(), focus.t);
+            v.seq += 1;
+            v.shown_seq = v.seq;
+        } else if !v.loading.contains(&want) && v.loading.len() < LOADS_AT_ONCE && v.failed != Some(want) {
+            // Starting ffmpeg takes most of a load, so the newest position starts at once instead of waiting for one
+            // the pointer has already left.
+            v.loading.push(want);
+            v.seq += 1;
+            let (load, slot, t, seq) = (v.load.clone(), v.slot.clone(), focus.t, v.seq);
             std::thread::spawn(move || {
                 crate::job::com_init();
                 let res = load(t);
-                *slot.lock().unwrap() = Some((want, t, res));
+                slot.lock().unwrap().push((want, t, seq, res));
             });
         }
-        let waiting = v.loading.is_some();
+        let waiting = !v.loading.is_empty();
         if waiting { ui.want_anim = true; }
 
         ui.fill(q, 10.0, 0x0A0B0C, 1.0);
@@ -273,10 +289,10 @@ impl Timeline {
             let (w, h) = (b.w as f32 * s, b.h as f32 * s);
             pic = r(q.x + (q.w - w) / 2.0, q.y + (q.h - h) / 2.0, w, h);
             ui.image(id(&format!("tl.view{n}")), b, pic);
-        } else if !v.failed {
+        } else if v.failed != Some(want) {
             ui.text("Loading frame", q, 12.5, 400, FAINT, Align::Center);
         }
-        if v.failed { ui.text("Could not read this frame", q, 12.5, 400, FAINT, Align::Center); }
+        if v.failed == Some(want) { ui.text("Could not read this frame", q, 12.5, 400, FAINT, Align::Center); }
 
         // A picture still on its way must not pass for the one asked for: the label says what is really on screen.
         let on_screen = v.shown.map(|s| s.0) == Some(want);

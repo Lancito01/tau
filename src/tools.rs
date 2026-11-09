@@ -72,7 +72,9 @@ fn still_exactly(input: &Path, t: f64, filter: Option<&str>) -> Result<Bmp, Stri
     let png = tmp.file("f.png");
     let vf = filter.map(|f| vec!["-vf".to_string(), f.to_string()]).unwrap_or_default();
     let (before, after) = quality::still_seek(&ext_of(input), t);
-    run(None, &ff, &sv(&["-y", "-hide_banner"]).into_iter().chain(before).chain(sv(&["-i", &input.display().to_string()])).chain(after).chain(vf).chain(sv(&["-frames:v", "1", &png.display().to_string()])).collect::<Vec<_>>(), None)?;
+    // The PNG only carries the picture across and is read straight back, so it is stored uncompressed: the same pixels,
+    // without the time it takes to compress a large frame.
+    run(None, &ff, &sv(&["-y", "-hide_banner"]).into_iter().chain(before).chain(sv(&["-i", &input.display().to_string()])).chain(after).chain(vf).chain(sv(&["-frames:v", "1", "-compression_level", "0", &png.display().to_string()])).collect::<Vec<_>>(), None)?;
     image::load(&png)
 }
 
@@ -92,9 +94,17 @@ fn strip(input: &Path, dur: f64) -> Result<Bmp, String> {
         return Ok(b);
     }
     let mut out = Bmp::new(STRIP_FRAMES * 160, 90, [0x12, 0x10, 0x0F, 255]);
-    for i in 0..STRIP_FRAMES {
-        let at = dur * (i as f64 + 0.5) / STRIP_FRAMES as f64;
-        if let Ok(f) = frame_at(input, at).and_then(|f| f.scaled(160, 90)) { out.blit(&f, (i * 160) as i32, 0); }
+    // Each frame is its own ffmpeg, so they are fetched side by side rather than one after another.
+    let tiles: Vec<Option<Bmp>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..STRIP_FRAMES).map(|i| sc.spawn(move || {
+            com_init();
+            let at = dur * (i as f64 + 0.5) / STRIP_FRAMES as f64;
+            frame_at(input, at).and_then(|f| f.scaled(160, 90)).ok()
+        })).collect();
+        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+    for (i, f) in tiles.iter().enumerate() {
+        if let Some(f) = f { out.blit(f, (i as u32 * 160) as i32, 0); }
     }
     Ok(out)
 }
@@ -107,10 +117,10 @@ fn frame_rate(p: &Path) -> f64 {
 fn pick_times(title: &str, input: &Path, mode: timeline::Mode, ok: &str) -> Option<Vec<f64>> {
     let p = input.to_path_buf();
     let r = pump_job("Reading file", move |_| {
-        let dur = media::duration(&p);
+        let pr = media::probe(&p);
+        let dur = pr.duration;
         if dur <= 0.0 { return Err("Could not read the length of this file".to_string()); }
-        let video = media::probe(&p).video;
-        Ok((dur, video, strip(&p, dur).ok()))
+        Ok((dur, pr.video, strip(&p, dur).ok()))
     });
     let (dur, video, st) = match r { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
     let fps = video.as_ref().map(|v| v.fps).unwrap_or(0.0);
@@ -261,12 +271,15 @@ fn video_spec(input: &Path) -> Result<preview::Spec, String> {
         let starts = if dur > len * 3.0 { vec![dur * 0.3, dur * 0.7] } else { vec![0.0] };
         let args = quality::compress_video_args(&probe, &squeeze_of(values));
         let tmp = TempDir::new()?;
-        let mut bytes = 0u64;
-        for (i, start) in starts.iter().enumerate() {
-            let out = tmp.file(&format!("s{i}.mp4"));
-            encode_sample(&p, &args, *start, len, &out)?;
-            bytes += file_size(&out);
-        }
+        // The samples are separate encodes, so they run side by side.
+        let sizes: Vec<Result<u64, String>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = starts.iter().enumerate().map(|(i, start)| {
+                let (p, args, out) = (&p, &args, tmp.file(&format!("s{i}.mp4")));
+                sc.spawn(move || { encode_sample(p, args, *start, len, &out)?; Ok(file_size(&out)) })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("Could not measure".into()))).collect()
+        });
+        let bytes = sizes.into_iter().sum::<Result<u64, String>>()?;
         Ok((bytes as f64 / (starts.len() as f64 * len) * dur) as u64)
     });
     Ok(preview::Spec {

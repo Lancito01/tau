@@ -98,11 +98,13 @@ struct Shared {
     want: Mutex<(Vec<i32>, f64)>,
     sizes: Mutex<HashMap<Vec<i32>, Result<u64, String>>>,
     pictures: Mutex<HashMap<Key, Arc<Result<Bmp, String>>>>,
+    /// Levels whose size a worker is working out.
+    measuring: Mutex<Vec<Vec<i32>>>,
 }
 
 impl Shared {
     fn new() -> Arc<Shared> {
-        Arc::new(Shared { alive: AtomicBool::new(true), want: Mutex::new((vec![], 0.0)), sizes: Mutex::new(HashMap::new()), pictures: Mutex::new(HashMap::new()) })
+        Arc::new(Shared { alive: AtomicBool::new(true), want: Mutex::new((vec![], 0.0)), sizes: Mutex::new(HashMap::new()), pictures: Mutex::new(HashMap::new()), measuring: Mutex::new(vec![]) })
     }
     fn picture(&self, k: &Key) -> Option<Arc<Result<Bmp, String>>> { self.pictures.lock().unwrap().get(k).cloned() }
     fn size(&self, v: &[i32]) -> Option<Result<u64, String>> { self.sizes.lock().unwrap().get(v).cloned() }
@@ -113,31 +115,55 @@ impl Shared {
     }
 }
 
-/// Sizes first for what is being looked at, then for every level, so the dropdown fills in by itself.
+/// Size estimates worked out side by side. Each is a few short encodes, mostly spent starting ffmpeg.
+const SIZE_WORKERS: usize = 3;
+
+/// Sizes first for what is being looked at, then for every level, so the dropdown fills in by itself. Several of these
+/// run at once; each takes a level no other is working on.
 fn size_worker(shared: Arc<Shared>, size: Size, presets: Vec<Vec<i32>>) {
     crate::job::com_init();
     while shared.alive.load(Ordering::SeqCst) {
         let current = shared.want.lock().unwrap().0.clone();
-        let next = std::iter::once(current).chain(presets.iter().cloned()).find(|v| !v.is_empty() && shared.size(v).is_none());
+        let next = {
+            let mut busy = shared.measuring.lock().unwrap();
+            let v = std::iter::once(current).chain(presets.iter().cloned()).find(|v| !v.is_empty() && shared.size(v).is_none() && !busy.contains(v));
+            if let Some(v) = &v { busy.push(v.clone()); }
+            v
+        };
         match next {
-            Some(v) => { let res = size(&v); shared.sizes.lock().unwrap().insert(v, res); }
+            Some(v) => {
+                let res = size(&v);
+                shared.sizes.lock().unwrap().insert(v.clone(), res);
+                shared.measuring.lock().unwrap().retain(|b| *b != v);
+            }
             None => std::thread::sleep(std::time::Duration::from_millis(40)),
         }
     }
 }
 
-/// The moment being looked at. The original comes first because it takes no encoding, so scrubbing keeps up even
-/// while the compressed frame is still being made.
+/// The moment being looked at, as it is. It takes no encoding, so scrubbing keeps up even while the compressed frame
+/// is still being made by `compressed_worker`.
 fn picture_worker(shared: Arc<Shared>, picture: Picture) {
     crate::job::com_init();
     while shared.alive.load(Ordering::SeqCst) {
-        let (values, t) = shared.want.lock().unwrap().clone();
+        let t = shared.want.lock().unwrap().1;
         let original = key_of(&[], t);
-        let wanted = key_of(&values, t);
         if shared.picture(&original).is_none() {
             let res = picture(None, t);
             shared.store_picture(original, res);
-        } else if !values.is_empty() && shared.picture(&wanted).is_none() {
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+}
+
+/// The moment being looked at, compressed at the level in use. Runs beside `picture_worker`, so neither waits on the other.
+fn compressed_worker(shared: Arc<Shared>, picture: Picture) {
+    crate::job::com_init();
+    while shared.alive.load(Ordering::SeqCst) {
+        let (values, t) = shared.want.lock().unwrap().clone();
+        let wanted = key_of(&values, t);
+        if !values.is_empty() && shared.picture(&wanted).is_none() {
             let res = picture(Some(&values), t);
             shared.store_picture(wanted, res);
         } else {
@@ -187,10 +213,14 @@ impl Preview {
         if self.started { return; }
         self.started = true;
         let presets: Vec<Vec<i32>> = self.spec.presets.iter().map(|p| p.values.clone()).collect();
-        let (a, size) = (self.shared.clone(), self.spec.size.clone());
-        std::thread::spawn(move || size_worker(a, size, presets));
+        for _ in 0..SIZE_WORKERS {
+            let (a, size, presets) = (self.shared.clone(), self.spec.size.clone(), presets.clone());
+            std::thread::spawn(move || size_worker(a, size, presets));
+        }
         let (b, picture) = (self.shared.clone(), self.spec.picture.clone());
         std::thread::spawn(move || picture_worker(b, picture));
+        let (c, picture) = (self.shared.clone(), self.spec.picture.clone());
+        std::thread::spawn(move || compressed_worker(c, picture));
     }
 
     /// Custom starts from the level that was showing, so it is a step away from something the user has already judged.

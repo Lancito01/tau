@@ -226,9 +226,139 @@ pub fn redact(b: &[u8], marks: &[Mark]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A GIF split into its header and its frames, each frame with the extensions in front of it.
+struct Parsed<'a> {
+    /// Signature, screen descriptor and global colour table.
+    head: &'a [u8],
+    global: &'a [u8],
+    frames: Vec<Frame<'a>>,
+}
+
+struct Frame<'a> {
+    /// Extensions before the image, each whole, with its label.
+    exts: Vec<(u8, &'a [u8])>,
+    /// Image descriptor, then the local colour table if there is one.
+    desc: &'a [u8],
+    /// Code size byte and the image data's sub-blocks, terminator included.
+    data: &'a [u8],
+}
+
+fn parse(b: &[u8]) -> Result<Parsed<'_>, String> {
+    screen_size(b).ok_or("Not a GIF")?;
+    let flags = *b.get(10).ok_or("GIF ends early")?;
+    let mut i = 13;
+    let gstart = i;
+    if flags & 0x80 != 0 { i += 3usize << ((flags & 7) + 1); }
+    let global = b.get(gstart..i).ok_or("GIF ends early")?;
+    let head = &b[..i];
+    let (mut frames, mut exts) = (vec![], vec![]);
+    loop {
+        match b.get(i) {
+            None | Some(0x3B) => break,
+            Some(0x21) => {
+                let label = *b.get(i + 1).ok_or("GIF ends early")?;
+                let (_, end) = read_blocks(b, i + 2)?;
+                exts.push((label, &b[i..end]));
+                i = end;
+            }
+            Some(0x2C) => {
+                let d = b.get(i..i + 10).ok_or("GIF ends early")?;
+                let mut j = i + 10;
+                if d[9] & 0x80 != 0 { j += 3usize << ((d[9] & 7) + 1); }
+                let desc = b.get(i..j).ok_or("GIF ends early")?;
+                let (_, end) = read_blocks(b, j + 1)?;
+                frames.push(Frame { exts: std::mem::take(&mut exts), desc, data: &b[j..end] });
+                i = end;
+            }
+            Some(0x00) => i += 1,
+            Some(_) => break,
+        }
+    }
+    Ok(Parsed { head, global, frames })
+}
+
+/// Joins GIFs that are consecutive parts of one encode, as `quality::gif_part_args` makes them, into what a single pass
+/// would show: the same pictures with the same delays. Every part but the last ends with one frame too many, the first
+/// of the next part, and that frame is dropped. The header and loop count come from the first part. A frame that used its
+/// own part's global colour table gets that table as a local one, since the first part's global table may differ.
+pub fn splice(parts: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let parsed = parts.iter().map(|p| parse(p)).collect::<Result<Vec<_>, _>>()?;
+    let first = parsed.first().ok_or("Nothing to join")?;
+    let mut out = first.head.to_vec();
+    let last = parsed.len() - 1;
+    for (k, p) in parsed.iter().enumerate() {
+        let keep = if k < last { p.frames.len().checked_sub(1).ok_or("A part of the GIF came out empty")? } else { p.frames.len() };
+        let same_global = p.global == first.global;
+        let gflags = p.head[10];
+        for (n, f) in p.frames[..keep].iter().enumerate() {
+            for (label, e) in &f.exts {
+                // The loop count and anything else ahead of a later part's first picture belong to that file, not the frame.
+                if k > 0 && n == 0 && *label != 0xF9 { continue; }
+                out.extend_from_slice(e);
+            }
+            let has_local = f.desc[9] & 0x80 != 0;
+            if k == 0 || has_local || same_global {
+                out.extend_from_slice(f.desc);
+            } else {
+                if p.global.is_empty() { return Err("A GIF frame has no colour table".into()); }
+                out.extend_from_slice(&f.desc[..9]);
+                // Keep the interlace bit, and carry the table's size and sort flag over from the screen descriptor.
+                out.push(0x80 | (f.desc[9] & 0x40) | if gflags & 0x08 != 0 { 0x20 } else { 0 } | (gflags & 7));
+                out.extend_from_slice(p.global);
+            }
+            out.extend_from_slice(f.data);
+        }
+    }
+    out.push(0x3B);
+    Ok(out)
+}
+
+/// The number of pictures in a GIF.
+pub fn frame_count(b: &[u8]) -> Result<usize, String> { Ok(parse(b)?.frames.len()) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-pixel-high GIF with a global table of `g` and one frame per entry of `frames`: (local table, delay, index).
+    fn make(g: &[u8], frames: &[(Option<&[u8]>, u8, u8)], loop_ext: bool) -> Vec<u8> {
+        let mut b = b"GIF89a\x01\x00\x01\x00".to_vec();
+        b.extend_from_slice(&[0xF0, 0, 0]);
+        b.extend_from_slice(g);
+        if loop_ext { b.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00"); }
+        for (local, delay, px) in frames {
+            b.extend_from_slice(&[0x21, 0xF9, 4, 0, *delay, 0, 0, 0]);
+            b.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0]);
+            match local { Some(t) => { b.push(0x80); b.extend_from_slice(t); } None => b.push(0) }
+            b.push(2);
+            write_blocks(&mut b, &lzw_encode(&[*px], 2));
+        }
+        b.push(0x3B);
+        b
+    }
+
+    #[test]
+    fn splice_drops_the_overlap_and_keeps_each_frames_colours() {
+        let (ga, gb) = ([0u8, 0, 0, 255, 255, 255], [9u8, 9, 9, 7, 7, 7]);
+        let a = make(&ga, &[(None, 3, 0), (None, 4, 1), (Some(&[1, 2, 3, 4, 5, 6]), 9, 1)], true);
+        let b = make(&gb, &[(Some(&[1, 2, 3, 4, 5, 6]), 3, 1), (None, 3, 0)], true);
+        let s = splice(&[a.clone(), b]).unwrap();
+        let p = parse(&s).unwrap();
+        assert_eq!(p.head, parse(&a).unwrap().head);
+        assert_eq!(p.frames.len(), 4, "the first part's extra frame is dropped");
+        assert_eq!(p.frames.iter().map(|f| f.exts.iter().find(|e| e.0 == 0xF9).unwrap().1[4]).collect::<Vec<_>>(), vec![3, 4, 3, 3]);
+        assert_eq!(p.frames.iter().map(|f| f.exts.iter().filter(|e| e.0 == 0xFF).count()).sum::<usize>(), 1, "one loop count");
+        assert_eq!(p.frames[2].desc[10..], [1, 2, 3, 4, 5, 6]);
+        assert_eq!(p.frames[3].desc[9] & 0x87, 0x80, "the second part's global table travels with its frame");
+        assert_eq!(&p.frames[3].desc[10..], &gb);
+        assert_eq!(p.frames[3].data, parse(&make(&gb, &[(None, 3, 0)], false)).unwrap().frames[0].data);
+    }
+
+    #[test]
+    fn splice_of_one_part_is_that_part() {
+        let a = make(&[0, 0, 0, 255, 255, 255], &[(None, 3, 0), (None, 4, 1)], true);
+        assert_eq!(splice(&[a.clone()]).unwrap(), a);
+    }
 
     #[test]
     fn lzw_round_trips_every_pattern() {
