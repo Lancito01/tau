@@ -271,12 +271,15 @@ fn video_spec(input: &Path) -> Result<preview::Spec, String> {
         let starts = if dur > len * 3.0 { vec![dur * 0.3, dur * 0.7] } else { vec![0.0] };
         let args = quality::compress_video_args(&probe, &squeeze_of(values));
         let tmp = TempDir::new()?;
-        let mut bytes = 0u64;
-        for (i, start) in starts.iter().enumerate() {
-            let out = tmp.file(&format!("s{i}.mp4"));
-            encode_sample(&p, &args, *start, len, &out)?;
-            bytes += file_size(&out);
-        }
+        // The samples are separate encodes, so they run side by side.
+        let sizes: Vec<Result<u64, String>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = starts.iter().enumerate().map(|(i, start)| {
+                let (p, args, out) = (&p, &args, tmp.file(&format!("s{i}.mp4")));
+                sc.spawn(move || { encode_sample(p, args, *start, len, &out)?; Ok(file_size(&out)) })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("Could not measure".into()))).collect()
+        });
+        let bytes = sizes.into_iter().sum::<Result<u64, String>>()?;
         Ok((bytes as f64 / (starts.len() as f64 * len) * dur) as u64)
     });
     Ok(preview::Spec {

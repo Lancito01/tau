@@ -23,6 +23,8 @@ pub struct Job {
     pub note: Mutex<Option<String>>,
     /// What the format being written cannot hold, shown on the card while it works.
     pub detail: Mutex<Option<String>>,
+    /// Several items run at once.
+    pub parallel: bool,
 }
 
 impl Job {
@@ -30,7 +32,8 @@ impl Job {
     pub fn set_frac(&self, f: f32) { *self.frac.lock().unwrap() = f.clamp(0.0, 1.0); }
     pub fn progress(&self) -> f32 {
         if self.total == 0 { return 0.0; }
-        (self.done.load(Ordering::Relaxed) as f32 + *self.frac.lock().unwrap()) / self.total as f32
+        let frac = if self.parallel { 0.0 } else { *self.frac.lock().unwrap() };
+        (self.done.load(Ordering::Relaxed) as f32 + frac) / self.total as f32
     }
 }
 
@@ -57,6 +60,44 @@ where T: Send + 'static, F: Fn(&Job, &T) -> Result<PathBuf, String> + Send + 'st
     job
 }
 
+/// Batches running several items at once. While any does, output names are reserved as they are picked, so two items
+/// can never be given the same new name.
+static PARALLEL: AtomicUsize = AtomicUsize::new(0);
+static RESERVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Like `spawn`, with up to `workers` items at a time. Each item's result is what it would be on its own; only the order
+/// they finish in can differ. The card then counts whole items, since each has its own progress.
+pub fn spawn_with<T, F>(title: String, items: Vec<T>, workers: usize, work: F) -> Arc<Job>
+where T: Send + Sync + 'static, F: Fn(&Job, &T) -> Result<PathBuf, String> + Send + Sync + 'static {
+    let workers = workers.clamp(1, items.len().max(1));
+    if workers == 1 { return spawn(title, items, work); }
+    let job = Arc::new(Job { title, total: items.len(), parallel: true, ..Default::default() });
+    crate::hud::add(job.clone());
+    let j = job.clone();
+    PARALLEL.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let next = AtomicUsize::new(0);
+        let one = || {
+            com_init();
+            loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(it) = items.get(i) else { break };
+                if j.cancelled() { break; }
+                match work(&j, it) {
+                    Ok(p) => { *j.last_output.lock().unwrap() = Some(p); }
+                    Err(e) => { if !j.cancelled() { j.errors.lock().unwrap().push(e); } }
+                }
+                j.done.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        std::thread::scope(|sc| { for _ in 0..workers { sc.spawn(one); } });
+        if PARALLEL.fetch_sub(1, Ordering::SeqCst) == 1 { RESERVED.lock().unwrap().clear(); }
+        *j.finished_at.lock().unwrap() = Some(std::time::Instant::now());
+        j.finished.store(true, Ordering::Relaxed);
+    });
+    job
+}
+
 pub fn com_init() {
     use windows::Win32::System::Com::*;
     unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
@@ -65,9 +106,12 @@ pub fn com_init() {
 /// `<dir>/<stem>.<ext>`, or `<stem> (2).<ext>` and so on. Never an existing file.
 pub fn unique(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let dot = if ext.is_empty() { String::new() } else { format!(".{ext}") };
+    let mut reserved = (PARALLEL.load(Ordering::SeqCst) > 0).then(|| RESERVED.lock().unwrap());
+    let free = |p: &PathBuf| !p.exists() && !reserved.as_ref().is_some_and(|r| r.contains(p));
     let first = dir.join(format!("{stem}{dot}"));
-    if !first.exists() { return first; }
-    (2..).map(|n| dir.join(format!("{stem} ({n}){dot}"))).find(|p| !p.exists()).unwrap()
+    let p = if free(&first) { first } else { (2..).map(|n| dir.join(format!("{stem} ({n}){dot}"))).find(free).unwrap() };
+    if let Some(r) = reserved.as_mut() { r.push(p.clone()); }
+    p
 }
 
 pub fn sibling(input: &Path, suffix: &str, ext: &str) -> PathBuf {
@@ -191,6 +235,15 @@ mod tests {
         std::fs::write(&a, b"x").unwrap();
         let b = unique(&t.0, "a", "png");
         assert_eq!(b.file_name().unwrap(), "a (2).png");
+    }
+    #[test]
+    fn items_running_at_once_never_share_a_name() {
+        let t = TempDir::new().unwrap();
+        PARALLEL.fetch_add(1, Ordering::SeqCst);
+        let (a, b) = (unique(&t.0, "a", "webp"), unique(&t.0, "a", "webp"));
+        PARALLEL.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(a.file_name().unwrap(), "a.webp");
+        assert_eq!(b.file_name().unwrap(), "a (2).webp");
     }
     #[test]
     fn atomically_removes_partial_on_failure() {

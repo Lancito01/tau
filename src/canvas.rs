@@ -315,14 +315,29 @@ pub struct FrameSource {
 #[derive(Default)]
 struct PageState { items: Vec<Item>, undo: Vec<Vec<Item>>, redo: Vec<Vec<Item>> }
 
+/// A fetched frame or page, already shrunk for the screen, with its full size.
+type Fetched = std::result::Result<(Bmp, (u32, u32)), String>;
+
 struct Scrub {
     source: FrameSource,
     pos: f32,
+    /// The position of the newest request.
     requested: f32,
-    loading: bool,
-    slot: Arc<Mutex<Option<std::result::Result<Bmp, String>>>>,
+    /// Times or pages being fetched.
+    loading: Vec<f64>,
+    /// Finished fetches: slider position, time or page, request number, picture.
+    slot: Arc<Mutex<Vec<(f32, f64, u64, Fetched)>>>,
+    seq: u64,
+    /// The request number of the picture on screen, so a slow older fetch cannot replace a newer one.
+    shown_seq: u64,
+    /// Recent video frames by position, newest last, so going back to one is instant.
+    cache: Vec<(f64, Bmp)>,
     error: Option<String>,
 }
+
+/// Video frames fetched side by side while the slider moves. Pages go one at a time, since their marks follow them.
+const SCRUB_LOADS: usize = 3;
+const SCRUB_CACHE: usize = 24;
 
 #[derive(Clone, PartialEq)]
 struct Item { shape: Shape, detected: bool }
@@ -403,7 +418,7 @@ impl Editor {
         let (wa, s) = (work_area_at(at), dpi_scale_at(at));
         let start_size = (((wa.right - wa.left) as f32 / s * 0.75).max(900.0), ((wa.bottom - wa.top) as f32 / s * 0.75).max(600.0));
         let pages = scrub.as_ref().map(|f| (0..f.pages).map(|_| PageState::default()).collect()).unwrap_or_default();
-        let scrub = scrub.filter(|f| f.dur > 0.0).map(|source| Scrub { source, pos: 0.0, requested: 0.0, loading: false, slot: Arc::new(Mutex::new(None)), error: None });
+        let scrub = scrub.filter(|f| f.dur > 0.0).map(|source| Scrub { source, pos: 0.0, requested: 0.0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), seq: 0, shown_seq: 0, cache: vec![], error: None });
         Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
@@ -979,42 +994,68 @@ impl Editor {
             ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
         }
 
-        if let Some(res) = sc.slot.lock().unwrap().take() {
-            sc.loading = false;
+        let arrived: Vec<_> = std::mem::take(&mut *sc.slot.lock().unwrap());
+        for (pos, at, seq, res) in arrived {
+            sc.loading.retain(|l| *l != at);
             match res {
-                Ok(b) => {
+                Ok((b, full)) => {
+                    if !paged && !sc.cache.iter().any(|(t, _)| *t == at) {
+                        if sc.cache.len() >= SCRUB_CACHE { sc.cache.remove(0); }
+                        sc.cache.push((at, b.clone()));
+                    }
+                    // Fetches can finish out of order. An older one must not replace a newer picture.
+                    if seq <= sc.shown_seq { continue; }
+                    sc.shown_seq = seq;
                     sc.error = None;
                     if paged {
                         // The marks follow the page they were drawn on.
-                        let to = (sc.requested as usize).min(self.pages.len() - 1);
+                        let to = (pos as usize).min(self.pages.len() - 1);
                         if to != self.page {
                             self.pages[self.page] = PageState { items: std::mem::take(&mut self.items), undo: std::mem::take(&mut self.undo), redo: std::mem::take(&mut self.redo) };
                             let next = std::mem::take(&mut self.pages[to]);
                             (self.items, self.undo, self.redo, self.page) = (next.items, next.undo, next.redo, to);
                             (self.sel, self.drag, self.before, self.list_sel) = (None, None, None, None);
                         }
-                        self.full = (b.w, b.h);
+                        self.full = full;
                     }
-                    self.preview = shrink(b, self.mode);
+                    self.preview = b;
                     self.shown_for = None;
                     self.scratch.clear();
                     ui.forget_image(id("ed.image"));
                 }
-                Err(e) => sc.error = Some(e),
+                Err(e) => if seq == sc.seq { sc.error = Some(e) },
             }
         }
-        if !sc.loading && sc.pos != sc.requested {
-            sc.requested = sc.pos;
-            sc.loading = true;
+        if sc.pos != sc.requested {
             let at = if paged { sc.pos as f64 } else { snap((sc.pos / 1000.0) as f64 * sc.source.dur, fps) };
-            let (load, slot) = (sc.source.load.clone(), sc.slot.clone());
-            std::thread::spawn(move || {
-                crate::job::com_init();
-                let res = load(at);
-                *slot.lock().unwrap() = Some(res);
-            });
+            let cached = if paged { None } else { sc.cache.iter().find(|(t, _)| *t == at).map(|(_, b)| b.clone()) };
+            if let Some(b) = cached {
+                sc.requested = sc.pos;
+                sc.seq += 1;
+                sc.shown_seq = sc.seq;
+                sc.error = None;
+                self.preview = b;
+                self.shown_for = None;
+                self.scratch.clear();
+                ui.forget_image(id("ed.image"));
+            } else if sc.loading.contains(&at) {
+                sc.requested = sc.pos;
+            } else if sc.loading.len() < if paged { 1 } else { SCRUB_LOADS } {
+                // Starting ffmpeg is most of a fetch, so the newest position starts at once instead of waiting for one
+                // the slider has already left.
+                sc.requested = sc.pos;
+                sc.seq += 1;
+                sc.loading.push(at);
+                let (load, slot, seq, pos, mode) = (sc.source.load.clone(), sc.slot.clone(), sc.seq, sc.pos, self.mode);
+                std::thread::spawn(move || {
+                    crate::job::com_init();
+                    // Shrunk here, so the window never waits on it.
+                    let res = load(at).map(|b| { let full = (b.w, b.h); (shrink(b, mode), full) });
+                    slot.lock().unwrap().push((pos, at, seq, res));
+                });
+            }
         }
-        if sc.loading { ui.want_anim = true; }
+        if !sc.loading.is_empty() { ui.want_anim = true; }
     }
 
     /// Moves to another page of a document. The marks change over once it has loaded.
