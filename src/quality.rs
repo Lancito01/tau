@@ -76,12 +76,14 @@ pub struct Probe {
     pub cover: bool,
     pub audio: Vec<AudioInfo>,
     pub subs: Vec<String>,
+    /// Seconds, 0 when the file does not say.
+    pub duration: f64,
 }
 
 /// ffprobe arguments whose output `parse_probe` reads.
 pub fn probe_args(path: &str) -> Vec<String> {
     sv(&["-v", "error", "-show_data_hash", "md5", "-show_entries",
-        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash,bit_rate,color_space,field_order,sample_aspect_ratio:stream_disposition=attached_pic:stream_side_data=rotation:format=bit_rate",
+        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,color_range,sample_fmt,bits_per_sample,bits_per_raw_sample,sample_rate,channels,extradata_hash,bit_rate,color_space,field_order,sample_aspect_ratio:stream_disposition=attached_pic:stream_side_data=rotation:format=bit_rate,duration",
         "-of", "flat", path])
 }
 
@@ -95,15 +97,17 @@ fn parse_rate(s: &str) -> f64 {
 pub fn parse_probe(flat: &str) -> Probe {
     let mut streams: BTreeMap<u32, BTreeMap<String, String>> = BTreeMap::new();
     let mut file_bitrate = 0u64;
+    let mut duration = 0.0;
     for line in flat.lines() {
         if let Some(v) = line.strip_prefix("format.bit_rate=") { file_bitrate = v.trim_matches('"').parse().unwrap_or(0); }
+        if let Some(v) = line.strip_prefix("format.duration=") { duration = v.trim_matches('"').parse().unwrap_or(0.0); }
         let Some(rest) = line.strip_prefix("streams.stream.") else { continue };
         let Some((n, kv)) = rest.split_once('.') else { continue };
         let Some((k, v)) = kv.split_once('=') else { continue };
         let Ok(n) = n.parse() else { continue };
         streams.entry(n).or_default().insert(k.to_string(), v.trim().trim_matches('"').to_string());
     }
-    let mut p = Probe::default();
+    let mut p = Probe { duration, ..Default::default() };
     for s in streams.values() {
         let get = |k: &str| s.get(k).map(String::as_str).unwrap_or("");
         let num = |k: &str| get(k).parse::<u32>().unwrap_or(0);
@@ -462,6 +466,32 @@ pub fn copy_attempts(leading: &[String], tail: &[String]) -> Vec<Vec<String>> {
 pub fn gif_edit_args(filter: Option<&str>) -> Vec<String> {
     let lead = filter.map(|f| format!("{f},")).unwrap_or_default();
     vec!["-vf".into(), format!("{lead}split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=none:diff_mode=none"), "-gifflags".into(), "-transdiff".into()]
+}
+
+/// The palette stage of every GIF this app writes. Each frame's palette comes from that frame alone and is used on it
+/// alone, so a frame comes out the same whichever frames are encoded with it.
+const GIF_PALETTE: &str = "split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1";
+
+/// The arguments for one part of a GIF encoded in parts, or None when they do not make each frame on its own.
+/// The part holds the frames from `from` up to `to` seconds, plus the first frame after `to`, which is only there so the
+/// delay of the frame before it is measured to the true next frame, as in one pass; `gif::splice` drops it.
+/// The selection sits just before the palette stage, so every filter ahead of it still sees every frame: a
+/// deinterlacer or a frame rate cap works across the cut exactly as in one pass.
+pub fn gif_part_args(args: &[String], from: Option<f64>, to: Option<f64>) -> Option<Vec<String>> {
+    let i = args.iter().position(|a| a == "-vf")? + 1;
+    let vf = args.get(i)?;
+    // A rectangle diff makes a frame depend on the one before it.
+    if vf.matches(GIF_PALETTE).count() != 1 || vf.contains("diff_mode=rectangle") { return None; }
+    let after = |b: f64| format!("gte(t,{b:.6})*lt(prev_t,{b:.6})");
+    let expr = match (from, to) {
+        (None, Some(b)) => format!("lt(t,{b:.6})+{}", after(b)),
+        (Some(a), Some(b)) => format!("gte(t,{a:.6})*lt(t,{b:.6})+{}", after(b)),
+        (Some(a), None) => format!("gte(t,{a:.6})"),
+        (None, None) => return Some(args.to_vec()),
+    };
+    let mut out = args.to_vec();
+    out[i] = vf.replacen(GIF_PALETTE, &format!("select='{expr}',{GIF_PALETTE}"), 1);
+    Some(out)
 }
 
 // ---- redaction ----

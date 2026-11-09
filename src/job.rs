@@ -106,6 +106,14 @@ pub fn atomically(out: &Path, f: impl FnOnce(&Path) -> Result<(), String>) -> Re
     }
 }
 
+/// Waits up to `ms` for the process to end, returning as soon as it does, so a quick run is not held up by a poll.
+fn wait_exit(child: &std::process::Child, ms: u32) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    unsafe { let _ = WaitForSingleObject(HANDLE(child.as_raw_handle()), ms); }
+}
+
 /// Runs a program with no console window, polling for cancel. Returns stdout.
 pub fn run(job: Option<&Job>, exe: &Path, args: &[String], on_line: Option<&(dyn Fn(&str) + Sync)>) -> Result<String, String> {
     let mut child = Command::new(exe).args(args)
@@ -128,7 +136,7 @@ pub fn run(job: Option<&Job>, exe: &Path, args: &[String], on_line: Option<&(dyn
             if let Some(j) = job { if j.cancelled() { let _ = child.kill(); } }
             match child.try_wait() {
                 Ok(Some(s)) => break s,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
+                Ok(None) => wait_exit(&child, 40),
                 Err(e) => return Err(e.to_string()),
             }
         };
@@ -160,7 +168,7 @@ pub fn powershell(job: &Job, script: &str, env: &[(&str, String)]) -> Result<Str
         if job.cancelled() { let _ = child.kill(); }
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(60)),
+            Ok(None) => wait_exit(&child, 60),
             Err(e) => return Err(e.to_string()),
         }
     };

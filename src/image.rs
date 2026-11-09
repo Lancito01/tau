@@ -115,7 +115,7 @@ pub fn load(p: &Path) -> std::result::Result<Bmp, String> {
             };
             let t = TempDir::new()?;
             let tmp = t.file("in.png");
-            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), tmp.display().to_string()], None)
+            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), "-compression_level".into(), "0".into(), tmp.display().to_string()], None)
                 .map_err(|e| format!("Could not read {}: {e}", p.file_name().unwrap_or_default().to_string_lossy()))?;
             wic_load(&tmp).map_err(es)
         }
@@ -403,7 +403,7 @@ pub fn load_native(p: &Path) -> std::result::Result<Native, String> {
             let t = TempDir::new()?;
             let tmp = t.file("in.png");
             // ffmpeg writes a deep source as 16-bit PNG by itself.
-            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), tmp.display().to_string()], None)
+            run(None, &ff, &["-y".into(), "-hide_banner".into(), "-i".into(), p.display().to_string(), "-frames:v".into(), "1".into(), "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), "-compression_level".into(), "0".into(), tmp.display().to_string()], None)
                 .map_err(|e| format!("Could not read {}: {e}", p.file_name().unwrap_or_default().to_string_lossy()))?;
             wic_native(&tmp).map_err(es)
         }
