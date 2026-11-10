@@ -104,7 +104,16 @@ pub fn engines() -> Engines {
 
 pub fn dispatch(kind: Kind, id: &str, paths: Vec<PathBuf>) {
     match kind {
-        Kind::Convert => { convert::run(id, paths); }
+        // A slow conversion first asks how much to give up for time, in a small window of its own, so it gets a thread
+        // like a tool does. Checking whether it is slow can probe the files, which also belongs off the dial's thread.
+        Kind::Convert => {
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                job::com_init();
+                let Some(speed) = convert::ask_speed(&id, &paths) else { return };
+                convert::run(&id, speed, paths);
+            });
+        }
         // Each tool gets a thread and message loop of its own. Sharing the dial's would stack their loops, so an older
         // window could not close, whatever was clicked, until every newer one had.
         Kind::Tools => {
@@ -404,10 +413,14 @@ fn cli(a: &[String]) -> Option<i32> {
             settings::set_sendto(false);
             Some(0)
         }
-        // --convert <format> <files...>
+        // --convert <format>[:best|quality|balanced|fast] <files...>
         "--convert" if rest.len() >= 2 => {
             job::com_init();
-            Some(wait(convert::run(&rest[0], rest[1..].iter().map(|f| absolute(f)).collect())))
+            let (target, speed) = match rest[0].split_once(':') {
+                Some((t, s)) => (t, quality::Speed::from_id(s).unwrap_or_default()),
+                None => (rest[0].as_str(), quality::Speed::Best),
+            };
+            Some(wait(convert::run(target, speed, rest[1..].iter().map(|f| absolute(f)).collect())))
         }
         // --tool <id> [key=value ...] <files...>   Values may use \n and \t for shape lists.
         "--tool" if rest.len() >= 2 => {

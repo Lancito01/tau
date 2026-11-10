@@ -319,7 +319,7 @@ fn image_spec(input: &Path) -> Result<preview::Spec, String> {
             let b = shrink_to(&source, values[1] as u32)?;
             let t = TempDir::new()?;
             let out = t.file(&format!("o.{}", compress_ext(&ext_of(&input), b.has_alpha())));
-            image::save(&b, &out, &SaveOpts { quality: values[0] as f32 / 100.0, fit: None })?;
+            image::save(&b, &out, &SaveOpts { quality: values[0] as f32 / 100.0, fit: None, ..Default::default() })?;
             Ok((t, out))
         }
     };
@@ -820,7 +820,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
                 if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; resized = true; }
             }
             let ext = compress_ext(&ext_of(p), b.has_alpha());
-            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None });
+            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None, ..Default::default() });
             if resized { res } else { only_if_smaller(j, p, res) }
         }),
         "img.metadata" => each("Saving metadata", paths, move |j, p| {

@@ -134,8 +134,8 @@ pub fn attempts(job: &Job, input: &Path, suffix: &str, ext: &str, sets: &[Vec<St
     Err(last)
 }
 
-pub fn convert(job: &Job, input: &Path, target: &str) -> Result<PathBuf, String> {
-    attempts(job, input, "", target, &quality::convert_attempts(&probe(input), target))
+pub fn convert(job: &Job, input: &Path, target: &str, speed: quality::Speed) -> Result<PathBuf, String> {
+    attempts(job, input, "", target, &quality::convert_attempts(&probe(input), target, speed))
 }
 
 /// One input to one output beside it, with extra arguments.
