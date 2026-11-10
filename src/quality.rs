@@ -565,6 +565,23 @@ pub fn gif_part_args(args: &[String], from: Option<f64>, to: Option<f64>) -> Opt
     Some(out)
 }
 
+// ---- annotation ----
+
+/// The same arguments with a still picture, given as the second input, laid over the whole video before the rest of
+/// the filter. Where the picture is clear, overlay leaves a sample as it was.
+pub fn overlay_args(args: &[String]) -> Option<Vec<String>> {
+    let i = args.iter().position(|a| a == "-vf")?;
+    let chain = args.get(i + 1)?;
+    let mut out = args.to_vec();
+    out[i] = "-filter_complex".into();
+    out[i + 1] = format!("[0:V:0][1:v]overlay=format=auto:eof_action=repeat,{chain}[annotated]");
+    match out.windows(2).position(|w| w[0] == "-map" && w[1] == "0:V:0") {
+        Some(m) => out[m + 1] = "[annotated]".into(),
+        None => out.splice(0..0, ["-map".to_string(), "[annotated]".to_string()]).for_each(drop),
+    }
+    Some(out)
+}
+
 // ---- redaction ----
 
 /// Grows a box to even edges, so it covers whole chroma samples and no colour leaks out at its border.
@@ -1417,6 +1434,15 @@ format.bit_rate="5000000"
         let a = redact_args(&p, "mkv", "null").unwrap().args.join(" ");
         assert!(!a.contains("0:t"), "{a}");
         assert!(lossless_args(&p, "mkv", Some("null"), None, false).unwrap().args.join(" ").contains("0:t"));
+    }
+    #[test]
+    fn overlay_goes_in_front_of_the_filter_and_replaces_the_video_map() {
+        let a = overlay_args(&sv(&["-map", "0:V:0", "-vf", "format=yuv420p", "-c:v", "libx264", "-map", "0:a?"])).unwrap();
+        assert_eq!(a, sv(&["-map", "[annotated]", "-filter_complex", "[0:V:0][1:v]overlay=format=auto:eof_action=repeat,format=yuv420p[annotated]", "-c:v", "libx264", "-map", "0:a?"]));
+        let g = overlay_args(&gif_edit_args(None)).unwrap();
+        assert_eq!(&g[..2], &sv(&["-map", "[annotated]"])[..]);
+        assert!(g[3].starts_with("[0:V:0][1:v]overlay") && g[3].ends_with("[annotated]"));
+        assert!(overlay_args(&sv(&["-c", "copy"])).is_none());
     }
     #[test]
     fn redact_box_only_grows_and_stays_inside() {

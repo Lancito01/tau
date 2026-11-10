@@ -1,7 +1,7 @@
 //! Shared image editor window: crop, redact and annotate. Coordinates are fractions of the image,
 //! so one result can apply across a batch or to a video of any resolution.
 use crate::form;
-use crate::gfx::{cursor_pos, dpi_scale_at, wide, work_area_at, ACCENT, BORDER, MUTED, ON_ACCENT, RAISED, SURFACE, TEXT};
+use crate::gfx::{cursor_pos, dpi_scale_at, work_area_at, ACCENT, BORDER, MUTED, ON_ACCENT, RAISED, SURFACE, TEXT};
 use crate::image::Bmp;
 use crate::timeline::{snap, timecode};
 use crate::ui::{self, glyph, id, r, Align, Page, Style, Ui, FOOT_H, PAD, R, TITLE_H};
@@ -29,11 +29,17 @@ pub struct Fx {
     pub feather: f32,
     /// Multiplies the line width and text size of an annotation.
     pub width: f32,
+    /// How solidly an annotated box or oval is filled with its colour, or how solid a text's backing is, 0 to 100.
+    pub fill: f32,
 }
-impl Default for Fx { fn default() -> Fx { Fx { blur: false, strength: 40.0, feather: 0.0, width: 1.0 } } }
+impl Default for Fx { fn default() -> Fx { Fx { blur: false, strength: 40.0, feather: 0.0, width: 1.0, fill: 0.0 } } }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Shape { pub tool: Tool, pub a: (f64, f64), pub b: (f64, f64), pub color: u32, pub text: String, pub fx: Fx }
+pub struct Shape {
+    pub tool: Tool, pub a: (f64, f64), pub b: (f64, f64), pub color: u32, pub text: String, pub fx: Fx,
+    /// The point a curved arrow passes through halfway along. A straight arrow has none.
+    pub bend: Option<(f64, f64)>,
+}
 
 /// Marks in pixels for a picture of this size. Strength and feather scale with the picture, so the preview, a video
 /// frame and the full-size result all look alike. `even` grows boxes to whole chroma samples, for video.
@@ -55,7 +61,25 @@ pub fn marks_for(shapes: &[Shape], w: u32, h: u32, even: bool) -> Vec<crate::red
 }
 
 impl Shape {
-    pub fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Shape { Shape { tool: Tool::Rect, a: (x0, y0), b: (x1, y1), color: 0, text: String::new(), fx: Fx::default() } }
+    pub fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Shape { Shape::new(Tool::Rect, (x0, y0), (x1, y1), 0) }
+    pub fn new(tool: Tool, a: (f64, f64), b: (f64, f64), color: u32) -> Shape { Shape { tool, a, b, color, text: String::new(), fx: Fx::default(), bend: None } }
+    /// The quadratic control point of a curved arrow, worked out from the point it passes through halfway.
+    pub fn control(&self) -> Option<(f64, f64)> {
+        self.bend.map(|m| (2.0 * m.0 - (self.a.0 + self.b.0) / 2.0, 2.0 * m.1 - (self.a.1 + self.b.1) / 2.0))
+    }
+    /// Points along an arrow, from its tail to its tip.
+    pub fn path(&self, steps: usize) -> Vec<(f64, f64)> {
+        let Some(q) = self.control() else { return vec![self.a, self.b] };
+        (0..=steps).map(|i| {
+            let t = i as f64 / steps as f64;
+            let (u, v, w) = ((1.0 - t) * (1.0 - t), 2.0 * t * (1.0 - t), t * t);
+            (u * self.a.0 + v * q.0 + w * self.b.0, u * self.a.1 + v * q.1 + w * self.b.1)
+        }).collect()
+    }
+    /// The point an arrow's tip is heading away from, which sets the angle of its head.
+    pub fn tip_from(&self) -> (f64, f64) { self.control().unwrap_or(self.a) }
+    /// Whether this kind of annotation can be filled.
+    pub fn fillable(&self) -> bool { matches!(self.tool, Tool::Rect | Tool::Ellipse | Tool::Text) }
     /// Normalised (x, y, w, h) fractions.
     pub fn bounds(&self) -> (f64, f64, f64, f64) {
         let (x0, x1) = (self.a.0.min(self.b.0).clamp(0.0, 1.0), self.a.0.max(self.b.0).clamp(0.0, 1.0));
@@ -64,8 +88,9 @@ impl Shape {
     }
     pub fn encode(&self) -> String {
         let t = match self.tool { Tool::Rect => "rect", Tool::Arrow => "arrow", Tool::Text => "text", Tool::Ellipse => "ellipse" };
-        format!("{t}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\t{}\t{}\t{}", self.a.0, self.a.1, self.b.0, self.b.1, self.color, self.text.replace(['\t', '\n'], " "),
-            self.fx.blur as u8, self.fx.strength, self.fx.feather, self.fx.width)
+        let bend = self.bend.map(|m| format!("{}\t{}", m.0, m.1)).unwrap_or_else(|| "\t".into());
+        format!("{t}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\t{}\t{}\t{}\t{}\t{bend}", self.a.0, self.a.1, self.b.0, self.b.1, self.color, self.text.replace(['\t', '\n'], " "),
+            self.fx.blur as u8, self.fx.strength, self.fx.feather, self.fx.width, self.fx.fill)
     }
     pub fn decode(s: &str) -> Option<Shape> {
         let f: Vec<&str> = s.split('\t').collect();
@@ -78,8 +103,9 @@ impl Shape {
             fx: {
                 let d = Fx::default();
                 let v = |i: usize, or: f32| f.get(i).and_then(|x| x.parse().ok()).unwrap_or(or);
-                Fx { blur: f.get(7) == Some(&"1"), strength: v(8, d.strength), feather: v(9, d.feather), width: v(10, d.width) }
+                Fx { blur: f.get(7) == Some(&"1"), strength: v(8, d.strength), feather: v(9, d.feather), width: v(10, d.width), fill: v(11, d.fill) }
             },
+            bend: n(12).zip(n(13)),
         })
     }
 }
@@ -102,73 +128,191 @@ fn bmi(w: u32, h: u32) -> BITMAPINFO {
 /// Stroke width for an image of this size, in image pixels.
 fn thickness(w: u32, h: u32) -> i32 { (w.max(h) as i32 / 220).max(3) }
 
-/// Draws shapes into a DC where the image occupies (ox, oy, w, h).
-unsafe fn draw_shapes(dc: HDC, shapes: &[Shape], ox: i32, oy: i32, w: i32, h: i32) {
-    let map = |p: (f64, f64)| (ox + (p.0 * w as f64) as i32, oy + (p.1 * h as f64) as i32);
-    let base = thickness(w as u32, h as u32);
-    let null = GetStockObject(NULL_BRUSH);
-    for s in shapes {
-        let thick = ((base as f32 * s.fx.width) as i32).max(1);
-        let (ax, ay) = map(s.a);
-        let (bx, by) = map(s.b);
-        let pen = CreatePen(PS_SOLID, thick, colorref(s.color));
-        let old = SelectObject(dc, pen.into());
+/// The backing behind filled text: black or white, whichever stands apart from the words.
+pub fn backing(c: u32) -> u32 {
+    let l = 0.299 * ((c >> 16) & 255) as f32 + 0.587 * ((c >> 8) & 255) as f32 + 0.114 * (c & 255) as f32;
+    if l > 140.0 { 0x000000 } else { 0xFFFFFF }
+}
+
+/// How far filled text's backing reaches past the words on each side, as a share of the text size.
+const TEXT_PAD: f32 = 0.25;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pass { Fill, Line }
+
+unsafe fn text_font(thick: i32) -> HFONT {
+    CreateFontW(-(thick * 8), 0, 0, 0, 600, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, 0, w!("Segoe UI"))
+}
+
+/// The text as GDI takes it, without the terminating zero.
+fn text_units(s: &str) -> Vec<u16> { s.encode_utf16().collect() }
+
+/// Draws one pass of a shape into a DC where the image fills (0, 0, w, h).
+unsafe fn draw_pass(dc: HDC, s: &Shape, pass: Pass, w: i32, h: i32) {
+    let map = |p: (f64, f64)| ((p.0 * w as f64).round() as i32, (p.1 * h as f64).round() as i32);
+    let thick = ((thickness(w as u32, h as u32) as f32 * s.fx.width) as i32).max(1);
+    let (ax, ay) = map(s.a);
+    let (bx, by) = map(s.b);
+    if pass == Pass::Fill {
+        let brush = CreateSolidBrush(colorref(if s.tool == Tool::Text { backing(s.color) } else { s.color }));
+        let ob = SelectObject(dc, brush.into());
+        let op = SelectObject(dc, GetStockObject(NULL_PEN));
         match s.tool {
-            Tool::Rect => {
-                let ob = SelectObject(dc, null);
-                let _ = Rectangle(dc, ax, ay, bx, by);
-                SelectObject(dc, ob);
-            }
-            Tool::Ellipse => {
-                let ob = SelectObject(dc, null);
-                let _ = Ellipse(dc, ax, ay, bx, by);
-                SelectObject(dc, ob);
-            }
-            Tool::Arrow => {
-                let _ = MoveToEx(dc, ax, ay, None);
-                let _ = LineTo(dc, bx, by);
-                let ang = ((ay - by) as f64).atan2((ax - bx) as f64);
-                let head = (thick * 5) as f64;
-                for d in [-0.45f64, 0.45] {
-                    let _ = MoveToEx(dc, bx, by, None);
-                    let _ = LineTo(dc, bx + ((ang + d).cos() * head) as i32, by + ((ang + d).sin() * head) as i32);
-                }
-            }
+            Tool::Rect => { let _ = Rectangle(dc, ax.min(bx), ay.min(by), ax.max(bx) + 1, ay.max(by) + 1); }
+            Tool::Ellipse => { let _ = Ellipse(dc, ax.min(bx), ay.min(by), ax.max(bx) + 1, ay.max(by) + 1); }
             Tool::Text => {
-                let font = CreateFontW(-(thick * 8), 0, 0, 0, 600, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, 0, w!("Segoe UI"));
+                let font = text_font(thick);
                 let of = SelectObject(dc, font.into());
-                SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, colorref(s.color));
-                let _ = TextOutW(dc, ax, ay, &wide(&s.text));
+                let mut size = SIZE::default();
+                let _ = GetTextExtentPoint32W(dc, &text_units(&s.text), &mut size);
                 SelectObject(dc, of);
                 let _ = DeleteObject(font.into());
+                let pad = (thick as f32 * 8.0 * TEXT_PAD) as i32;
+                let _ = Rectangle(dc, ax - pad, ay, ax + size.cx + pad + 1, ay + size.cy + 1);
+            }
+            Tool::Arrow => {}
+        }
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        let _ = DeleteObject(brush.into());
+        return;
+    }
+    let pen = CreatePen(PS_SOLID, thick, colorref(s.color));
+    let old = SelectObject(dc, pen.into());
+    let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    match s.tool {
+        Tool::Rect => { let _ = Rectangle(dc, ax, ay, bx, by); }
+        Tool::Ellipse => { let _ = Ellipse(dc, ax, ay, bx, by); }
+        Tool::Arrow => {
+            match s.control() {
+                Some(q) => {
+                    // The quadratic curve, as the cubic GDI draws.
+                    let (qx, qy) = (q.0 * w as f64, q.1 * h as f64);
+                    let c = |x: i32, y: i32| POINT { x: (x as f64 + (qx - x as f64) * 2.0 / 3.0).round() as i32, y: (y as f64 + (qy - y as f64) * 2.0 / 3.0).round() as i32 };
+                    let _ = PolyBezier(dc, &[POINT { x: ax, y: ay }, c(ax, ay), c(bx, by), POINT { x: bx, y: by }]);
+                }
+                None => { let _ = MoveToEx(dc, ax, ay, None); let _ = LineTo(dc, bx, by); }
+            }
+            let f = s.tip_from();
+            let (fx, fy) = (f.0 * w as f64, f.1 * h as f64);
+            let ang = (fy - by as f64).atan2(fx - bx as f64);
+            let head = (thick * 5) as f64;
+            for d in [-0.45f64, 0.45] {
+                let _ = MoveToEx(dc, bx, by, None);
+                let _ = LineTo(dc, bx + ((ang + d).cos() * head) as i32, by + ((ang + d).sin() * head) as i32);
             }
         }
-        SelectObject(dc, old);
-        let _ = DeleteObject(pen.into());
+        Tool::Text => {
+            let font = text_font(thick);
+            let of = SelectObject(dc, font.into());
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, colorref(s.color));
+            let _ = TextOutW(dc, ax, ay, &text_units(&s.text));
+            SelectObject(dc, of);
+            let _ = DeleteObject(font.into());
+        }
     }
+    SelectObject(dc, ob);
+    SelectObject(dc, old);
+    let _ = DeleteObject(pen.into());
+}
+
+/// The pixel box a shape can touch, generously, as (x0, y0, x1, y1).
+fn reach(s: &Shape, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let thick = (thickness(w, h) as f32 * s.fx.width).max(1.0) as f64;
+    let mut pts = vec![s.a, s.b];
+    pts.extend(s.control());
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in pts {
+        let (x, y) = (p.0 * w as f64, p.1 * h as f64);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    let m = if s.tool == Tool::Arrow { thick * 6.0 } else { thick * 3.0 };
+    let (x0, y0, x1, y1) = if s.tool == Tool::Text {
+        // Its width is only known to GDI, so the box runs to the right edge.
+        let em = thick * 8.0;
+        (x0 - em * TEXT_PAD as f64 - m, y0 - m, w as f64, y0 + em * 1.6 + m)
+    } else {
+        (x0 - m, y0 - m, x1 + m, y1 + m)
+    };
+    let clamp = |v: f64, top: u32| (v.max(0.0) as u32).min(top);
+    (clamp(x0.floor(), w), clamp(y0.floor(), h), clamp(x1.ceil(), w), clamp(y1.ceil(), h))
+}
+
+/// Lays straight-alpha BGRA `s`, with alpha from 0 to 1, over `d`.
+fn over(d: &mut [u8], s: [f32; 4]) {
+    let (sa, da) = (s[3], d[3] as f32 / 255.0);
+    let oa = sa + da * (1.0 - sa);
+    if oa <= 0.0 { return; }
+    for c in 0..3 { d[c] = ((s[c] * sa + d[c] as f32 * da * (1.0 - sa)) / oa).round().clamp(0.0, 255.0) as u8; }
+    d[3] = (oa * 255.0).round() as u8;
+}
+
+/// The annotations alone at this size, as straight-alpha BGRA, each drawn over the ones before it. GDI ignores alpha,
+/// so each shape is drawn on black and on white, and how far a pixel moved between the two gives its coverage.
+pub fn annotation_layer(w: u32, h: u32, shapes: &[Shape]) -> std::result::Result<Vec<u8>, String> {
+    let n = w as usize * h as usize * 4;
+    let mut out = vec![0u8; n];
+    if shapes.is_empty() || w == 0 || h == 0 { return Ok(out); }
+    unsafe {
+        let info = bmi(w, h);
+        let (kdc, wdc) = (CreateCompatibleDC(None), CreateCompatibleDC(None));
+        let (mut kp, mut wp) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let made = (CreateDIBSection(Some(kdc), &info, DIB_RGB_COLORS, &mut kp, None, 0), CreateDIBSection(Some(wdc), &info, DIB_RGB_COLORS, &mut wp, None, 0));
+        let (kdib, wdib) = match made {
+            (Ok(k), Ok(l)) => (k, l),
+            (k, l) => {
+                if let Ok(k) = k { let _ = DeleteObject(k.into()); }
+                if let Ok(l) = l { let _ = DeleteObject(l.into()); }
+                let _ = DeleteDC(kdc);
+                let _ = DeleteDC(wdc);
+                return Err("Not enough memory to draw the annotations".into());
+            }
+        };
+        let (ko, wo) = (SelectObject(kdc, kdib.into()), SelectObject(wdc, wdib.into()));
+        let kb = std::slice::from_raw_parts_mut(kp as *mut u8, n);
+        let wb = std::slice::from_raw_parts_mut(wp as *mut u8, n);
+        let row = |y: u32, x0: u32, x1: u32| (y as usize * w as usize + x0 as usize) * 4..(y as usize * w as usize + x1 as usize) * 4;
+        for s in shapes {
+            let mut passes = vec![];
+            if s.fillable() && s.fx.fill > 0.0 { passes.push((Pass::Fill, s.fx.fill.min(100.0) / 100.0)); }
+            passes.push((Pass::Line, 1.0));
+            let (x0, y0, x1, y1) = reach(s, w, h);
+            if x0 >= x1 || y0 >= y1 { continue; }
+            for (pass, opacity) in passes {
+                for y in y0..y1 { kb[row(y, x0, x1)].fill(0); wb[row(y, x0, x1)].fill(255); }
+                draw_pass(kdc, s, pass, w as i32, h as i32);
+                draw_pass(wdc, s, pass, w as i32, h as i32);
+                let _ = GdiFlush();
+                for y in y0..y1 {
+                    for i in row(y, x0, x1).step_by(4) {
+                        let (k, l) = (&kb[i..i + 3], &wb[i..i + 3]);
+                        // On black a pixel is a*C, on white a*C + (1-a)*255.
+                        let gap = (0..3).map(|c| l[c] as i32 - k[c] as i32).min().unwrap_or(255).clamp(0, 255);
+                        if gap == 255 { continue; }
+                        let a = (255 - gap) as f32 / 255.0;
+                        let c = |v: u8| (v as f32 / a).min(255.0);
+                        over(&mut out[i..i + 4], [c(k[0]), c(k[1]), c(k[2]), a * opacity]);
+                    }
+                }
+            }
+        }
+        SelectObject(kdc, ko);
+        SelectObject(wdc, wo);
+        let _ = DeleteObject(kdib.into());
+        let _ = DeleteObject(wdib.into());
+        let _ = DeleteDC(kdc);
+        let _ = DeleteDC(wdc);
+    }
+    Ok(out)
 }
 
 /// Burns annotations into the pixels at full resolution.
 pub fn apply_annotations(b: &mut Bmp, shapes: &[Shape]) -> std::result::Result<(), String> {
-    unsafe {
-        let dc = CreateCompatibleDC(None);
-        let info = bmi(b.w, b.h);
-        let mut bits = std::ptr::null_mut();
-        let dib = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| e.to_string())?;
-        let old = SelectObject(dc, dib.into());
-        let n = (b.w * b.h * 4) as usize;
-        std::ptr::copy_nonoverlapping(b.px.as_ptr(), bits as *mut u8, n);
-        draw_shapes(dc, shapes, 0, 0, b.w as i32, b.h as i32);
-        let _ = GdiFlush();
-        let out = std::slice::from_raw_parts(bits as *const u8, n);
-        // GDI clears alpha on everything it touches: restore it where the colour changed.
-        for (d, s) in b.px.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
-            if d[..3] != s[..3] { d[..3].copy_from_slice(&s[..3]); d[3] = 255; }
-        }
-        SelectObject(dc, old);
-        let _ = DeleteObject(dib.into());
-        let _ = DeleteDC(dc);
+    let layer = annotation_layer(b.w, b.h, shapes)?;
+    for (d, s) in b.px.chunks_exact_mut(4).zip(layer.chunks_exact(4)) {
+        if s[3] == 0 { continue; }
+        over(d, [s[0] as f32, s[1] as f32, s[2] as f32, s[3] as f32 / 255.0]);
     }
     Ok(())
 }
@@ -202,12 +346,23 @@ pub fn fit_aspect(rect: (f64, f64, f64, f64), ratio: f64, iw: f64, ih: f64) -> S
     Shape::rect(x0, y0, x0 + fw, y0 + fh)
 }
 
+fn whole(v: f32) -> String { format!("{}", v as i32) }
+
+/// A gentle curve to start from, bowed to the left of the arrow's direction.
+fn default_bend(s: &Shape) -> P {
+    let (m, d) = (chord_mid(s), (s.b.0 - s.a.0, s.b.1 - s.a.1));
+    (m.0 + d.1 * 0.2, m.1 - d.0 * 0.2)
+}
+
+/// The middle of an arrow's straight line, where a bend starts from.
+fn chord_mid(s: &Shape) -> P { ((s.a.0 + s.b.0) / 2.0, (s.a.1 + s.b.1) / 2.0) }
+
 /// Grab points as (which, point). 0-3 are the corners clockwise from top left, 4-7 the edges
-/// from the top, and 8 and 9 the ends of an arrow.
+/// from the top, 8 and 9 the ends of an arrow and 10 the point that bends it.
 fn handles(s: &Shape, edges: bool) -> Vec<(u8, P)> {
     match s.tool {
         Tool::Text => vec![],
-        Tool::Arrow => vec![(8, s.a), (9, s.b)],
+        Tool::Arrow => vec![(8, s.a), (9, s.b), (10, s.bend.unwrap_or_else(|| chord_mid(s)))],
         Tool::Rect | Tool::Ellipse => {
             let (x, y, w, h) = s.bounds();
             let (x1, y1) = (x + w, y + h);
@@ -233,20 +388,35 @@ fn apply_handle(orig: &Shape, which: u8, p: P, aspect: Option<(f64, f64, f64)>) 
         5 => { s.a = (x, y); s.b = (p.0, y1); }
         6 => { s.a = (x, y); s.b = (x1, p.1); }
         7 => { s.a = (p.0, y); s.b = (x1, y1); }
-        8 => s.a = p,
-        _ => s.b = p,
+        8 | 9 => {
+            // A bend keeps its place relative to the line, so the curve keeps its shape as an end moves.
+            let end = if which == 8 { &mut s.a } else { &mut s.b };
+            let d = (p.0 - end.0, p.1 - end.1);
+            *end = p;
+            if let Some(m) = s.bend.as_mut() { *m = (m.0 + d.0 / 2.0, m.1 + d.1 / 2.0); }
+        }
+        _ => {
+            // Close to the straight line, it snaps back to straight.
+            let mid = chord_mid(&s);
+            s.bend = (((p.0 - mid.0).powi(2) + (p.1 - mid.1).powi(2)).sqrt() > BEND_SNAP).then_some(p);
+        }
     }
     s
 }
 
+/// How far, as a fraction of the picture, the bend point must leave the straight line before an arrow curves.
+const BEND_SNAP: f64 = 0.012;
+
 /// The shape moved by a delta, stopping at the edges of the image.
 fn moved(orig: &Shape, d: P) -> Shape {
-    let (x0, x1) = (orig.a.0.min(orig.b.0), orig.a.0.max(orig.b.0));
-    let (y0, y1) = (orig.a.1.min(orig.b.1), orig.a.1.max(orig.b.1));
-    let (dx, dy) = (d.0.clamp(-x0, 1.0 - x1), d.1.clamp(-y0, 1.0 - y1));
+    let pts: Vec<P> = [orig.a, orig.b].into_iter().chain(orig.bend).collect();
+    let (x0, x1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let (y0, y1) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+    let (dx, dy) = (d.0.clamp((-x0).min(0.0), (1.0 - x1).max(0.0)), d.1.clamp((-y0).min(0.0), (1.0 - y1).max(0.0)));
     let mut s = orig.clone();
     s.a = (s.a.0 + dx, s.a.1 + dy);
     s.b = (s.b.0 + dx, s.b.1 + dy);
+    if let Some(m) = s.bend.as_mut() { *m = (m.0 + dx, m.1 + dy); }
     s
 }
 
@@ -272,11 +442,12 @@ fn on_shape(s: &Shape, p: P, vw: f64, vh: f64, em: f64) -> bool {
             let (rx, ry) = ((w / 2.0).max(1e-6), (h / 2.0).max(1e-6));
             ((p.0 - x - rx) / rx).powi(2) + ((p.1 - y - ry) / ry).powi(2) <= 1.0
         }
-        Tool::Arrow => seg_distance(m, px(s.a), px(s.b)) <= 8.0,
+        Tool::Arrow => s.path(32).windows(2).any(|w| seg_distance(m, px(w[0]), px(w[1])) <= 8.0),
         Tool::Text => {
             let a = px(s.a);
             let em = em * s.fx.width as f64;
-            m.0 >= a.0 && m.0 <= a.0 + s.text.chars().count() as f64 * em * 0.56 && m.1 >= a.1 && m.1 <= a.1 + em * 1.35
+            let pad = if s.fx.fill > 0.0 { em * TEXT_PAD as f64 } else { 0.0 };
+            m.0 >= a.0 - pad && m.0 <= a.0 + s.text.chars().count() as f64 * em * 0.56 + pad && m.1 >= a.1 && m.1 <= a.1 + em * 1.35
         }
     }
 }
@@ -526,14 +697,14 @@ impl Editor {
                             self.drag = Some(Drag::Move { i, start: p, orig: self.items[i].shape.clone() });
                         } else if self.mode == Mode::Redact {
                             let tool = if self.oval { Tool::Ellipse } else { Tool::Rect };
-                            self.drag = Some(Drag::New(Shape { tool, a: p, b: p, color: self.pen, text: String::new(), fx: self.fx }));
+                            self.drag = Some(Drag::New(Shape { fx: self.fx, ..Shape::new(tool, p, p, self.pen) }));
                         }
                     }
                     _ if self.tool == 3 => { self.pending_text = Some(p); self.before = None; }
                     _ => {
                         let tool = match self.tool { 1 => Tool::Rect, 4 => Tool::Ellipse, _ => Tool::Arrow };
                         self.sel = None;
-                        self.drag = Some(Drag::New(Shape { tool, a: p, b: p, color: self.pen, text: String::new(), fx: Fx { width: self.fx.width, ..Fx::default() } }));
+                        self.drag = Some(Drag::New(Shape { fx: self.next_fx(tool), ..Shape::new(tool, p, p, self.pen) }));
                     }
                 }
             }
@@ -587,10 +758,16 @@ impl Editor {
         ui.unclip();
         if self.mode != Mode::Crop {
             if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
-                for (_, h) in handles(&self.items[i].shape, false) {
+                let straight = self.items[i].shape.bend.is_none();
+                for (which, h) in handles(&self.items[i].shape, false) {
                     let q = to_view(h);
                     ui.dot(q.0, q.1, 5.5, ON_ACCENT, 1.0);
-                    ui.dot(q.0, q.1, 4.0, ACCENT, 1.0);
+                    if which == 10 && straight {
+                        // A straight arrow's bend point is there to be pulled, so it shows hollow.
+                        ui.ring(q.0, q.1, 3.5, ACCENT, 1.0, 1.5);
+                    } else {
+                        ui.dot(q.0, q.1, 4.0, ACCENT, 1.0);
+                    }
                 }
             }
         }
@@ -667,27 +844,34 @@ impl Editor {
             }
             return;
         }
+        let fill = s.fx.fill.clamp(0.0, 100.0) / 100.0;
         match s.tool {
             Tool::Rect => {
+                if fill > 0.0 { ui.fill(q, 0.0, s.color, fill); }
                 ui.stroke(q, 0.0, s.color, 1.0, thick);
                 if selected || lit { ui.stroke(q.inset(-thick / 2.0 - 2.0), 0.0, ACCENT, 0.9, 1.0); }
             }
             Tool::Ellipse => {
+                if fill > 0.0 { ui.oval(q, s.color, fill); }
                 ui.oval_stroke(q, s.color, 1.0, thick);
                 if selected || lit { ui.stroke(q.inset(-thick / 2.0 - 2.0), 0.0, ACCENT, 0.9, 1.0); }
             }
             Tool::Arrow => {
-                if lit { ui.line(a, b, ACCENT, 0.5, thick + 4.0); }
-                ui.line(a, b, s.color, 1.0, thick);
-                let ang = (a.1 - b.1).atan2(a.0 - b.0);
+                let path: Vec<(f32, f32)> = s.path(48).into_iter().map(at).collect();
+                if lit { for w in path.windows(2) { ui.line(w[0], w[1], ACCENT, 0.5, thick + 4.0); } }
+                for w in path.windows(2) { ui.line(w[0], w[1], s.color, 1.0, thick); }
+                let f = at(s.tip_from());
+                let ang = (f.1 - b.1).atan2(f.0 - b.0);
                 for d in [-0.45f32, 0.45] {
                     ui.line(b, (b.0 + (ang + d).cos() * thick * 5.0, b.1 + (ang + d).sin() * thick * 5.0), s.color, 1.0, thick);
                 }
+                let _ = a;
             }
             Tool::Text => {
                 let em = thick * 8.0;
                 let w = ui.measure(&s.text, em, 600) + 4.0;
                 let tq = r(a.0, a.1, w, em * 1.35);
+                if fill > 0.0 { ui.fill(r(a.0 - em * TEXT_PAD, a.1, w + em * TEXT_PAD * 2.0, em * 1.35), 0.0, backing(s.color), fill); }
                 ui.text(&s.text, tq, em, 600, s.color, Align::Left);
                 if selected || lit { ui.stroke(tq.inset(-3.0), 2.0, ACCENT, 0.9, 1.0); }
             }
@@ -768,15 +952,7 @@ impl Editor {
                 y += 46.0;
                 self.swatches(ui, x, y, &COLORS);
                 y += 40.0;
-                let sel = self.sel.filter(|s| *s < self.items.len());
-                let mut width = sel.map(|i| self.items[i].shape.fx.width).unwrap_or(self.fx.width) * 2.0;
-                ui.text("Line and text size", r(x, y, w - 50.0, 18.0), 12.5, 500, MUTED, Align::Left);
-                ui.text(&format!("{}x", width / 2.0), r(x + w - 50.0, y, 50.0, 18.0), 12.5, 600, MUTED, Align::Right);
-                let was = width;
-                ui.slider("ed.width", r(x - 9.0, y + 18.0, w + 18.0, 28.0), 1.0, 10.0, 2.0, &mut width);
-                if width != was { self.restyle(|f| f.width = width / 2.0); }
                 if !ui.down { self.slider_open = false; }
-                y += 52.0;
                 self.list(ui, r(q.x, y, q.w - 1.0, q.bottom() - y - 58.0));
                 self.clear_button(ui, x, w, q);
             }
@@ -788,17 +964,11 @@ impl Editor {
         }
     }
 
-    /// Changes the look of the next shape and of the selected one. Dragging a slider makes one undo step.
-    fn restyle(&mut self, change: impl Fn(&mut Fx)) {
-        change(&mut self.fx);
-        if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
-            let mut fx = self.items[i].shape.fx;
-            change(&mut fx);
-            if fx != self.items[i].shape.fx {
-                if !self.slider_open { self.checkpoint(); self.slider_open = true; }
-                self.items[i].shape.fx = fx;
-            }
-        }
+    /// The look a new annotation starts with: the size and box fill last chosen for any annotation, so a run of
+    /// shapes can share them without a setting that reaches into the selected one.
+    fn next_fx(&self, tool: Tool) -> Fx {
+        let fill = if matches!(tool, Tool::Rect | Tool::Ellipse) { self.fx.fill } else { 0.0 };
+        Fx { width: self.fx.width, fill, ..Fx::default() }
     }
 
     fn recolor(&mut self, c: u32) {
@@ -862,10 +1032,10 @@ impl Editor {
     }
 
     /// One of a selected mark's own sliders. A drag makes one undo step, taken before the first change.
-    fn row_slider(&mut self, ui: &mut Ui, key: &str, label: &str, x: f32, w: f32, y: f32, range: (f32, f32, f32), was: f32) -> f32 {
+    fn row_slider(&mut self, ui: &mut Ui, key: &str, label: &str, x: f32, w: f32, y: f32, range: (f32, f32, f32), was: f32, show: fn(f32) -> String) -> f32 {
         let mut v = was;
         ui.text(label, r(x, y, w - 50.0, 18.0), 12.0, 500, MUTED, Align::Left);
-        ui.text(&format!("{}", v as i32), r(x + w - 50.0, y, 50.0, 18.0), 12.0, 600, MUTED, Align::Right);
+        ui.text(&show(v), r(x + w - 50.0, y, 50.0, 18.0), 12.0, 600, MUTED, Align::Right);
         ui.slider(key, r(x - 9.0, y + 16.0, w + 18.0, 28.0), range.0, range.1, range.2, &mut v);
         if v != was && !self.slider_open { self.checkpoint(); self.slider_open = true; }
         v
@@ -888,10 +1058,12 @@ impl Editor {
             ui.wrapped(msg, r(q.x + PAD, q.y + 4.0, q.w - PAD * 2.0, 60.0), 12.5, 400, MUTED);
             return;
         }
-        // The selected redaction's row opens to hold the settings that belong to that mark alone.
+        // The selected row opens to hold the settings that belong to that mark alone. A redaction has feather, and
+        // strength when it blurs. An annotation has its size, and a fill or, for an arrow, a curve.
         let redact = self.mode == Mode::Redact;
         let blurred: Vec<bool> = self.items.iter().map(|it| it.shape.fx.blur).collect();
-        let extra = |sel: Option<usize>, i: usize| if redact && sel == Some(i) { ROW_SLIDER * if blurred[i] { 2.0 } else { 1.0 } } else { 0.0 };
+        let own: Vec<f32> = self.items.iter().map(|it| if redact { if it.shape.fx.blur { 2.0 } else { 1.0 } } else { 2.0 }).collect();
+        let extra = |sel: Option<usize>, i: usize| if sel == Some(i) { ROW_SLIDER * own[i] } else { 0.0 };
         let top_of = |sel: Option<usize>, i: usize| (0..i).map(|n| ROW + extra(sel, n)).sum::<f32>();
         let content = top_of(self.sel, self.items.len());
         if self.sel != self.list_sel {
@@ -929,7 +1101,7 @@ impl Editor {
                 }
                 (_, Tool::Rect) => ("Box".to_string(), size_label(&it.shape, self.full)),
                 (_, Tool::Ellipse) => ("Oval".to_string(), size_label(&it.shape, self.full)),
-                (_, Tool::Arrow) => ("Arrow".to_string(), String::new()),
+                (_, Tool::Arrow) => ("Arrow".to_string(), if it.shape.bend.is_some() { "Curved".to_string() } else { String::new() }),
                 (_, Tool::Text) => (it.shape.text.clone(), "Text".to_string()),
             };
             if self.mode == Mode::Redact {
@@ -943,7 +1115,7 @@ impl Editor {
                     ui.stroke(sw, 3.0, TEXT, 0.25, 1.0);
                 }
             } else {
-                ui.dot(row.x + 19.0, row.y + row.h / 2.0, 6.0, it.shape.color, 1.0);
+                ui.dot(row.x + 19.0, row.y + (ROW - 4.0) / 2.0, 6.0, it.shape.color, 1.0);
             }
             let tw = row.w - 40.0 - 36.0;
             if detail.is_empty() {
@@ -952,16 +1124,42 @@ impl Editor {
                 ui.text(&name, r(row.x + 38.0, row.y + 4.0, tw, 18.0), 12.5, 500, TEXT, Align::Left);
                 ui.text(&detail, r(row.x + 38.0, row.y + 21.0, tw, 16.0), 11.0, 400, MUTED, Align::Left);
             }
-            if extra(self.sel, i) > 0.0 {
+            if extra(self.sel, i) > 0.0 && !redact {
+                let (fx, fw, mut fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
+                // Size runs in half steps, so the slider works in doubles.
+                let was = self.items[i].shape.fx.width * 2.0;
+                let v = self.row_slider(ui, &format!("ed.size{i}"), "Size", fx, fw, fy, (1.0, 10.0, 2.0), was, |v| format!("{}x", v / 2.0));
+                if v != was { self.items[i].shape.fx.width = v / 2.0; self.fx.width = v / 2.0; }
+                fy += ROW_SLIDER;
+                if self.items[i].shape.tool == Tool::Arrow {
+                    let mut curved = self.items[i].shape.bend.is_some() as usize;
+                    let names: Vec<String> = ["Straight", "Curved"].iter().map(|s| s.to_string()).collect();
+                    ui.segmented(&format!("ed.curve{i}"), r(fx, fy + 6.0, fw, 30.0), &names, &mut curved);
+                    if (curved == 1) != self.items[i].shape.bend.is_some() {
+                        self.checkpoint();
+                        let s = &mut self.items[i].shape;
+                        s.bend = (curved == 1).then(|| default_bend(s));
+                    }
+                } else {
+                    let was = self.items[i].shape.fx.fill;
+                    let label = if self.items[i].shape.tool == Tool::Text { "Backing" } else { "Fill" };
+                    let v = self.row_slider(ui, &format!("ed.fill{i}"), label, fx, fw, fy, (0.0, 100.0, 0.0), was, |v| if v <= 0.0 { "Off".into() } else { format!("{}%", v as i32) });
+                    if v != was {
+                        self.items[i].shape.fx.fill = v;
+                        if self.items[i].shape.tool != Tool::Text { self.fx.fill = v; }
+                    }
+                }
+            }
+            if extra(self.sel, i) > 0.0 && redact {
                 let (fx, fw, mut fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
                 if blurred[i] {
                     let was = self.items[i].shape.fx.strength;
-                    let v = self.row_slider(ui, &format!("ed.strength{i}"), "Strength", fx, fw, fy, (1.0, 100.0, 40.0), was);
+                    let v = self.row_slider(ui, &format!("ed.strength{i}"), "Strength", fx, fw, fy, (1.0, 100.0, 40.0), was, whole);
                     if v != was { self.items[i].shape.fx.strength = v; }
                     fy += ROW_SLIDER;
                 }
                 let was = self.items[i].shape.fx.feather;
-                let v = self.row_slider(ui, &format!("ed.feather{i}"), "Feather", fx, fw, fy, (0.0, 100.0, 0.0), was);
+                let v = self.row_slider(ui, &format!("ed.feather{i}"), "Feather", fx, fw, fy, (0.0, 100.0, 0.0), was, whole);
                 if v != was { self.items[i].shape.fx.feather = v; }
             }
         }
@@ -1078,8 +1276,9 @@ impl Editor {
             Mode::Crop => "Drag the handles, or drag outside the box to start over.",
             Mode::Redact if video => "Applies to the whole video. Click a mark to select and restyle it, right-click to remove it.",
             Mode::Redact => "Click a mark to select and restyle it, right-click to remove it. Delete works too.",
+            Mode::Annotate if video && self.tool != 3 => "Applies to the whole video. Drag to draw, click to select, right-click to remove.",
             Mode::Annotate => match self.tool {
-                0 => "Click to select, drag to move, right-click to remove.",
+                0 => "Click to select, drag to move, right-click to remove. Drag an arrow's middle dot to curve it.",
                 3 => "Click where the text should start.",
                 _ => "Drag on the picture to draw.",
             },
@@ -1140,7 +1339,7 @@ impl Page for Editor {
             let t = v[0].trim().to_string();
             if !t.is_empty() {
                 self.checkpoint();
-                self.items.push(Item { shape: Shape { tool: Tool::Text, a: p, b: p, color: self.pen, text: t, fx: Fx { width: self.fx.width, ..Fx::default() } }, detected: false });
+                self.items.push(Item { shape: Shape { text: t, fx: self.next_fx(Tool::Text), ..Shape::new(Tool::Text, p, p, self.pen) }, detected: false });
                 self.sel = Some(self.items.len() - 1);
             }
         }
@@ -1195,11 +1394,14 @@ mod tests {
     use super::*;
     #[test]
     fn shapes_round_trip() {
-        let v = vec![Shape::rect(0.1, 0.2, 0.3, 0.4), Shape { tool: Tool::Text, a: (0.5, 0.5), b: (0.5, 0.5), color: 0xFF3B30, text: "hi\tthere".into(), fx: Fx { blur: true, strength: 12.0, feather: 7.0, width: 2.5 } }];
+        let v = vec![Shape::rect(0.1, 0.2, 0.3, 0.4), Shape { tool: Tool::Text, a: (0.5, 0.5), b: (0.5, 0.5), color: 0xFF3B30, text: "hi\tthere".into(), fx: Fx { blur: true, strength: 12.0, feather: 7.0, width: 2.5, fill: 30.0 }, bend: None },
+            Shape { bend: Some((0.4, 0.2)), ..Shape::new(Tool::Arrow, (0.1, 0.1), (0.9, 0.9), 0xFFCC00) }];
         let back = decode_all(&encode_all(&v));
         assert_eq!(back[0], v[0]);
         assert_eq!(back[1].text, "hi there");
         assert_eq!(back[1].fx, v[1].fx, "per-shape look survives");
+        assert_eq!(back[1].bend, None);
+        assert_eq!(back[2], v[2], "a curve survives");
         assert_eq!(Shape::decode("rect\t0.1\t0.2\t0.3\t0.4\t000000\t").unwrap().fx, Fx::default(), "older lines still read");
     }
     #[test]
@@ -1217,7 +1419,7 @@ mod tests {
     #[test]
     fn annotation_changes_pixels() {
         let mut b = Bmp::new(200, 200, [255, 255, 255, 255]);
-        apply_annotations(&mut b, &[Shape { tool: Tool::Rect, a: (0.1, 0.1), b: (0.9, 0.9), color: 0xFF0000, text: String::new(), fx: Fx::default() }]).unwrap();
+        apply_annotations(&mut b, &[Shape::new(Tool::Rect, (0.1, 0.1), (0.9, 0.9), 0xFF0000)]).unwrap();
         assert!(b.px.chunks_exact(4).any(|p| p[2] == 255 && p[0] == 0 && p[3] == 255));
     }
     fn ratio_of(a: P, b: P, iw: f64, ih: f64) -> f64 { ((b.0 - a.0) * iw / ((b.1 - a.1) * ih)).abs() }
@@ -1261,7 +1463,7 @@ mod tests {
     }
     #[test]
     fn arrows_are_hit_near_the_line_only() {
-        let s = Shape { tool: Tool::Arrow, a: (0.1, 0.5), b: (0.9, 0.5), color: 0, text: String::new(), fx: Fx::default() };
+        let s = Shape::new(Tool::Arrow, (0.1, 0.5), (0.9, 0.5), 0);
         assert!(on_shape(&s, (0.5, 0.505), 1000.0, 1000.0, 20.0));
         assert!(!on_shape(&s, (0.5, 0.6), 1000.0, 1000.0, 20.0));
     }

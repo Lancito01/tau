@@ -155,9 +155,9 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
                 ff(tool("vid.mute", "MUTE", 0xE74F)), ff(tool("vid.trim", "TRIM", 0xE8C6)),
                 ff(tool("vid.crop", "CROP", 0xE7A8)), ff(tool("vid.speed", "SPEED", 0xEC4A)),
                 ff(tool("vid.snapshot", "SNAPSHOT", 0xE722)), ff(tool("vid.split", "SPLIT", 0xE8A4)),
-                ff(tool("vid.redact", "REDACT", 0xED1A)),
+                ff(tool("vid.redact", "REDACT", 0xED1A)), ff(tool("vid.annotate", "ANNOTATE", 0xE70F)),
             ];
-            // Nine nodes is the limit that stays readable, so JOIN replaces SPLIT for a selection.
+            // Ten nodes is the limit that stays readable, so JOIN replaces SPLIT for a selection.
             if count > 1 { v[7] = ff(tool("vid.join", "JOIN", 0xE71B)); }
             v
         }
@@ -234,11 +234,11 @@ mod tests {
         assert!(!entries(Kind::Tools, &p("a.pdf"), &all()).iter().any(|e| e.id == "pdf.merge"));
     }
     #[test]
-    fn no_wheel_exceeds_nine_nodes() {
+    fn no_wheel_exceeds_ten_nodes() {
         for f in ["a.jpg", "a.mp4", "a.mp3", "a.pdf", "a.docx", "a.pptx", "a.xlsx", "a.epub", "a.srt", "a.zip"] {
             let two = vec![PathBuf::from(f), PathBuf::from(f)];
             for k in [Kind::Convert, Kind::Tools, Kind::Actions] {
-                assert!(entries(k, &two, &all()).len() <= 9, "{f} {k:?}");
+                assert!(entries(k, &two, &all()).len() <= 10, "{f} {k:?}");
             }
         }
     }
