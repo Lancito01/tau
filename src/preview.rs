@@ -53,6 +53,8 @@ pub struct Spec {
     pub note: String,
     pub picture: Picture,
     pub size: Size,
+    /// Lets a video play, not only be scrubbed. What plays is the original: each level is a real encode of one frame.
+    pub play: Option<crate::player::Source>,
 }
 
 pub fn format_bytes(n: u64) -> String {
@@ -190,6 +192,11 @@ struct Preview {
     started: bool,
     result: Option<bool>,
     start: (f32, f32),
+    player: Option<crate::player::Player>,
+    play_frame: Option<Bmp>,
+    play_gen: u64,
+    /// Playing was paused by dragging the slider, and goes on from wherever it is let go.
+    resume: bool,
 }
 
 impl Preview {
@@ -199,7 +206,7 @@ impl Preview {
         let start = (((wa.right - wa.left) as f32 / s * 0.8).max(980.0), ((wa.bottom - wa.top) as f32 / s * 0.8).max(620.0));
         let sel = spec.default;
         let custom = spec.custom_start.clone();
-        Preview { sub, sel, settled: custom.clone(), custom, pos: 300.0, zoom: 0, pan: (0.5, 0.5), drag: None, comparing: false, shown: None, shared: Shared::new(), started: false, result: None, start, spec }
+        Preview { sub, sel, settled: custom.clone(), custom, pos: 300.0, zoom: 0, pan: (0.5, 0.5), drag: None, comparing: false, shown: None, shared: Shared::new(), started: false, result: None, start, player: None, play_frame: None, play_gen: 0, resume: false, spec }
     }
 
     fn is_custom(&self) -> bool { self.sel >= self.spec.presets.len() }
@@ -248,12 +255,18 @@ impl Preview {
         let wanted = if self.comparing || !self.spec.visual { original_key.clone() } else { key_of(&values, t) };
         let exact = self.shared.picture(&wanted);
         // Until this frame is encoded the original stands in, and the label says so.
-        let (key, picture) = match (&exact, &original) {
+        // Playing shows the original as it plays. The level comes back once paused.
+        let played = self.player.as_ref().and(self.play_frame.as_ref()).map(|b| Arc::new(Ok(b.clone())));
+        let (key, picture) = match (&played, &exact, &original) {
+            (Some(p), _, _) => ((vec![-1], self.play_gen as i64), Some(p.clone())),
+            (None, ..) => match (&exact, &original) {
             (Some(p), _) => (wanted.clone(), Some(p.clone())),
             (None, Some(p)) => (original_key.clone(), Some(p.clone())),
             _ => (wanted.clone(), None),
+            },
         };
-        let encoding = exact.is_none();
+        let playing = played.is_some();
+        let encoding = exact.is_none() && !playing;
 
         // Every level draws at the original's size, so a smaller encode shows as soft as it will really look.
         let base = original.as_ref().and_then(|p| p.as_ref().as_ref().ok().map(|b| (b.w, b.h)));
@@ -290,7 +303,7 @@ impl Preview {
         }
         if let Some(e) = failure { ui.wrapped(&e, view.inset(40.0), 12.0, 400, DANGER); }
 
-        let label = if !self.spec.visual { String::new() } else if self.comparing { "Original".to_string() } else if encoding { "Original, until this frame is encoded".to_string() } else { self.level_name() };
+        let label = if !self.spec.visual { String::new() } else if playing { "Original, playing. Pause to see this level".to_string() } else if self.comparing { "Original".to_string() } else if encoding { "Original, until this frame is encoded".to_string() } else { self.level_name() };
         if !label.is_empty() {
             let w = ui.measure(&label, 12.0, 600) + 18.0;
             let chip = r(view.x + 8.0, view.y + 8.0, w, 24.0);
@@ -300,12 +313,46 @@ impl Preview {
         if encoding || self.shared.size(&values).is_none() || self.spec.presets.iter().any(|p| self.shared.size(&p.values).is_none()) { ui.want_anim = true; }
     }
 
+    /// Plays the original from the slider's point, or pauses there.
+    fn toggle_play(&mut self) {
+        if self.player.take().is_some() { return; }
+        if std::mem::take(&mut self.resume) { return; }
+        let Some(src) = self.spec.play.as_ref() else { return };
+        let size = self.shared.picture(&key_of(&[], self.time())).and_then(|p| p.as_ref().as_ref().ok().map(|b| (b.w, b.h))).unwrap_or((1280, 720));
+        let dur = self.spec.dur;
+        let from = crate::player::start_from(self.time(), 0.0, dur, self.spec.fps);
+        self.pos = (from / dur.max(0.001) * 1000.0) as f32;
+        self.player = Some(crate::player::Player::start(src, from, dur, size));
+        self.play_frame = None;
+    }
+
+    /// Takes the frame that is due and moves the slider with it.
+    fn advance_play(&mut self, ui: &mut Ui) {
+        let Some(pl) = self.player.as_mut() else { return };
+        if let Some(b) = pl.tick() {
+            self.play_gen += 1;
+            self.play_frame = Some(b);
+        }
+        self.pos = (pl.time() / self.spec.dur.max(0.001) * 1000.0).clamp(0.0, 1000.0) as f32;
+        ui.want_anim = true;
+        if pl.ended() { self.player = None; }
+    }
+
     fn level_name(&self) -> String { self.spec.presets.get(self.sel).map(|p| p.name.clone()).unwrap_or_else(|| "Custom".to_string()) }
 
     fn scrubber(&mut self, ui: &mut Ui, q: R) {
         ui.fill(q, 0.0, SURFACE, 0.6);
         ui.fill(r(q.x, q.y, q.w, 1.0), 0.0, BORDER, 0.7);
-        ui.slider("pv.scrub", r(q.x + PAD - 9.0, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0, 28.0), 0.0, 1000.0, 0.0, &mut self.pos);
+        let bw = if self.spec.play.is_some() { 42.0 } else { 0.0 };
+        if bw > 0.0 {
+            let g = if self.player.is_some() || self.resume { ui::glyph::PAUSE } else { ui::glyph::PLAY };
+            if ui.icon_button("pv.play", g, r(q.x + PAD - 6.0, q.y + (q.h - 36.0) / 2.0, 36.0, 36.0), 13.0, false) { self.toggle_play(); }
+        }
+        let before = self.pos;
+        ui.slider("pv.scrub", r(q.x + PAD - 9.0 + bw, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0 - bw, 28.0), 0.0, 1000.0, 0.0, &mut self.pos);
+        // Dragging while playing holds it at the slider, and it plays on from wherever it is let go.
+        if self.pos != before && self.player.take().is_some() { self.resume = true; }
+        if self.resume && !ui.down { self.resume = false; self.toggle_play(); }
         let label = format!("{} / {}", timecode(self.time(), self.spec.fps), timecode(self.spec.dur, self.spec.fps));
         ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
     }
@@ -401,8 +448,13 @@ impl Page for Preview {
         let body = h - TITLE_H - FOOT_H - 1.0;
         self.sidebar(ui, r(w - SIDE, TITLE_H + 1.0, SIDE - 1.0, body));
         let scrub = if self.spec.dur > 0.0 { SCRUB_H } else { 0.0 };
-        if scrub > 0.0 { self.scrubber(ui, r(1.0, TITLE_H + 1.0 + body - scrub, w - SIDE - 1.0, scrub)); }
-        *self.shared.want.lock().unwrap() = (self.values(), self.time());
+        if scrub > 0.0 {
+            self.advance_play(ui);
+            if ui.key(VK_SPACE) && self.spec.play.is_some() { self.toggle_play(); }
+            self.scrubber(ui, r(1.0, TITLE_H + 1.0 + body - scrub, w - SIDE - 1.0, scrub));
+        }
+        // While playing, the workers keep to the last moment asked for rather than encode every frame going past.
+        if self.player.is_none() { *self.shared.want.lock().unwrap() = (self.values(), self.time()); }
         self.start_workers();
         self.stage(ui, r(1.0, TITLE_H + 1.0, w - SIDE - 1.0, body - scrub));
         let fy = h - FOOT_H;

@@ -109,11 +109,6 @@ fn strip(input: &Path, dur: f64) -> Result<Bmp, String> {
     Ok(out)
 }
 
-/// Frames per second of a video, 0 for anything without pictures.
-fn frame_rate(p: &Path) -> f64 {
-    media::probe(p).video.as_ref().map(|v| v.fps).unwrap_or(0.0)
-}
-
 fn pick_times(title: &str, input: &Path, mode: timeline::Mode, ok: &str) -> Option<Vec<f64>> {
     let p = input.to_path_buf();
     let r = pump_job("Reading file", move |_| {
@@ -126,11 +121,13 @@ fn pick_times(title: &str, input: &Path, mode: timeline::Mode, ok: &str) -> Opti
     let fps = video.as_ref().map(|v| v.fps).unwrap_or(0.0);
     let filter = video.as_ref().and_then(quality::still_filter);
     // Only pictures have a frame to look at.
-    let load: Option<timeline::FrameLoader> = (classify(input) == Cat::Video).then(|| {
+    let video = classify(input) == Cat::Video;
+    let play = video.then(|| crate::player::Source { path: input.to_path_buf(), filter: filter.clone(), fps });
+    let load: Option<timeline::FrameLoader> = video.then(|| {
         let p = input.to_path_buf();
         Arc::new(move |t| still_at(&p, t, filter.as_deref()).and_then(thumbnail)) as timeline::FrameLoader
     });
-    timeline::pick(title, st, dur, fps, mode, ok, load)
+    timeline::pick(title, st, dur, fps, mode, ok, load, play)
 }
 
 fn pick_shapes(title: &str, bmp: Result<Bmp, String>, mode: canvas::Mode, init: Vec<Shape>, ok: &str) -> Option<String> {
@@ -144,12 +141,15 @@ fn pick_shapes(title: &str, bmp: Result<Bmp, String>, mode: canvas::Mode, init: 
 fn pick_shapes_video(title: &str, input: &Path, mode: canvas::Mode, ok: &str) -> Option<String> {
     let p = input.to_path_buf();
     let loaded = pump_job("Reading file", move |_| {
-        let dur = media::duration(&p);
-        Ok((frame_at(&p, 1f64.min(dur / 2.0))?, dur, frame_rate(&p)))
+        let pr = media::probe(&p);
+        let (dur, video) = (pr.duration, pr.video);
+        Ok((frame_at(&p, 1f64.min(dur / 2.0))?, dur, video))
     });
-    let (first, dur, fps) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let (first, dur, video) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let fps = video.as_ref().map(|v| v.fps).unwrap_or(0.0);
+    let play = Some(crate::player::Source { path: input.to_path_buf(), filter: video.as_ref().and_then(quality::still_filter), fps });
     let p = input.to_path_buf();
-    let source = canvas::FrameSource { dur, fps, pages: 0, load: Arc::new(move |t| frame_at(&p, t)) };
+    let source = canvas::FrameSource { dur, fps, pages: 0, load: Arc::new(move |t| frame_at(&p, t)), play };
     canvas::edit_video(title, first, mode, ok, source).map(|v| canvas::encode_all(&v))
 }
 
@@ -253,6 +253,7 @@ fn video_spec(input: &Path) -> Result<preview::Spec, String> {
         Control::Choice { label: "Frame rate".into(), options: rates },
     ];
     let still = pr.video.as_ref().and_then(quality::still_filter);
+    let play = pr.video.as_ref().map(|_| crate::player::Source { path: input.to_path_buf(), filter: still.clone(), fps });
     let (p, probe) = (input.to_path_buf(), pr.clone());
     let picture: preview::Picture = Arc::new(move |values, t| {
         let Some(values) = values else { return still_at(&p, t, still.as_deref()) };
@@ -284,7 +285,7 @@ fn video_spec(input: &Path) -> Result<preview::Spec, String> {
     });
     Ok(preview::Spec {
         title: "Compress video".into(), ok: "Compress".into(), presets, default: 1, controls,
-        custom_start: vec![40, 0, 0, 0], original_bytes: file_size(input), dur, fps, visual: true, note: String::new(), picture, size,
+        custom_start: vec![40, 0, 0, 0], original_bytes: file_size(input), dur, fps, visual: true, note: String::new(), picture, size, play,
     })
 }
 
@@ -337,7 +338,7 @@ fn image_spec(input: &Path) -> Result<preview::Spec, String> {
             Control::Slider { label: "Picture quality".into(), min: 1, max: 99, unit: "%" },
             Control::Choice { label: "Longest side".into(), options: sides },
         ],
-        custom_start: vec![40, 0], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: true, note, picture, size,
+        custom_start: vec![40, 0], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: true, note, picture, size, play: None,
     })
 }
 
@@ -359,7 +360,7 @@ fn pdf_spec(input: &Path) -> Result<preview::Spec, String> {
         title: "Compress PDF".into(), ok: "Compress".into(), presets: vec![level("Tidy only", 0), level("Scan at 150 DPI", 150), level("Scan at 96 DPI", 96)], default: 0,
         controls: vec![Control::Slider { label: "Scan resolution".into(), min: 20, max: 300, unit: " DPI" }],
         custom_start: vec![72], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: true,
-        note: "Tidying keeps the text. A scan turns every page into a picture, so its text can no longer be selected.".into(), picture, size,
+        note: "Tidying keeps the text. A scan turns every page into a picture, so its text can no longer be selected.".into(), picture, size, play: None,
     })
 }
 
@@ -374,7 +375,7 @@ fn audio_spec(input: &Path) -> Result<preview::Spec, String> {
         title: "Compress audio".into(), ok: "Compress".into(),
         presets: vec![level("High", 192), level("Good", 128), level("Medium", 96), level("Low", 64)], default: 1,
         controls: vec![Control::Slider { label: "Bitrate".into(), min: 8, max: 320, unit: " kbps" }],
-        custom_start: vec![64], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: false, note: String::new(), picture, size,
+        custom_start: vec![64], original_bytes: file_size(input), dur: 0.0, fps: 0.0, visual: false, note: String::new(), picture, size, play: None,
     })
 }
 
@@ -475,8 +476,21 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
         }
         "vid.metadata" | "aud.metadata" => metadata_flow("Metadata", paths, |p| crate::metadata::read_media(p), "Remove everything else")?,
         "vid.speed" => {
-            let v = form::show("Change speed", &[choice("Speed", &["0.25x", "0.5x", "0.75x", "1.25x", "1.5x", "2x", "4x"], 5)], "Apply")?;
-            opts(&[("speed", v[0].trim_end_matches('x').to_string())])
+            let p = first.to_path_buf();
+            let loaded = pump_job("Reading file", move |_| {
+                let pr = media::probe(&p);
+                let at = 1f64.min(pr.duration / 2.0);
+                Ok((frame_at(&p, at)?, at, pr.duration, pr.video))
+            });
+            let (still, at, dur, video) = match loaded { Ok(v) => v, Err(e) => { fail("Change speed", e); return None; } };
+            let fps = video.as_ref().map(|v| v.fps).unwrap_or(0.0);
+            let filter = video.as_ref().and_then(quality::still_filter);
+            let play = crate::player::Source { path: first.to_path_buf(), filter: filter.clone(), fps };
+            let p = first.to_path_buf();
+            let load: crate::speed::Loader = Arc::new(move |t| still_at(&p, t, filter.as_deref()).and_then(|b| shrink_to(&b, 1280)));
+            let first = shrink_to(&still, 1280).unwrap_or(still);
+            let f = crate::speed::pick(first, at, dur, fps, play, load)?;
+            opts(&[("speed", format!("{f}"))])
         }
         "vid.trim" | "aud.trim" => {
             let m = pick_times("Trim", first, timeline::Mode::Range, "Trim")?;

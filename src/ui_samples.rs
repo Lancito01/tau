@@ -152,6 +152,7 @@ pub fn render(name: &str, out: &Path) -> Result<(), String> {
                 custom_start: vec![40, 0, 0, 0], original_bytes: 84_000_000, dur: 192.0, fps: 29.97, visual: true, note: String::new(),
                 picture: std::sync::Arc::new(move |_, _| Ok(base.clone())),
                 size: std::sync::Arc::new(|v| Ok((v[0] as u64).pow(2) * 8000)),
+                play: None,
             };
             crate::preview::render(spec, if name == "compress" { 1 } else { 4 }, out)
         }

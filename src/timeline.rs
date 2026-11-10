@@ -123,13 +123,19 @@ struct Viewport {
     order: Vec<i64>,
     /// The frame that could not be read.
     failed: Option<i64>,
+    play: Option<crate::player::Source>,
+    player: Option<crate::player::Player>,
+    /// The frame playing last showed, and a count that names its picture.
+    play_frame: Option<Bmp>,
+    play_frame_t: f64,
+    play_gen: u64,
 }
 
 /// Frames fetched side by side while the pointer moves.
 const LOADS_AT_ONCE: usize = 3;
 
 /// What the viewport is showing and why.
-struct Focus { t: f64, label: String }
+struct Focus { t: f64, label: String, playhead: bool }
 
 struct Timeline {
     title: String,
@@ -146,21 +152,32 @@ struct Timeline {
     hover: Option<f64>,
     view: Option<Viewport>,
     view_h: f32,
+    /// Where playing is, or stopped. Shown until a marker or the strip is used.
+    playhead: Option<f64>,
+    /// Where the playhead's grip sits while nothing is playing or paused, so it can be picked up again.
+    head_rest: f64,
+    /// The playhead's grip is being dragged.
+    head_drag: bool,
+    /// Playing was paused by dragging the playhead, and goes on from wherever it is let go.
+    resume: bool,
     ok: String,
     result: Option<bool>,
 }
 
 impl Timeline {
-    fn new(title: &str, sub: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok: &str, load: Option<FrameLoader>) -> Timeline {
+    fn new(title: &str, sub: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok: &str, load: Option<FrameLoader>, play: Option<crate::player::Source>) -> Timeline {
         let marks = if mode == Mode::Range { vec![0.0, dur] } else { vec![] };
-        let view = load.map(|load| Viewport { load, shown: None, shown_seq: 0, seq: 0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), frames: HashMap::new(), order: vec![], failed: None });
+        let view = load.map(|load| Viewport {
+            load, shown: None, shown_seq: 0, seq: 0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), frames: HashMap::new(), order: vec![], failed: None,
+            play, player: None, play_frame: None, play_frame_t: -1.0, play_gen: 0,
+        });
         // A small screen gets a smaller viewport, not a window that runs off it.
         let at = cursor_pos();
         let wa = work_area_at(at);
         let room = (wa.bottom - wa.top) as f32 / dpi_scale_at(at) - 80.0 - CHROME - STRIP_H_VIDEO - VIEW_GAP;
         Timeline {
             title: title.into(), sub: sub.into(), mode, strip, dur, fps, marks, undo: vec![], drag: None,
-            sel: if mode == Mode::Range { Some(0) } else { None }, hover: None, view, view_h: room.clamp(VIEW_MIN, VIEW_MAX),
+            sel: if mode == Mode::Range { Some(0) } else { None }, hover: None, view, view_h: room.clamp(VIEW_MIN, VIEW_MAX), playhead: None, head_rest: 0.0, head_drag: false, resume: false,
             ok: ok.into(), result: None,
         }
     }
@@ -224,13 +241,88 @@ impl Timeline {
             }
         };
         let mark = self.drag.or(self.sel).filter(|i| *i < self.marks.len());
-        let (t, label) = match (self.drag, self.hover, mark) {
-            (Some(_), _, Some(i)) => (self.marks[i], name(i)),
-            (_, Some(t), _) => (t, "Pointer".to_string()),
-            (_, _, Some(i)) => (self.marks[i], name(i)),
-            _ => (0.0, "First frame".to_string()),
+        let playing = self.playing();
+        let (t, label, playhead) = match (self.drag, self.hover, mark, self.playhead) {
+            (_, _, _, Some(t)) if self.head_drag => (t, "Playhead".to_string(), true),
+            (Some(_), _, Some(i), _) => (self.marks[i], name(i), false),
+            (_, _, _, Some(t)) if playing => (t, "Playing".to_string(), true),
+            (_, Some(t), _, _) => (t, "Pointer".to_string(), false),
+            (_, _, _, Some(t)) => (t, "Paused".to_string(), true),
+            (_, _, Some(i), _) => (self.marks[i], name(i), false),
+            _ => (0.0, "First frame".to_string(), false),
         };
-        Focus { t: t.min(self.last_frame()), label }
+        Focus { t: t.min(self.last_frame()), label, playhead }
+    }
+
+    fn playing(&self) -> bool { self.view.as_ref().is_some_and(|v| v.player.is_some()) }
+    fn can_play(&self) -> bool { self.view.as_ref().is_some_and(|v| v.play.is_some()) }
+
+    /// What playing covers: the part kept by a trim, otherwise the whole file.
+    fn play_span(&self) -> (f64, f64) {
+        if self.mode == Mode::Range { (self.marks[0].min(self.marks[1]), self.marks[0].max(self.marks[1])) } else { (0.0, self.dur) }
+    }
+
+    /// Plays from the playhead's grip, or pauses where it is.
+    fn toggle_play(&mut self) {
+        let at = self.playhead.unwrap_or(self.head_rest);
+        let (start, end) = self.play_span();
+        let fps = self.fps;
+        let Some(v) = self.view.as_mut() else { return };
+        if v.player.take().is_some() { return; }
+        let Some(src) = v.play.as_ref() else { return };
+        let size = v.shown.and_then(|(n, _)| v.frames.get(&n)).or(v.play_frame.as_ref()).map(|b| (b.w, b.h)).unwrap_or((640, 360));
+        let from = crate::player::start_from(at, start, end, fps);
+        v.player = Some(crate::player::Player::start(src, from, end, size));
+        self.playhead = Some(from);
+    }
+
+    /// Stops playing and lets the viewport follow the markers again.
+    fn stop_play(&mut self) {
+        if let Some(v) = self.view.as_mut() { v.player = None; }
+        if let Some(t) = self.playhead.take() { self.head_rest = t; }
+        self.resume = false;
+    }
+
+    /// A grip above the strip that moves the playhead. Dragged while playing, it holds at the pointer and plays on
+    /// from wherever it is let go.
+    fn head_grip(&mut self, ui: &mut Ui, q: R) {
+        if !self.can_play() { return; }
+        let dur = self.dur.max(0.001);
+        let lane = r(q.x - 8.0, q.y - 25.0, q.w + 16.0, 15.0);
+        let (hover, held, _) = ui.hit(id("tl.head"), lane);
+        let at = snap((((ui.mouse.0 - q.x) / q.w) as f64 * dur).clamp(0.0, dur), self.fps).min(self.last_frame());
+        if hover && ui.pressed {
+            self.head_drag = true;
+            if let Some(v) = self.view.as_mut() { if v.player.take().is_some() { self.resume = true; } }
+        }
+        if self.head_drag && held { self.playhead = Some(at); }
+        if self.head_drag && !ui.down {
+            self.head_drag = false;
+            if std::mem::take(&mut self.resume) { self.toggle_play(); }
+        }
+        if hover || self.head_drag { ui.cursor = IDC_SIZEWE; }
+        if hover && !self.head_drag { ui.tooltip = Some(("Drag to play from here".to_string(), (ui.mouse.0.clamp(q.x, q.right()), q.y - 26.0))); }
+        let t = self.playhead.unwrap_or(self.head_rest);
+        let x = q.x + (t / dur) as f32 * q.w;
+        let on = self.playhead.is_some() || hover || self.head_drag;
+        let a = if on { 1.0 } else { 0.45 };
+        ui.fill(r(x - 6.0, q.y - 23.0, 12.0, 11.0), 3.0, TEXT, a);
+        ui.fill(r(x - 1.0, q.y - 12.0, 2.0, 12.0), 0.0, TEXT, a);
+    }
+
+    /// Takes the frame that is due, before anything asks what the viewport shows.
+    fn advance_play(&mut self, ui: &mut Ui) {
+        let Some(v) = self.view.as_mut() else { return };
+        let Some(pl) = v.player.as_mut() else { return };
+        if let Some(b) = pl.tick() {
+            ui.forget_image(id(&format!("tl.play{}", v.play_gen)));
+            v.play_gen += 1;
+            v.play_frame = Some(b);
+            v.play_frame_t = pl.time();
+        }
+        self.playhead = Some(pl.time());
+        ui.want_anim = true;
+        if pl.ended() { v.player = None; }
     }
 
     fn viewport(&mut self, ui: &mut Ui, q: R) {
@@ -238,6 +330,14 @@ impl Timeline {
         let fps = self.fps;
         let index = |t: f64| if usable_fps(fps) { (t * fps).round() as i64 } else { (t * 1000.0) as i64 };
         let want = index(focus.t);
+        let can_play = self.can_play();
+        let playing = self.playing();
+        // The last frame played stands for the playhead only while it is from there. A moved playhead is fetched.
+        let half = if usable_fps(fps) { 0.5 / fps } else { 0.02 };
+        if focus.playhead && self.view.as_ref().is_some_and(|v| v.play_frame.is_some() && (playing || (v.play_frame_t - focus.t).abs() < half)) {
+            self.played(ui, q, &focus, playing);
+            return;
+        }
         let Some(v) = self.view.as_mut() else { return };
 
         let arrived: Vec<_> = std::mem::take(&mut *v.slot.lock().unwrap());
@@ -310,10 +410,36 @@ impl Timeline {
         let fwd = ui.icon_button_if("tl.next", 0xE76C, r(q.right() - 48.0, by, 44.0, 44.0), 15.0, can_step);
         if back { self.step_frame(-1.0); }
         if fwd { self.step_frame(1.0); }
+        if can_play && self.play_button(ui, q, playing) { self.toggle_play(); }
+    }
+
+    /// The viewport while playing, or stopped part way.
+    fn played(&mut self, ui: &mut Ui, q: R, focus: &Focus, playing: bool) {
+        let fps = self.fps;
+        let Some(b) = self.view.as_ref().and_then(|v| v.play_frame.as_ref().map(|b| (v.play_gen, b))) else { return };
+        let (gen, b) = b;
+        ui.fill(q, 10.0, 0x0A0B0C, 1.0);
+        let s = (q.w / b.w as f32).min(q.h / b.h as f32);
+        let (w, h) = (b.w as f32 * s, b.h as f32 * s);
+        let pic = r(q.x + (q.w - w) / 2.0, q.y + (q.h - h) / 2.0, w, h);
+        ui.image(id(&format!("tl.play{gen}")), b, pic);
+        let stamp = format!("{}  \u{b7}  {}", focus.label, timecode(focus.t, fps));
+        let tw = ui.measure(&stamp, 12.0, 600) + 22.0;
+        let pill = r(pic.x + (pic.w - tw) / 2.0, pic.bottom() - 34.0, tw, 26.0);
+        ui.fill(pill, 13.0, 0, 0.72);
+        ui.text(&stamp, pill, 12.0, 600, TEXT, Align::Center);
+        if self.play_button(ui, q, playing) { self.toggle_play(); }
+    }
+
+    fn play_button(&mut self, ui: &mut Ui, q: R, playing: bool) -> bool {
+        let b = r(q.x + 10.0, q.bottom() - 46.0, 36.0, 36.0);
+        ui.fill(b, 18.0, 0, 0.6);
+        ui.icon_button("tl.play", if playing { glyph::PAUSE } else { glyph::PLAY }, b, 13.0, false)
     }
 
     /// Moves the selected marker one frame along.
     fn step_frame(&mut self, by: f64) {
+        self.stop_play();
         let Some(i) = self.sel.filter(|i| *i < self.marks.len()) else { return };
         let moved = self.snapped(self.marks[i] + by * self.frame_len());
         if moved != self.marks[i] {
@@ -337,6 +463,7 @@ impl Timeline {
         let at = self.snapped(raw);
 
         if hover && ui.pressed {
+            self.stop_play();
             self.undo.push(self.marks.clone());
             let hit = nearest(&self.marks, raw, per_px * GRAB_PX);
             self.drag = match (hit, self.mode) {
@@ -379,6 +506,7 @@ impl Timeline {
             ui.fill(r(ui.mouse.0.clamp(q.x, q.right()) - 0.5, q.y, 1.0, q.h), 0.0, TEXT, 0.6);
         }
         if hover { ui.tooltip = Some((self.fmt(at), (ui.mouse.0.clamp(q.x, q.right()), q.y - 6.0))); }
+        if let Some(t) = self.playhead { ui.fill(r(xof(t) - 1.0, q.y, 2.0, q.h), 0.0, TEXT, 0.9); }
 
         for (i, m) in self.marks.clone().iter().enumerate() {
             let x = xof(*m);
@@ -435,7 +563,7 @@ impl Timeline {
             x += w + 6.0;
         }
         if hidden > 0 { ui.text(&format!("+{hidden} more"), r(x + 4.0, y, 70.0, 30.0), 12.0, 400, MUTED, Align::Left); }
-        if let Some(t) = pick { self.sel = self.marks.iter().position(|m| *m == t); }
+        if let Some(t) = pick { self.stop_play(); self.sel = self.marks.iter().position(|m| *m == t); }
         if let Some(vals) = remove {
             self.undo.push(self.marks.clone());
             self.marks.retain(|m| !vals.contains(m));
@@ -476,8 +604,11 @@ impl Page for Timeline {
         ui.text(&read, r(WIDTH / 2.0 - 60.0, TITLE_H, WIDTH / 2.0 + 60.0 - PAD, 26.0), 12.5, 600, TEXT, Align::Right);
         let (strip_y, strip_h, height) = (self.strip_y(), self.strip_h(), self.height());
         // The strip first, as the viewport follows what the pointer is doing on it.
+        self.head_grip(ui, r(PAD, strip_y, WIDTH - PAD * 2.0, strip_h));
         self.strip_area(ui, r(PAD, strip_y, WIDTH - PAD * 2.0, strip_h));
         if self.view.is_some() {
+            self.advance_play(ui);
+            if ui.key(VK_SPACE) && self.can_play() { self.toggle_play(); }
             self.viewport(ui, r(PAD, TITLE_H + 30.0, WIDTH - PAD * 2.0, self.view_h));
             if ui.key(VK_LEFT) { self.step_frame(-1.0); }
             if ui.key(VK_RIGHT) { self.step_frame(1.0); }
@@ -498,8 +629,8 @@ impl Page for Timeline {
 
 /// Opens the picker and blocks while pumping messages. Returns the sorted marks. `fps` of 0 means times stay in decimals,
 /// and a `load` adds the viewport.
-pub fn pick(title: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok: &str, load: Option<FrameLoader>) -> Option<Vec<f64>> {
-    let t = ui::run_modal(Timeline::new(title, &form::context(), strip, dur, fps, mode, ok, load), title, None)?;
+pub fn pick(title: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok: &str, load: Option<FrameLoader>, play: Option<crate::player::Source>) -> Option<Vec<f64>> {
+    let t = ui::run_modal(Timeline::new(title, &form::context(), strip, dur, fps, mode, ok, load, play), title, None)?;
     if t.result != Some(true) { return None; }
     let mut m = t.marks;
     m.sort_by(f64::total_cmp);
@@ -510,7 +641,7 @@ pub fn pick(title: &str, strip: Option<Bmp>, dur: f64, fps: f64, mode: Mode, ok:
 pub fn render(mode: Mode, strip: Option<Bmp>, marks: Vec<f64>, fps: f64, frame: Option<Bmp>, out: &std::path::Path) -> Result<(), String> {
     let (title, ok) = match mode { Mode::Range => ("Trim", "Trim"), Mode::Points => ("Split", "Split"), Mode::Ranges => ("Bleep", "Bleep") };
     let load: Option<FrameLoader> = frame.as_ref().map(|_| -> FrameLoader { Arc::new(|_| Err(String::new())) });
-    let mut t = Timeline::new(title, "interview take 3.mp4", strip, 192.0, fps, mode, ok, load);
+    let mut t = Timeline::new(title, "interview take 3.mp4", strip, 192.0, fps, mode, ok, load, None);
     t.marks = marks;
     if !t.marks.is_empty() { t.sel = Some(0); }
     t.view_h = VIEW_MAX;
