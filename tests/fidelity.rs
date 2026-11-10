@@ -123,7 +123,7 @@ fn camcorder_footage_comes_out_whole_frames_at_the_right_shape() {
     assert_eq!(muxer_for("mts"), None, "ffmpeg knows this one");
 
     let out = d.p("c.mp4");
-    run_attempts(&src, &convert_attempts(&info, "mp4"), &out);
+    run_attempts(&src, &convert_attempts(&info, "mp4", Speed::Best), &out);
     assert_eq!(field(&out, "v:0", "stream=codec_name"), "h264", "MPEG-2 in MP4 would not play");
     assert_eq!(field(&out, "v:0", "stream=field_order"), "progressive");
     assert_eq!(field(&out, "a:0", "stream=codec_name"), "ac3");
@@ -435,13 +435,13 @@ fn matching_codecs_copy_with_no_change_at_all() {
     let want = region(&s, None, None);
     for t in ["mkv", "mov"] {
         let out = d.p(&format!("o.{t}"));
-        assert_eq!(run_attempts(&s, &convert_attempts(&p, t), &out), 0, "{t}: stream copy worked first time");
+        assert_eq!(run_attempts(&s, &convert_attempts(&p, t, Speed::Best), &out), 0, "{t}: stream copy worked first time");
         assert_eq!(region(&out, None, None), want, "{t}: frames");
         assert_eq!(field(&out, "a", "stream=codec_name").lines().count(), 2, "{t}: tracks");
         assert_eq!(field(&out, "v:0", "stream=pix_fmt"), "yuv444p10le", "{t}: format");
     }
     let m4a = d.p("o.m4a");
-    run_attempts(&s, &convert_attempts(&p, "m4a"), &m4a);
+    run_attempts(&s, &convert_attempts(&p, "m4a", Speed::Best), &m4a);
     let aud = |f: &Path| { let o = ff(&["-i".into(), f.display().to_string(), "-map".into(), "0:a:0".into(), "-c".into(), "copy".into(), "-f".into(), "md5".into(), "-".into()]).unwrap(); String::from_utf8_lossy(&o).to_string() };
     assert_eq!(aud(&s), aud(&m4a), "aac in mp4 moves into m4a bit for bit");
 }
@@ -457,7 +457,7 @@ fn reencoding_conversions_keep_format_size_and_tracks() {
     // A lossless source stays lossless wherever the target can hold it.
     let want = region(&s, None, None);
     let m = d.p("o.mp4");
-    run_attempts(&s, &convert_attempts(&p, "mp4"), &m);
+    run_attempts(&s, &convert_attempts(&p, "mp4", Speed::Best), &m);
     assert_eq!(field(&m, "v:0", "stream=pix_fmt"), "yuv422p10le", "10-bit 4:2:2 kept");
     assert_eq!(field(&m, "v:0", "stream=color_transfer"), "smpte2084", "HDR tag kept");
     assert_eq!(field(&m, "a:0", "stream=codec_name"), "alac", "lossless audio stays lossless");
@@ -465,12 +465,12 @@ fn reencoding_conversions_keep_format_size_and_tracks() {
     if has_encoder("libvpx-vp9") {
         let w = d.p("o.webm");
         let plain = clip(&d, "plain8.mkv", "yuv420p", &["-c:v", "ffv1"], "");
-        run_attempts(&plain, &convert_attempts(&probe(&plain), "webm"), &w);
+        run_attempts(&plain, &convert_attempts(&probe(&plain), "webm", Speed::Best), &w);
         assert_eq!(region(&w, None, None), region(&plain, None, None), "webm lossless");
     }
     let plain = clip(&d, "plain.mkv", "yuv420p", &["-c:v", "ffv1"], "");
     let wv = d.p("q.wmv");
-    run_attempts(&plain, &convert_attempts(&probe(&plain), "wmv"), &wv);
+    run_attempts(&plain, &convert_attempts(&probe(&plain), "wmv", Speed::Best), &wv);
     assert!(psnr(&wv, &plain) > 40.0, "wmv: {}", psnr(&wv, &plain));
 }
 
@@ -501,7 +501,7 @@ fn lossy_sources_are_not_blown_up_and_still_hold_their_quality() {
     let base = psnr(&src, &reference);
     let check = |ext: &str, limit: f64, floor: f64| {
         let o = d.p(&format!("c.{ext}"));
-        run_attempts(&src, &convert_attempts(&p, ext), &o);
+        run_attempts(&src, &convert_attempts(&p, ext, Speed::Best), &o);
         let k = kbps(&o);
         let (to_ref, to_src) = (psnr(&o, &reference), psnr(&o, &src));
         println!("{ext}: {source_rate:.0} -> {k:.0} kbps, {base:.1} -> {to_ref:.1} dB against the true original, {to_src:.1} dB against the source");
@@ -518,7 +518,7 @@ fn lossy_sources_are_not_blown_up_and_still_hold_their_quality() {
         let rate = pv.video.as_ref().unwrap().bitrate as f64 / 1000.0;
         assert!(rate > 500.0, "bitrate from the file total when the stream gives none: {rate}");
         let o = d.p("from-vp9.mp4");
-        run_attempts(&v, &convert_attempts(&pv, "mp4"), &o);
+        run_attempts(&v, &convert_attempts(&pv, "mp4", Speed::Best), &o);
         let k = kbps(&o);
         println!("vp9 -> mp4: {rate:.0} -> {k:.0} kbps, {:.1} -> {:.1} dB", psnr(&v, &r2), psnr(&o, &r2));
         assert!(k <= rate / 0.65 * 1.1, "{k} from {rate}");
@@ -531,7 +531,7 @@ fn lossy_sources_are_not_blown_up_and_still_hold_their_quality() {
     let pm = probe(&m);
     assert_eq!(pm.audio[0].bitrate, 128000);
     let a = d.p("a.m4a");
-    run_attempts(&m, &convert_attempts(&pm, "m4a"), &a);
+    run_attempts(&m, &convert_attempts(&pm, "m4a", Speed::Best), &a);
     assert_eq!(field(&a, "a:0", "stream=codec_name"), "aac", "a lossy source does not become a bigger ALAC");
     assert!(field(&a, "a:0", "stream=bit_rate").parse::<u32>().unwrap() < 130_000);
 }
@@ -628,11 +628,11 @@ fn odd_sizes_are_padded_not_resampled() {
     let p = probe(&s);
     // 4:4:4 stores odd sizes as they are.
     let m = d.p("o.mp4");
-    run_attempts(&s, &convert_attempts(&p, "mp4"), &m);
+    run_attempts(&s, &convert_attempts(&p, "mp4", Speed::Best), &m);
     assert_eq!(field(&m, "v:0", "stream=width"), "641");
     // 4:2:0 cannot, so a row and a column of padding go on, and the picture itself is not resampled.
     let a = d.p("o.wmv");
-    run_attempts(&s, &convert_attempts(&p, "wmv"), &a);
+    run_attempts(&s, &convert_attempts(&p, "wmv", Speed::Best), &a);
     assert_eq!((field(&a, "v:0", "stream=width"), field(&a, "v:0", "stream=height")), ("642".to_string(), "362".to_string()));
     let o = Command::new("ffmpeg").args(["-hide_banner", "-nostdin", "-i"]).arg(&a).arg("-i").arg(&s)
         .args(["-lavfi", "[0:v]crop=640:360:0:0,format=yuv420p,settb=1/1000,setpts=N[a];[1:v]format=yuv444p,crop=640:360:0:0,format=yuv420p,settb=1/1000,setpts=N[b];[a][b]psnr", "-f", "null", "-"]).output().unwrap();
@@ -642,20 +642,61 @@ fn odd_sizes_are_padded_not_resampled() {
 }
 
 #[test]
-fn gif_keeps_full_size_and_frame_rate() {
+fn gif_best_keeps_full_size_and_frame_rate() {
     if !have_ffmpeg() { return; }
     let d = Dir::new();
     let s = d.p("s.mkv");
     ffs(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-vf", "format=yuv420p", "-c:v", "ffv1", &s.display().to_string()]);
     let out = d.p("o.gif");
-    run_attempts(&s, &convert_attempts(&probe(&s), "gif"), &out);
+    run_attempts(&s, &convert_attempts(&probe(&s), "gif", Speed::Best), &out);
     assert_eq!(field(&out, "v:0", "stream=width"), "1280");
     assert_eq!(region(&out, None, None).len(), region(&s, None, None).len(), "every frame kept");
     let v = d.p("fast.mkv");
     ffs(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=60:d=1", "-c:v", "ffv1", &v.display().to_string()]);
     let g = d.p("fast.gif");
-    run_attempts(&v, &convert_attempts(&probe(&v), "gif"), &g);
+    run_attempts(&v, &convert_attempts(&probe(&v), "gif", Speed::Best), &g);
     assert_eq!(region(&g, None, None).len(), 50, "60 fps caps at the 50 GIF can show");
+}
+
+#[test]
+fn quick_video_speeds_encode_and_play() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=1", "-vf", "format=yuv420p", "-c:v", "ffv1", &s.display().to_string()]);
+    for sp in [Speed::Quality, Speed::Balanced, Speed::Fast] {
+        for t in ["mp4", "webm"] {
+            let o = d.p(&format!("{}.{t}", sp.id()));
+            run_attempts(&s, &convert_attempts(&probe(&s), t, sp), &o);
+            assert_eq!(region(&o, None, None).len(), 30, "{t} {sp:?} keeps every frame");
+        }
+    }
+    let g = d.p("fast.gif");
+    run_attempts(&s, &convert_attempts(&probe(&s), "gif", Speed::Fast), &g);
+    assert_eq!((field(&g, "v:0", "stream=width"), region(&g, None, None).len()), ("480".into(), 12));
+}
+
+#[test]
+fn gif_is_shrunk_but_never_enlarged() {
+    if !have_ffmpeg() { return; }
+    let d = Dir::new();
+    let s = d.p("s.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=1", "-vf", "format=yuv420p", "-c:v", "ffv1", &s.display().to_string()]);
+    let out = d.p("o.gif");
+    run_attempts(&s, &convert_attempts(&probe(&s), "gif", Speed::Balanced), &out);
+    assert_eq!((field(&out, "v:0", "stream=width"), field(&out, "v:0", "stream=height")), ("640".into(), "360".into()));
+    assert_eq!(region(&out, None, None).len(), 15, "30 fps comes down to 15");
+    let tall = d.p("tall.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=720x1280:r=30:d=1", "-c:v", "ffv1", &tall.display().to_string()]);
+    let t = d.p("tall.gif");
+    run_attempts(&tall, &convert_attempts(&probe(&tall), "gif", Speed::Balanced), &t);
+    assert_eq!(field(&t, "v:0", "stream=height"), "640", "the long side is the one limited");
+    let small = d.p("small.mkv");
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=1", "-c:v", "ffv1", &small.display().to_string()]);
+    let g = d.p("small.gif");
+    run_attempts(&small, &convert_attempts(&probe(&small), "gif", Speed::Balanced), &g);
+    assert_eq!(field(&g, "v:0", "stream=width"), "320");
+    assert_eq!(region(&g, None, None).len(), 10, "a slow source keeps every frame");
 }
 
 #[test]
@@ -666,41 +707,41 @@ fn audio_keeps_depth_rate_and_cover_art() {
     ffs(&["-f", "lavfi", "-i", "sine=f=997:r=96000:d=1", "-c:a", "pcm_s24le", &w.display().to_string()]);
     let f = d.p("s.flac");
     let p = probe(&w);
-    run_attempts(&w, &convert_attempts(&p, "flac"), &f);
+    run_attempts(&w, &convert_attempts(&p, "flac", Speed::Best), &f);
     assert_eq!(field(&f, "a:0", "stream=sample_rate"), "96000");
     assert_eq!(field(&f, "a:0", "stream=bits_per_raw_sample"), "24");
     let pcm = |a: &Path| { let o = ff(&["-i".into(), a.display().to_string(), "-map".into(), "0:a:0".into(), "-f".into(), "s32le".into(), "-c:a".into(), "pcm_s32le".into(), "-".into()]).unwrap(); o };
     assert_eq!(pcm(&w), pcm(&f), "wav to flac is bit exact");
     let back = d.p("b.wav");
-    run_attempts(&f, &convert_attempts(&probe(&f), "wav"), &back);
+    run_attempts(&f, &convert_attempts(&probe(&f), "wav", Speed::Best), &back);
     assert_eq!(field(&back, "a:0", "stream=codec_name"), "pcm_s24le", "24-bit stays 24-bit, the old code cut it to 16");
     assert_eq!(pcm(&w), pcm(&back));
     let a = d.p("s.aiff");
-    run_attempts(&w, &convert_attempts(&p, "aiff"), &a);
+    run_attempts(&w, &convert_attempts(&p, "aiff", Speed::Best), &a);
     assert_eq!(field(&a, "a:0", "stream=codec_name"), "pcm_s24be");
     assert_eq!(pcm(&w), pcm(&a));
     let m = d.p("s.m4a");
-    run_attempts(&w, &convert_attempts(&p, "m4a"), &m);
+    run_attempts(&w, &convert_attempts(&p, "m4a", Speed::Best), &m);
     assert_eq!(field(&m, "a:0", "stream=codec_name"), "alac");
     assert_eq!(pcm(&w), pcm(&m), "m4a from a lossless source is lossless");
 
     // Lossy targets at their top settings, with resampling where the format needs it.
     let mp3 = d.p("s.mp3");
-    run_attempts(&w, &convert_attempts(&p, "mp3"), &mp3);
+    run_attempts(&w, &convert_attempts(&p, "mp3", Speed::Best), &mp3);
     assert_eq!(field(&mp3, "a:0", "stream=bit_rate"), "320000");
     assert_eq!(field(&mp3, "a:0", "stream=sample_rate"), "48000");
     let wma = d.p("s.wma");
-    run_attempts(&w, &convert_attempts(&p, "wma"), &wma);
+    run_attempts(&w, &convert_attempts(&p, "wma", Speed::Best), &wma);
     assert_eq!(field(&wma, "a:0", "stream=sample_rate"), "48000");
     if has_encoder("libopus") {
         let o = d.p("s.opus");
-        run_attempts(&w, &convert_attempts(&p, "opus"), &o);
+        run_attempts(&w, &convert_attempts(&p, "opus", Speed::Best), &o);
         assert_eq!(field(&o, "a:0", "stream=sample_rate"), "48000");
         // Stereo and surround have higher ceilings than mono.
         let st = d.p("st.flac");
         ffs(&["-f", "lavfi", "-i", "sine=r=48000:d=1", "-af", "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0", &st.display().to_string()]);
         let so = d.p("st.opus");
-        run_attempts(&st, &convert_attempts(&probe(&st), "opus"), &so);
+        run_attempts(&st, &convert_attempts(&probe(&st), "opus", Speed::Best), &so);
         assert_eq!(field(&so, "a:0", "stream=channels"), "6");
     }
 
@@ -713,7 +754,7 @@ fn audio_keeps_depth_rate_and_cover_art() {
     assert!(tp.cover);
     for t in ["mp3", "m4a"] {
         let o = d.p(&format!("cover.{t}"));
-        assert_eq!(run_attempts(&tagged, &convert_attempts(&tp, t), &o), 0, "{t}: cover attempt worked");
+        assert_eq!(run_attempts(&tagged, &convert_attempts(&tp, t, Speed::Best), &o), 0, "{t}: cover attempt worked");
         assert!(probe(&o).cover, "{t}: cover kept");
         assert!(field(&o, "", "format_tags=title").contains("Song"), "{t}: tags kept");
     }
@@ -944,12 +985,12 @@ fn encoders_some_builds_lack() {
         let f = d.p("s.flac");
         ffs(&["-f", "lavfi", "-i", "sine=r=44100:d=2", "-ac", "2", &f.display().to_string()]);
         let o = d.p("s.ogg");
-        run_attempts(&f, &convert_attempts(&probe(&f), "ogg"), &o);
+        run_attempts(&f, &convert_attempts(&probe(&f), "ogg", Speed::Best), &o);
         assert_eq!(field(&o, "a:0", "stream=codec_name"), "vorbis");
         let m = d.p("s.mp3");
         ffs(&["-i", &f.display().to_string(), "-c:a", "libmp3lame", "-b:a", "128k", &m.display().to_string()]);
         let o2 = d.p("m.ogg");
-        run_attempts(&m, &convert_attempts(&probe(&m), "ogg"), &o2);
+        run_attempts(&m, &convert_attempts(&probe(&m), "ogg", Speed::Best), &o2);
         assert_eq!(field(&o2, "a:0", "stream=codec_name"), "vorbis");
     } else { println!("not checked: Ogg Vorbis, this ffmpeg has no libvorbis"); }
 }

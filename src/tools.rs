@@ -319,7 +319,7 @@ fn image_spec(input: &Path) -> Result<preview::Spec, String> {
             let b = shrink_to(&source, values[1] as u32)?;
             let t = TempDir::new()?;
             let out = t.file(&format!("o.{}", compress_ext(&ext_of(&input), b.has_alpha())));
-            image::save(&b, &out, &SaveOpts { quality: values[0] as f32 / 100.0, fit: None })?;
+            image::save(&b, &out, &SaveOpts { quality: values[0] as f32 / 100.0, fit: None, ..Default::default() })?;
             Ok((t, out))
         }
     };
@@ -463,6 +463,10 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
         }
         "vid.redact" => {
             let sh = pick_shapes_video("Redact video", first, canvas::Mode::Redact, "Redact")?;
+            opts(&[("shapes", sh)])
+        }
+        "vid.annotate" => {
+            let sh = pick_shapes_video("Annotate video", first, canvas::Mode::Annotate, "Save")?;
             opts(&[("shapes", sh)])
         }
         "vid.compress" => {
@@ -820,7 +824,7 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
                 if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; resized = true; }
             }
             let ext = compress_ext(&ext_of(p), b.has_alpha());
-            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None });
+            let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None, ..Default::default() });
             if resized { res } else { only_if_smaller(j, p, res) }
         }),
         "img.metadata" => each("Saving metadata", paths, move |j, p| {
@@ -953,6 +957,24 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let l = quality::redact_args(&pr, &e, &f).ok_or(NO_LOSSLESS)?;
             if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
             media::transform(j, p, " redacted", Some(&l.ext), l.args)
+        }),
+        "vid.annotate" => each("Annotating", paths, move |j, p| {
+            if shapes.is_empty() { return Err("Nothing drawn to add".into()); }
+            // The annotations are drawn once, at the size the video shows at, into a clear picture laid over every frame.
+            let (w, h) = media::size(p).ok_or("Could not read the video size")?;
+            let layer = Bmp { w, h, px: canvas::annotation_layer(w, h, &shapes)? };
+            let t = TempDir::new()?;
+            let png = t.file("annotations.png");
+            image::save(&layer, &png, &SaveOpts::default())?;
+            let e = ext_of(p);
+            let (ext, args) = if e == "gif" { (e.clone(), quality::gif_edit_args(None)) } else {
+                let l = quality::lossless_args(&media::probe(p), &e, None, None, false).ok_or(NO_LOSSLESS)?;
+                if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
+                (l.ext, l.args)
+            };
+            let args = quality::overlay_args(&args).ok_or(NO_LOSSLESS)?;
+            let total = media::duration(p);
+            atomically(&sibling(p, " annotated", &ext), |tmp| media::ffmpeg(j, &[p, png.as_path()], &args, tmp, total))
         }),
         "vid.trim" | "aud.trim" => each("Trimming", paths, move |j, p| {
             let (a, b) = match marks[..] { [a, b, ..] => (a, b), _ => return Err("Needs a start and an end".into()) };

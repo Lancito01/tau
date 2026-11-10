@@ -22,6 +22,76 @@ const CONVERT_VP9_CRF: &str = "4";
 /// GIF timing has centisecond steps, and browsers slow down anything faster than 2 of them.
 const GIF_MAX_FPS: f64 = 50.0;
 
+/// How a slow conversion trades fidelity for time. `Best` keeps everything the target can hold; the rest give some of it
+/// up to finish sooner, `Fast` the most. Only conversions where this changes the time much offer a choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Speed { #[default] Best, Quality, Balanced, Fast }
+
+impl Speed {
+    pub const ALL: [Speed; 4] = [Speed::Best, Speed::Quality, Speed::Balanced, Speed::Fast];
+    pub fn id(self) -> &'static str {
+        match self { Speed::Best => "best", Speed::Quality => "quality", Speed::Balanced => "balanced", Speed::Fast => "fast" }
+    }
+    pub fn from_id(s: &str) -> Option<Speed> { Speed::ALL.into_iter().find(|v| v.id() == s) }
+}
+
+/// GIF frame rate, longest side and dither for each quick speed. A GIF stores every frame whole, with no motion
+/// prediction, so frame rate and size drive both file size and encode time. An ordered (Bayer) dither repeats one pattern
+/// frame to frame, so it compresses far better than error diffusion and runs about twice as fast, with slight banding.
+/// Measured in the app on 5 s of 1080p30 (time, size, SSIM): Best 14.1 s, 172 MB, 0.983; Quality 5.7 s, 24 MB, 0.975;
+/// Balanced 3.0 s, 11 MB, 0.972; Fast 2.1 s, 6 MB, 0.960.
+fn gif_preset(s: Speed) -> Option<(f64, u32, &'static str)> {
+    match s {
+        Speed::Best => None,
+        Speed::Quality => Some((20.0, 800, "sierra2_4a")),
+        Speed::Balanced => Some((15.0, 640, "bayer:bayer_scale=5")),
+        Speed::Fast => Some((12.0, GIF_ONE_PASS_SIDE, "bayer:bayer_scale=3")),
+    }
+}
+
+/// At this size a frame's palette is cheap enough that starting a process per part costs more than it saves: Fast took
+/// 2.7 s in parts and 2.1 s in one pass.
+const GIF_ONE_PASS_SIDE: u32 = 480;
+
+/// x264 preset and CRF for each quick speed. Measured in the app on 5 s of 1080p MPEG-2 (time, SSIM): Best 6.7 s, 0.9905;
+/// Quality 3.8 s, 0.9904; Balanced 1.4 s, 0.9893; Fast 0.8 s, 0.9812.
+fn x264_preset(s: Speed) -> (&'static str, &'static str) {
+    match s {
+        Speed::Best => ("slow", CONVERT_X264_CRF),
+        Speed::Quality => ("medium", "16"),
+        Speed::Balanced => ("veryfast", "20"),
+        Speed::Fast => ("ultrafast", "24"),
+    }
+}
+
+/// VP9 deadline, cpu-used and CRF for each quick speed. Measured on 5 s of 1080p (time, SSIM): Best 16.9 s, 0.9913;
+/// realtime 4 at CRF 26 2.8 s, 0.9910, where good 4 at CRF 24 took 14.5 s for 0.9909; Balanced 1.9 s, 0.9894; Fast
+/// 1.4 s, 0.9871.
+fn vp9_preset(s: Speed) -> (&'static str, &'static str, &'static str) {
+    match s {
+        Speed::Best | Speed::Quality => ("realtime", "4", "26"),
+        Speed::Balanced => ("realtime", "6", "30"),
+        Speed::Fast => ("realtime", "8", "34"),
+    }
+}
+
+/// libaom CRF and cpu-used for an AVIF picture at each quick speed. Lossless at cpu-used 4 takes 6.3 s for a 1080p
+/// frame; CRF 20 at cpu-used 8 takes 0.7 s.
+pub fn avif_quick_args(s: Speed) -> Option<Vec<String>> {
+    let (crf, cpu) = match s { Speed::Best => return None, Speed::Quality => ("12", "6"), Speed::Balanced => ("20", "8"), Speed::Fast => ("28", "8") };
+    Some(sv(&["-c:v", "libaom-av1", "-still-picture", "1", "-crf", crf, "-pix_fmt", "yuv444p", "-cpu-used", cpu]))
+}
+
+/// True when the speed choice changes how long converting to `target` takes. Copying a stream is already instant, and
+/// the older codecs and audio are quick at their best.
+pub fn speed_matters(p: &Probe, target: &str) -> bool {
+    match target {
+        "gif" => true,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" => p.video.as_ref().is_none_or(|v| !video_fits(target, &v.codec)),
+        _ => false,
+    }
+}
+
 fn sv(v: &[&str]) -> Vec<String> { v.iter().map(|x| x.to_string()).collect() }
 
 // ---- what is in the file ----
@@ -482,6 +552,7 @@ pub fn gif_part_args(args: &[String], from: Option<f64>, to: Option<f64>) -> Opt
     let vf = args.get(i)?;
     // A rectangle diff makes a frame depend on the one before it.
     if vf.matches(GIF_PALETTE).count() != 1 || vf.contains("diff_mode=rectangle") { return None; }
+    if vf.contains(&format!("min({GIF_ONE_PASS_SIDE},iw)")) { return None; }
     let after = |b: f64| format!("gte(t,{b:.6})*lt(prev_t,{b:.6})");
     let expr = match (from, to) {
         (None, Some(b)) => format!("lt(t,{b:.6})+{}", after(b)),
@@ -491,6 +562,23 @@ pub fn gif_part_args(args: &[String], from: Option<f64>, to: Option<f64>) -> Opt
     };
     let mut out = args.to_vec();
     out[i] = vf.replacen(GIF_PALETTE, &format!("select='{expr}',{GIF_PALETTE}"), 1);
+    Some(out)
+}
+
+// ---- annotation ----
+
+/// The same arguments with a still picture, given as the second input, laid over the whole video before the rest of
+/// the filter. Where the picture is clear, overlay leaves a sample as it was.
+pub fn overlay_args(args: &[String]) -> Option<Vec<String>> {
+    let i = args.iter().position(|a| a == "-vf")?;
+    let chain = args.get(i + 1)?;
+    let mut out = args.to_vec();
+    out[i] = "-filter_complex".into();
+    out[i + 1] = format!("[0:V:0][1:v]overlay=format=auto:eof_action=repeat,{chain}[annotated]");
+    match out.windows(2).position(|w| w[0] == "-map" && w[1] == "0:V:0") {
+        Some(m) => out[m + 1] = "[annotated]".into(),
+        None => out.splice(0..0, ["-map".to_string(), "[annotated]".to_string()]).for_each(drop),
+    }
     Some(out)
 }
 
@@ -621,16 +709,18 @@ fn x264_cap(kbps: u32) -> Vec<String> {
 /// Encoder arguments for a video target, chosen by what the source is worth: lossless when it is lossless and the format
 /// can hold that, otherwise capped to match it. Keeps depth and chroma, and pads rather than resamples a frame whose odd
 /// size a codec cannot store: a scale filter would soften every pixel to add one row.
-fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
+fn encode_video(target: &str, v: Option<&VideoInfo>, speed: Speed) -> Vec<String> {
     let pix = v.map(|i| i.pix_fmt.as_str()).unwrap_or("");
-    let lossless_source = v.is_some_and(|i| video_is_lossless(&i.codec));
+    // A quick speed has already accepted some loss, so a lossless source is encoded like any other.
+    let lossless_source = speed == Speed::Best && v.is_some_and(|i| video_is_lossless(&i.codec));
     let mut a: Vec<String> = vec![];
     let fmt = match target {
         "mp4" | "m4v" | "mov" | "mkv" => {
             if lossless_source {
                 a.extend(sv(&["-c:v", "libx264", "-qp", "0", "-preset", "medium"]));
             } else {
-                a.extend(sv(&["-c:v", "libx264", "-preset", "slow", "-crf", CONVERT_X264_CRF]));
+                let (preset, crf) = x264_preset(speed);
+                a.extend(sv(&["-c:v", "libx264", "-preset", preset, "-crf", crf]));
                 if let Some(k) = v.and_then(|i| video_budget(i, 1.0)) { a.extend(x264_cap(k)); }
             }
             (!pix.is_empty()).then(|| x264_nearest(pix))
@@ -638,6 +728,9 @@ fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
         "webm" => {
             if lossless_source {
                 a.extend(sv(&["-c:v", "libvpx-vp9", "-lossless", "1", "-row-mt", "1", "-deadline", "good", "-cpu-used", "2"]));
+            } else if speed != Speed::Best {
+                let (deadline, cpu, crf) = vp9_preset(speed);
+                a.extend(sv(&["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", crf, "-deadline", deadline, "-cpu-used", cpu, "-row-mt", "1"]));
             } else {
                 // A VP9 target bitrate lands well under what it is given, so this counts as H.264's budget, not its own.
                 let k = v.and_then(|i| video_budget(i, 1.0)).map(|k| format!("{k}k")).unwrap_or_else(|| "0".to_string());
@@ -681,12 +774,15 @@ fn encode_video(target: &str, v: Option<&VideoInfo>) -> Vec<String> {
     a
 }
 
-fn gif_args(v: Option<&VideoInfo>) -> Vec<String> {
-    let cap = v.is_some_and(|i| i.fps > GIF_MAX_FPS);
-    let still = v.and_then(still_filter).map(|f| format!("{f},")).unwrap_or_default();
-    let lead = if cap { format!("{still}fps={GIF_MAX_FPS},") } else { still };
+fn gif_args(v: Option<&VideoInfo>, speed: Speed) -> Vec<String> {
+    let mut lead = v.and_then(still_filter).map(|f| format!("{f},")).unwrap_or_default();
+    let (fps, side, dither) = gif_preset(speed).map(|(f, s, d)| (f, Some(s), d)).unwrap_or((GIF_MAX_FPS, None, "floyd_steinberg"));
+    // Only ever lowered: a slower source would just get repeated frames.
+    if v.is_some_and(|i| i.fps > fps) { lead.push_str(&format!("fps={fps},")); }
+    // Fits the long side within the limit and never enlarges. Bicubic is plenty for a shrink and faster than lanczos.
+    if let Some(s) = side { lead.push_str(&format!("scale='min({s},iw)':'min({s},ih)':force_original_aspect_ratio=decrease:flags=bicubic,")); }
     vec!["-map".into(), "0:V:0".into(),
-        "-vf".into(), format!("{lead}split[a][b];[a]palettegen=stats_mode=single[p];[b][p]paletteuse=new=1:dither=floyd_steinberg"),
+        "-vf".into(), format!("{lead}{GIF_PALETTE}:dither={dither}"),
         "-sws_flags".into(), "lanczos+accurate_rnd+full_chroma_int".into(), "-an".into()]
 }
 
@@ -705,9 +801,9 @@ pub fn audio_target_args(p: &Probe, target: &str, with_cover: bool) -> Vec<Strin
 
 /// Attempts in order of how much of the original they keep. A later one runs only if the one before failed,
 /// which is how the unusual combinations a table cannot predict still end up with a file.
-pub fn convert_attempts(p: &Probe, target: &str) -> Vec<Vec<String>> {
+pub fn convert_attempts(p: &Probe, target: &str, speed: Speed) -> Vec<Vec<String>> {
     match target {
-        "gif" => vec![gif_args(p.video.as_ref())],
+        "gif" => vec![gif_args(p.video.as_ref(), speed)],
         "mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "aiff" | "wma" => {
             let mut v = vec![];
             if p.cover && p.video.is_none() && matches!(target, "mp3" | "m4a" | "flac") { v.push(audio_target_args(p, target, true)); }
@@ -717,7 +813,7 @@ pub fn convert_attempts(p: &Probe, target: &str) -> Vec<Vec<String>> {
         _ => {
             let Some(info) = p.video.as_ref() else {
                 // ffprobe is missing or could not read the file: still the best encoder settings, for what ffmpeg picks.
-                let mut a = encode_video(target, None);
+                let mut a = encode_video(target, None, speed);
                 push_audio(&mut a, 0, &encode_audio(target, &AudioInfo::default(), None));
                 a.extend(keep_frames_as_they_are(target));
                 a.extend(container_flags(target));
@@ -730,7 +826,7 @@ pub fn convert_attempts(p: &Probe, target: &str) -> Vec<Vec<String>> {
                     // Windows and Apple players want this tag on HEVC in these containers.
                     if info.codec == "hevc" && matches!(target, "mp4" | "m4v" | "mov") { a.extend(sv(&["-tag:v", "hvc1"])); }
                 } else {
-                    a.extend(encode_video(target, Some(info)));
+                    a.extend(encode_video(target, Some(info), speed));
                     a.extend(keep_frames_as_they_are(target));
                 }
                 a.extend(audio_streams(p, target, None));
@@ -1260,25 +1356,48 @@ format.bit_rate="5000000"
     fn every_target_has_arguments() {
         let p = parse_probe(FLAT);
         for t in ["mp4", "mov", "mkv", "webm", "avi", "wmv", "gif", "mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma"] {
-            let a = convert_attempts(&p, t);
+            let a = convert_attempts(&p, t, Speed::Best);
             assert!(!a.is_empty() && a.iter().all(|x| !x.is_empty()), "{t}");
         }
     }
     #[test]
     fn matching_codecs_are_copied_first() {
         let p = parse_probe(FLAT);
-        let first = convert_attempts(&p, "mkv").remove(0).join(" ");
+        let first = convert_attempts(&p, "mkv", Speed::Best).remove(0).join(" ");
         assert!(first.contains("-c:v copy") && first.contains("-c:a:0 copy"), "{first}");
-        let m4a = convert_attempts(&p, "m4a").remove(0).join(" ");
+        let m4a = convert_attempts(&p, "m4a", Speed::Best).remove(0).join(" ");
         assert!(m4a.contains("-c:a:0 copy"), "{m4a}");
     }
     #[test]
-    fn gif_keeps_size_and_frame_rate_up_to_the_format_limit() {
+    fn gif_best_keeps_size_and_frame_rate_up_to_the_format_limit() {
         let mut p = parse_probe(FLAT);
-        let a = convert_attempts(&p, "gif").remove(0).join(" ");
-        assert!(!a.contains("fps=") && !a.contains("scale"), "{a}");
+        let a = convert_attempts(&p, "gif", Speed::Best).remove(0).join(" ");
+        assert!(!a.contains("fps=") && !a.contains("scale") && a.contains("floyd_steinberg"), "{a}");
         p.video.as_mut().unwrap().fps = 60.0;
-        assert!(convert_attempts(&p, "gif").remove(0).join(" ").contains("fps=50"));
+        assert!(convert_attempts(&p, "gif", Speed::Best).remove(0).join(" ").contains("fps=50"));
+    }
+    #[test]
+    fn gif_is_made_in_parts_unless_small_enough_for_one_pass() {
+        let p = parse_probe(FLAT);
+        for s in [Speed::Best, Speed::Quality, Speed::Balanced] { assert!(gif_part_args(&convert_attempts(&p, "gif", s)[0], Some(1.0), Some(2.0)).is_some(), "{s:?}"); }
+        assert!(gif_part_args(&convert_attempts(&p, "gif", Speed::Fast)[0], Some(1.0), Some(2.0)).is_none());
+    }
+    #[test]
+    fn speed_is_offered_only_where_it_saves_time() {
+        let p = parse_probe(FLAT);
+        assert!(speed_matters(&p, "gif") && speed_matters(&p, "webm"));
+        assert!(!speed_matters(&p, "mkv"), "HEVC copies into MKV");
+        assert!(!speed_matters(&p, "mp3") && !speed_matters(&p, "avi"));
+        assert!(encode_video("mp4", p.video.as_ref(), Speed::Fast).join(" ").contains("ultrafast"));
+        assert_eq!(Speed::from_id("balanced"), Some(Speed::Balanced));
+    }
+    #[test]
+    fn gif_is_shrunk_to_a_light_size_and_frame_rate() {
+        let mut p = parse_probe(FLAT);
+        let a = convert_attempts(&p, "gif", Speed::Balanced).remove(0).join(" ");
+        assert!(a.contains("fps=15") && a.contains("min(640,iw)") && a.contains("dither=bayer"), "{a}");
+        p.video.as_mut().unwrap().fps = 10.0;
+        assert!(!convert_attempts(&p, "gif", Speed::Balanced).remove(0).join(" ").contains("fps="), "a slow source keeps its rate");
     }
     #[test]
     fn opus_bitrate_respects_the_per_channel_limit() {
@@ -1317,6 +1436,15 @@ format.bit_rate="5000000"
         assert!(lossless_args(&p, "mkv", Some("null"), None, false).unwrap().args.join(" ").contains("0:t"));
     }
     #[test]
+    fn overlay_goes_in_front_of_the_filter_and_replaces_the_video_map() {
+        let a = overlay_args(&sv(&["-map", "0:V:0", "-vf", "format=yuv420p", "-c:v", "libx264", "-map", "0:a?"])).unwrap();
+        assert_eq!(a, sv(&["-map", "[annotated]", "-filter_complex", "[0:V:0][1:v]overlay=format=auto:eof_action=repeat,format=yuv420p[annotated]", "-c:v", "libx264", "-map", "0:a?"]));
+        let g = overlay_args(&gif_edit_args(None)).unwrap();
+        assert_eq!(&g[..2], &sv(&["-map", "[annotated]"])[..]);
+        assert!(g[3].starts_with("[0:V:0][1:v]overlay") && g[3].ends_with("[annotated]"));
+        assert!(overlay_args(&sv(&["-c", "copy"])).is_none());
+    }
+    #[test]
     fn redact_box_only_grows_and_stays_inside() {
         assert_eq!(redact_box(101, 61, 10, 10, 640, 360), (100, 60, 12, 12));
         assert_eq!(redact_box(100, 60, 10, 10, 640, 360), (100, 60, 10, 10));
@@ -1336,15 +1464,15 @@ format.bit_rate="5000000"
     #[test]
     fn lossy_sources_are_capped_and_lossless_ones_are_not() {
         let v = VideoInfo { codec: "h264".into(), pix_fmt: "yuv420p".into(), width: 640, height: 360, bitrate: 5_000_000, ..Default::default() };
-        let a = encode_video("mov", Some(&v)).join(" ");
+        let a = encode_video("mov", Some(&v), Speed::Best).join(" ");
         assert!(a.contains("-maxrate 4000k") && a.contains("-crf"), "{a}");
         let hevc = VideoInfo { codec: "hevc".into(), ..v.clone() };
-        assert!(encode_video("mp4", Some(&hevc)).join(" ").contains("-maxrate 6666k"), "HEVC needs more bits as H.264");
+        assert!(encode_video("mp4", Some(&hevc), Speed::Best).join(" ").contains("-maxrate 6666k"), "HEVC needs more bits as H.264");
         let raw = VideoInfo { codec: "ffv1".into(), ..v.clone() };
-        let l = encode_video("mp4", Some(&raw)).join(" ");
+        let l = encode_video("mp4", Some(&raw), Speed::Best).join(" ");
         assert!(l.contains("-qp 0") && !l.contains("-maxrate"), "{l}");
-        assert!(encode_video("avi", Some(&raw)).join(" ").contains("ffv1"));
-        assert!(encode_video("webm", Some(&raw)).join(" ").contains("-lossless 1"));
+        assert!(encode_video("avi", Some(&raw), Speed::Best).join(" ").contains("ffv1"));
+        assert!(encode_video("webm", Some(&raw), Speed::Best).join(" ").contains("-lossless 1"));
     }
     #[test]
     fn audio_bitrate_follows_a_lossy_source() {

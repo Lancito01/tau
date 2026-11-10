@@ -128,8 +128,10 @@ pub struct SaveOpts {
     /// A lossy source's size in bytes. WebP and AVIF then keep the best setting that does not outgrow it, in place of a
     /// lossless copy that would be several times the size and show nothing more.
     pub fit: Option<u64>,
+    /// A quick speed swaps AVIF's slow lossless encode for a fast lossy one, and ignores `quality` and `fit`.
+    pub speed: crate::quality::Speed,
 }
-impl Default for SaveOpts { fn default() -> Self { SaveOpts { quality: 1.0, fit: None } } }
+impl Default for SaveOpts { fn default() -> Self { SaveOpts { quality: 1.0, fit: None, speed: Default::default() } } }
 
 fn property(bag: &IPropertyBag2Wrap, name: PCWSTR, v: f32) { bag.write(name, VARIANT::from(v)); }
 
@@ -212,14 +214,15 @@ fn ffmpeg_still(png: &Path, out: &Path, ext: &str, o: &SaveOpts) -> std::result:
     let ff = crate::ffmpeg().ok_or("Needs ffmpeg")?;
     let lossless = o.quality >= 1.0;
     let aom = |crf: i32| -> Vec<String> { vec!["-c:v".into(), "libaom-av1".into(), "-still-picture".into(), "1".into(), "-crf".into(), crf.to_string(), "-pix_fmt".into(), "yuv444p".into(), "-cpu-used".into(), "4".into()] };
-    let encoders: Vec<Vec<String>> = match (ext, lossless) {
+    let quick = if ext == "avif" { crate::quality::avif_quick_args(o.speed) } else { None };
+    let encoders: Vec<Vec<String>> = if let Some(q) = quick { vec![q] } else { match (ext, lossless) {
         (_, true) if o.fit.is_some() => crate::quality::still_ladder(ext),
         ("webp", true) => vec![crate::quality::image_encode_args("webp")],
         ("webp", false) => vec![vec!["-c:v".into(), "libwebp".into(), "-quality".into(), ((o.quality * 100.0) as i32).to_string()]],
         // A build that refuses RGB AVIF still gets the closest thing to lossless it can do.
         (_, true) => vec![crate::quality::image_encode_args("avif"), aom(0)],
         (_, false) => vec![aom(((1.0 - o.quality) * 63.0) as i32 + 8)],
-    };
+    } };
     let mut last = Err("Nothing to do".to_string());
     for enc in encoders {
         let mut a: Vec<String> = vec!["-y".into(), "-hide_banner".into(), "-i".into(), png.display().to_string()];
@@ -228,7 +231,7 @@ fn ffmpeg_still(png: &Path, out: &Path, ext: &str, o: &SaveOpts) -> std::result:
         last = run(None, &ff, &a, None).map(|_| ());
         if last.is_err() { continue; }
         // Without a size to fit, the first that works is the one. With one, the first that fits; the last tried otherwise.
-        let Some(limit) = o.fit else { break };
+        let Some(limit) = o.fit.filter(|_| o.speed == crate::quality::Speed::Best) else { break };
         if std::fs::metadata(out).is_ok_and(|m| m.len() <= limit) { break; }
     }
     last
@@ -498,7 +501,7 @@ pub fn write_rgba_png(rgba: &[u8], w: u32, h: u32, out: &Path) -> std::result::R
     wic_save(&Bmp { w, h, px }, out, "png", &SaveOpts::default(), &Carry::default()).map_err(es)
 }
 
-pub fn convert(job: &Job, input: &Path, target: &str) -> std::result::Result<PathBuf, String> {
+pub fn convert(job: &Job, input: &Path, target: &str, speed: crate::quality::Speed) -> std::result::Result<PathBuf, String> {
     let n = load_native(input)?;
     if job.cancelled() { return Err("Cancelled".into()); }
     job.set_frac(0.5);
@@ -508,7 +511,7 @@ pub fn convert(job: &Job, input: &Path, target: &str) -> std::result::Result<Pat
     // A WebP says which kind it is in its first chunk.
     let lossy = matches!(e.as_str(), "jpg" | "jpeg" | "heic" | "heif" | "avif") || (e == "webp" && bytes.as_ref().is_some_and(|b| b.get(12..16) == Some(b"VP8 ")));
     let fit = if lossy { bytes.map(|b| b.len() as u64) } else { None };
-    atomically(&out, |tmp| save_native(&n, tmp, &SaveOpts { fit, ..Default::default() }))
+    atomically(&out, |tmp| save_native(&n, tmp, &SaveOpts { fit, speed, ..Default::default() }))
 }
 
 /// Removes metadata without touching the pixels. Returns None for anything it cannot walk safely.
