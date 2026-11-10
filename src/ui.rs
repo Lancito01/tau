@@ -50,6 +50,8 @@ pub mod glyph {
     pub const MUSIC: u16 = 0xE8D6;
     pub const WARNING: u16 = 0xE7BA;
     pub const ADD: u16 = 0xE710;
+    pub const PLAY: u16 = 0xE768;
+    pub const PAUSE: u16 = 0xE769;
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]

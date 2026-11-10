@@ -480,6 +480,8 @@ pub struct FrameSource {
     pub fps: f64,
     pub pages: u32,
     pub load: Arc<dyn Fn(f64) -> std::result::Result<Bmp, String> + Send + Sync>,
+    /// Lets a video play, not only be scrubbed.
+    pub play: Option<crate::player::Source>,
 }
 
 /// The marks and history of a page that is not the one on screen.
@@ -504,6 +506,9 @@ struct Scrub {
     /// Recent video frames by position, newest last, so going back to one is instant.
     cache: Vec<(f64, Bmp)>,
     error: Option<String>,
+    player: Option<crate::player::Player>,
+    /// Playing was paused by dragging the slider, and goes on from wherever it is let go.
+    resume: bool,
 }
 
 /// Video frames fetched side by side while the slider moves. Pages go one at a time, since their marks follow them.
@@ -589,7 +594,7 @@ impl Editor {
         let (wa, s) = (work_area_at(at), dpi_scale_at(at));
         let start_size = (((wa.right - wa.left) as f32 / s * 0.75).max(900.0), ((wa.bottom - wa.top) as f32 / s * 0.75).max(600.0));
         let pages = scrub.as_ref().map(|f| (0..f.pages).map(|_| PageState::default()).collect()).unwrap_or_default();
-        let scrub = scrub.filter(|f| f.dur > 0.0).map(|source| Scrub { source, pos: 0.0, requested: 0.0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), seq: 0, shown_seq: 0, cache: vec![], error: None });
+        let scrub = scrub.filter(|f| f.dur > 0.0).map(|source| Scrub { source, pos: 0.0, requested: 0.0, loading: vec![], slot: Arc::new(Mutex::new(vec![])), seq: 0, shown_seq: 0, cache: vec![], error: None, player: None, resume: false });
         Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
@@ -1171,6 +1176,26 @@ impl Editor {
     // ---- video ----
 
     fn scrubber(&mut self, ui: &mut Ui, q: R) {
+        let mut toggle = false;
+        self.scrub_bar(ui, q, &mut toggle);
+        if toggle { self.toggle_play(); }
+    }
+
+    /// Plays from the slider's point, or pauses. Paused, the exact frame there is read in, as when scrubbing.
+    fn toggle_play(&mut self) {
+        let size = (self.preview.w, self.preview.h);
+        let Some(sc) = self.scrub.as_mut().filter(|s| s.source.pages == 0) else { return };
+        if sc.player.take().is_some() { sc.requested = -1.0; return; }
+        if std::mem::take(&mut sc.resume) { return; }
+        let Some(src) = sc.source.play.as_ref() else { return };
+        let dur = sc.source.dur;
+        let from = crate::player::start_from((sc.pos / 1000.0) as f64 * dur, 0.0, dur, sc.source.fps);
+        sc.pos = (from / dur.max(0.001) * 1000.0) as f32;
+        sc.requested = sc.pos;
+        sc.player = Some(crate::player::Player::start(src, from, dur, size));
+    }
+
+    fn scrub_bar(&mut self, ui: &mut Ui, q: R, toggle: &mut bool) {
         let marked = self.pages.iter().enumerate().filter(|(i, p)| if *i == self.page { !self.items.is_empty() } else { !p.items.is_empty() }).count();
         let Some(sc) = self.scrub.as_mut() else { return };
         ui.fill(q, 0.0, SURFACE, 0.6);
@@ -1187,9 +1212,31 @@ impl Editor {
             ui.text(&note, r(q.right() - PAD - 200.0, q.y, 200.0, q.h), 12.0, 500, MUTED, Align::Right);
         } else {
             let t = (sc.pos / 1000.0) as f64 * sc.source.dur;
-            ui.slider("ed.scrub", r(q.x + PAD - 9.0, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0, 28.0), 0.0, 1000.0, 0.0, &mut sc.pos);
+            let bw = if sc.source.play.is_some() { 42.0 } else { 0.0 };
+            if bw > 0.0 {
+                let g = if sc.player.is_some() || sc.resume { glyph::PAUSE } else { glyph::PLAY };
+                if ui.icon_button("ed.play", g, r(q.x + PAD - 6.0, q.y + (q.h - 36.0) / 2.0, 36.0, 36.0), 13.0, false) { *toggle = true; }
+            }
+            let before = sc.pos;
+            ui.slider("ed.scrub", r(q.x + PAD - 9.0 + bw, q.y + 14.0, q.w - PAD * 2.0 - 132.0 + 18.0 - bw, 28.0), 0.0, 1000.0, 0.0, &mut sc.pos);
+            // Dragging while playing holds it at the slider, and it plays on from wherever it is let go.
+            if sc.pos != before && sc.player.take().is_some() { sc.resume = true; }
+            if sc.resume && !ui.down { sc.resume = false; *toggle = true; }
             let label = format!("{} / {}", timecode(t, fps), timecode(sc.source.dur, fps));
             ui.text(&label, r(q.right() - PAD - 124.0, q.y, 124.0, q.h), 12.0, 500, MUTED, Align::Right);
+        }
+        if let Some(pl) = sc.player.as_mut() {
+            if let Some(b) = pl.tick() {
+                self.preview = b;
+                self.shown_for = None;
+                self.scratch.clear();
+                ui.forget_image(id("ed.image"));
+            }
+            sc.pos = (pl.time() / sc.source.dur.max(0.001) * 1000.0).clamp(0.0, 1000.0) as f32;
+            sc.requested = sc.pos;
+            ui.want_anim = true;
+            // The last frame played stands in until the exact one at that point has been read.
+            if pl.ended() { sc.player = None; sc.requested = -1.0; }
         }
 
         let arrived: Vec<_> = std::mem::take(&mut *sc.slot.lock().unwrap());
@@ -1301,6 +1348,7 @@ impl Editor {
         }
         match ui.ctrl_key(VK_Z) { Some(true) => self.step_redo(), Some(false) => self.step_undo(), None => {} }
         if ui.ctrl_key(VK_Y).is_some() { self.step_redo(); }
+        if ui.key(VK_SPACE) { self.toggle_play(); }
         if ui.key(VK_PRIOR) { self.turn_page(-1); }
         if ui.key(VK_NEXT) { self.turn_page(1); }
     }
@@ -1358,7 +1406,7 @@ fn run(title: &str, bmp: Bmp, mode: Mode, initial: Vec<Shape>, save_label: &str,
 
 /// The redaction editor over a document, one page at a time. Gives the marks of every page, in page order.
 pub fn redact_pages(title: &str, first: Bmp, count: u32, save_label: &str, load: Arc<dyn Fn(u32) -> std::result::Result<Bmp, String> + Send + Sync>) -> Option<Vec<Vec<Shape>>> {
-    let source = FrameSource { dur: count.max(1) as f64, fps: 0.0, pages: count.max(1), load: Arc::new(move |at| load(at as u32)) };
+    let source = FrameSource { dur: count.max(1) as f64, fps: 0.0, pages: count.max(1), load: Arc::new(move |at| load(at as u32)), play: None };
     open(title, first, Mode::Redact, vec![], save_label, Some(source)).map(|e| e.output_pages())
 }
 
@@ -1380,7 +1428,7 @@ pub fn render(mode: Mode, bmp: Bmp, shapes: Vec<Shape>, sel: usize, video: Optio
         (Mode::Redact, true) => "Redact video",
         (Mode::Annotate, _) => "Annotate",
     };
-    let source = video.map(|dur| FrameSource { dur, fps: 30.0, pages: 0, load: Arc::new(|_| Err(String::new())) });
+    let source = video.map(|dur| FrameSource { dur, fps: 30.0, pages: 0, load: Arc::new(|_| Err(String::new())), play: None });
     let mut e = Editor::new(title, bmp, mode, shapes, title, source);
     e.sub = "holiday.jpg".into();
     e.start_size = (1180.0, 720.0);
