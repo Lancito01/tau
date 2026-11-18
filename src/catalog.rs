@@ -64,6 +64,8 @@ fn fmt(id: &'static str, label: &'static str) -> Entry { Entry { id, label, icon
 fn tool(id: &'static str, label: &'static str, icon: u16) -> Entry { Entry { id, label, icon, blocked: None } }
 
 const NEED_FFMPEG: &str = "Needs ffmpeg";
+/// Still formats a GIF can convert to. They keep its first frame.
+pub const GIF_STILLS: [&str; 4] = ["png", "jpg", "webp", "bmp"];
 const NEED_WORD: &str = "Needs Word";
 const NEED_EXCEL: &str = "Needs Excel";
 const NEED_PPT: &str = "Needs PowerPoint";
@@ -78,11 +80,19 @@ fn convert_targets(cat: Cat, src_ext: &str, e: &Engines) -> Vec<Entry> {
             needs(fmt("webp", "WEBP"), e.ffmpeg, NEED_FFMPEG),
             needs(fmt("heic", "HEIC"), e.ffmpeg, NEED_FFMPEG), fmt("tiff", "TIFF"),
             needs(fmt("avif", "AVIF"), e.ffmpeg, NEED_FFMPEG),
-            fmt("bmp", "BMP"), fmt("pdf", "PDF"),
+            fmt("bmp", "BMP"), fmt("gif", "GIF"), fmt("pdf", "PDF"),
         ],
-        Cat::Video => ["mp4", "mov", "mkv", "webm", "avi", "wmv", "gif", "mp3"].iter().zip(
-            ["MP4", "MOV", "MKV", "WEBM", "AVI", "WMV", "GIF", "MP3"].iter())
-            .map(|(i, l)| needs(fmt(i, l), e.ffmpeg, NEED_FFMPEG)).collect(),
+        Cat::Video => {
+            let mut v: Vec<Entry> = ["mp4", "mov", "mkv", "webm", "avi", "wmv", "gif", "mp3"].iter().zip(
+                ["MP4", "MOV", "MKV", "WEBM", "AVI", "WMV", "GIF", "MP3"].iter())
+                .map(|(i, l)| needs(fmt(i, l), e.ffmpeg, NEED_FFMPEG)).collect();
+            if src_ext == "gif" {
+                v.retain(|en| en.id != "gif");
+                v.extend([fmt("png", "PNG"), fmt("jpg", "JPG"),
+                    needs(fmt("webp", "WEBP"), e.ffmpeg, NEED_FFMPEG), fmt("bmp", "BMP")]);
+            }
+            v
+        }
         Cat::Audio => ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma"].iter().zip(
             ["MP3", "M4A", "WAV", "FLAC", "OGG", "OPUS", "AIFF", "WMA"].iter())
             .map(|(i, l)| needs(fmt(i, l), e.ffmpeg, NEED_FFMPEG)).collect(),

@@ -82,6 +82,9 @@ pub fn one(job: &Job, input: &Path, target: &str, speed: Speed) -> Result<PathBu
             atomically(&out, |tmp| crate::pdf::images_to_pdf(job, &[input.to_path_buf()], tmp))
         }
         Cat::Image => crate::image::convert(job, input, target, speed),
+        // A GIF to a still format takes its first frame through the image path.
+        Cat::Video if ext_of(input) == "gif" && crate::catalog::GIF_STILLS.contains(&target) =>
+            crate::image::convert(job, input, target, speed),
         Cat::Video | Cat::Audio => crate::media::convert(job, input, target, speed),
         Cat::Pdf => crate::docs::convert_pdf(job, input, target),
         Cat::Doc => crate::docs::convert_doc(job, input, target),
@@ -164,6 +167,26 @@ mod tests {
         assert!(!offers_speeds(&p("a.png"), "jpg"));
         assert!(!offers_speeds(&p("a.mp4"), "mp3"));
         assert!(!offers_speeds(&p("a.docx"), "pdf"));
+    }
+    #[test]
+    fn images_and_gifs_convert_both_ways() {
+        crate::job::com_init();
+        let d = std::env::temp_dir().join(format!("tau-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let px: Vec<u8> = (0..32 * 24).flat_map(|i| [(i * 7) as u8, (i * 3) as u8, 200, 255]).collect();
+        let png = d.join("pic.png");
+        crate::image::write_rgba_png(&px, 32, 24, &png).unwrap();
+        let job = Job::default();
+        let gif = one(&job, &png, "gif", Speed::default()).unwrap();
+        assert_eq!(std::fs::read(&gif).unwrap().get(..3), Some(&b"GIF"[..]));
+        let back = one(&job, &gif, "png", Speed::default()).unwrap();
+        assert_eq!(crate::image::load(&back).map(|b| (b.w, b.h)), Ok((32, 24)));
+        if crate::ffmpeg().is_some() {
+            let webp = one(&job, &png, "webp", Speed::default()).unwrap();
+            let from_webp = one(&job, &webp, "gif", Speed::default()).unwrap();
+            assert_eq!(crate::image::load(&from_webp).map(|b| (b.w, b.h)), Ok((32, 24)));
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
     #[test]
     fn presets_show_as_a_dropdown() {
