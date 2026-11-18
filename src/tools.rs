@@ -834,8 +834,8 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             j.set_frac(0.4);
             let mut resized = false;
             if let Ok(max) = get(&o, "max", "").parse::<u32>() {
-                let long = b.w.max(b.h);
-                if long > max { let f = max as f64 / long as f64; b = b.scaled((b.w as f64 * f) as u32, (b.h as f64 * f) as u32)?; resized = true; }
+                // 0 means keep the original size, as in the preview.
+                if max > 0 && b.w.max(b.h) > max { b = shrink_to(&b, max)?; resized = true; }
             }
             let ext = compress_ext(&ext_of(p), b.has_alpha());
             let res = save_new(&b, sibling(p, " compressed", &ext), &SaveOpts { quality: quality_of(get(&o, "quality", "")), fit: None, ..Default::default() });
