@@ -3,6 +3,7 @@
 use crate::form;
 use crate::gfx::{cursor_pos, dpi_scale_at, work_area_at, ACCENT, BORDER, MUTED, ON_ACCENT, RAISED, SURFACE, TEXT};
 use crate::image::Bmp;
+use crate::redact::Area;
 use crate::timeline::{snap, timecode};
 use crate::ui::{self, glyph, id, r, Align, Page, Style, Ui, FOOT_H, PAD, R, TITLE_H};
 use std::sync::{Arc, Mutex};
@@ -179,10 +180,10 @@ unsafe fn text_font(thick: i32) -> HFONT {
 /// The text as GDI takes it, without the terminating zero.
 fn text_units(s: &str) -> Vec<u16> { s.encode_utf16().collect() }
 
-/// Draws one pass of a shape into a DC where the image fills (0, 0, w, h).
-unsafe fn draw_pass(dc: HDC, s: &Shape, pass: Pass, w: i32, h: i32) {
+/// Draws one pass of a shape into a DC where the image fills (0, 0, w, h), with `base` the stroke width at size 1.
+unsafe fn draw_pass(dc: HDC, s: &Shape, pass: Pass, w: i32, h: i32, base: f32) {
     let map = |p: (f64, f64)| ((p.0 * w as f64).round() as i32, (p.1 * h as f64).round() as i32);
-    let thick = ((thickness(w as u32, h as u32) as f32 * s.fx.width) as i32).max(1);
+    let thick = ((base * s.fx.width) as i32).max(1);
     let (ax, ay) = map(s.a);
     let (bx, by) = map(s.b);
     if pass == Pass::Fill {
@@ -250,8 +251,8 @@ unsafe fn draw_pass(dc: HDC, s: &Shape, pass: Pass, w: i32, h: i32) {
 }
 
 /// The pixel box a shape can touch, generously, as (x0, y0, x1, y1).
-fn reach(s: &Shape, w: u32, h: u32) -> (u32, u32, u32, u32) {
-    let thick = (thickness(w, h) as f32 * s.fx.width).max(1.0) as f64;
+fn reach(s: &Shape, w: u32, h: u32, base: f32) -> (u32, u32, u32, u32) {
+    let thick = (base * s.fx.width).max(1.0) as f64;
     let mut pts = vec![s.a, s.b];
     pts.extend(s.control());
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -283,11 +284,19 @@ fn over(d: &mut [u8], s: [f32; 4]) {
 /// The annotations alone at this size, as straight-alpha BGRA, each drawn over the ones before it. GDI ignores alpha,
 /// so each shape is drawn on black and on white, and how far a pixel moved between the two gives its coverage.
 pub fn annotation_layer(w: u32, h: u32, shapes: &[Shape]) -> std::result::Result<Vec<u8>, String> {
-    let n = w as usize * h as usize * 4;
+    layer_within(w, h, thickness(w, h) as f32, shapes, (0, 0, w, h))
+}
+
+/// The annotations over an image of size (w, h), with `base` the stroke width at size 1, for only the pixels in
+/// `clip` (x0, y0, x1, y1): a buffer of the clip's size, laid out as `annotation_layer` lays out the whole image.
+fn layer_within(w: u32, h: u32, base: f32, shapes: &[Shape], clip: (u32, u32, u32, u32)) -> std::result::Result<Vec<u8>, String> {
+    let (cx0, cy0) = (clip.0.min(w), clip.1.min(h));
+    let (cw, ch) = (clip.2.min(w).saturating_sub(cx0), clip.3.min(h).saturating_sub(cy0));
+    let n = cw as usize * ch as usize * 4;
     let mut out = vec![0u8; n];
-    if shapes.is_empty() || w == 0 || h == 0 { return Ok(out); }
+    if shapes.is_empty() || cw == 0 || ch == 0 { return Ok(out); }
     unsafe {
-        let info = bmi(w, h);
+        let info = bmi(cw, ch);
         let (kdc, wdc) = (CreateCompatibleDC(None), CreateCompatibleDC(None));
         let (mut kp, mut wp) = (std::ptr::null_mut(), std::ptr::null_mut());
         let made = (CreateDIBSection(Some(kdc), &info, DIB_RGB_COLORS, &mut kp, None, 0), CreateDIBSection(Some(wdc), &info, DIB_RGB_COLORS, &mut wp, None, 0));
@@ -302,19 +311,25 @@ pub fn annotation_layer(w: u32, h: u32, shapes: &[Shape]) -> std::result::Result
             }
         };
         let (ko, wo) = (SelectObject(kdc, kdib.into()), SelectObject(wdc, wdib.into()));
+        // The DIBs hold only the clip, so image coordinates are moved onto them.
+        let _ = SetViewportOrgEx(kdc, -(cx0 as i32), -(cy0 as i32), None);
+        let _ = SetViewportOrgEx(wdc, -(cx0 as i32), -(cy0 as i32), None);
         let kb = std::slice::from_raw_parts_mut(kp as *mut u8, n);
         let wb = std::slice::from_raw_parts_mut(wp as *mut u8, n);
-        let row = |y: u32, x0: u32, x1: u32| (y as usize * w as usize + x0 as usize) * 4..(y as usize * w as usize + x1 as usize) * 4;
+        let row = |y: u32, x0: u32, x1: u32| (y as usize * cw as usize + x0 as usize) * 4..(y as usize * cw as usize + x1 as usize) * 4;
         for s in shapes {
             let mut passes = vec![];
             if s.fillable() && s.fx.fill > 0.0 { passes.push((Pass::Fill, s.fx.fill.min(100.0) / 100.0)); }
             passes.push((Pass::Line, 1.0));
-            let (x0, y0, x1, y1) = reach(s, w, h);
+            // Its reach within the clip, in the clip's own pixels.
+            let (x0, y0, x1, y1) = reach(s, w, h, base);
+            let (x0, y0) = (x0.max(cx0) - cx0, y0.max(cy0) - cy0);
+            let (x1, y1) = (x1.min(cx0 + cw).saturating_sub(cx0), y1.min(cy0 + ch).saturating_sub(cy0));
             if x0 >= x1 || y0 >= y1 { continue; }
             for (pass, opacity) in passes {
                 for y in y0..y1 { kb[row(y, x0, x1)].fill(0); wb[row(y, x0, x1)].fill(255); }
-                draw_pass(kdc, s, pass, w as i32, h as i32);
-                draw_pass(wdc, s, pass, w as i32, h as i32);
+                draw_pass(kdc, s, pass, w as i32, h as i32, base);
+                draw_pass(wdc, s, pass, w as i32, h as i32, base);
                 let _ = GdiFlush();
                 for y in y0..y1 {
                     for i in row(y, x0, x1).step_by(4) {
@@ -592,6 +607,10 @@ struct Editor {
     /// Where changed areas are painted before being copied into `shown`, kept to avoid a large allocation per change.
     scratch: Vec<u8>,
     shown_gen: u64,
+    /// `shown` with the annotations drawn into it at the picture's own resolution, by the code that draws the saved
+    /// file, so a small picture shows them as coarse as they will be saved. This is what the stage shows.
+    marked: Bmp,
+    marked_for: Option<Vec<Shape>>,
     /// The selection the list last scrolled to.
     list_sel: Option<usize>,
     aspect: usize,
@@ -637,7 +656,7 @@ impl Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
             pen: COLORS[0], cover_pen: REDACT_COLORS[0], fx: Fx::default(), oval: false, aspect: 0, found: vec![], found_used: false,
-            pending_text: None, pending_color: None, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, pages, page: 0, start_size, result: None,
+            pending_text: None, pending_color: None, slider_open: false, shown: preview.clone(), marked: preview, marked_for: None, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, pages, page: 0, start_size, result: None,
         }
     }
 
@@ -790,7 +809,7 @@ impl Editor {
         // Paint.
         if self.mode != Mode::Crop {
             self.refresh_shown(ui);
-            ui.image(id(&format!("ed.shown{}", self.shown_gen)), &self.shown, v);
+            ui.image(id(&format!("ed.shown{}", self.shown_gen)), &self.marked, v);
         } else {
             ui.image(id("ed.image"), &self.preview, v);
         }
@@ -854,31 +873,83 @@ impl Editor {
     /// A mark being drawn shows as it grows. A blur waits for the mouse button, since it is too slow to redo for every
     /// pixel of a drag; the outline follows meanwhile.
     fn refresh_shown(&mut self, ui: &mut Ui) {
+        let covered = self.refresh_covers(ui);
+        self.refresh_notes(ui, covered);
+    }
+
+    /// Paints the redactions into `shown`. Says which pixels changed, all of them when the picture was redone.
+    fn refresh_covers(&mut self, ui: &Ui) -> Option<Area> {
         use crate::redact::{apply, apply_within, change_between, Layout};
         let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).filter(|s| self.is_cover(s)).collect();
         if let Some(Drag::New(s)) = &self.drag { if self.is_cover(s) { now.push(s.clone()); } }
-        if self.shown_for.as_ref() == Some(&now) { return; }
+        if self.shown_for.as_ref() == Some(&now) { return None; }
         let (w, h) = (self.preview.w, self.preview.h);
         let marks = marks_for(&now, w, h, false);
         let l = Layout { w, h, stride: w as usize * 4, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
-        if self.shown_for.is_none() {
+        let changed = if self.shown_for.is_none() {
             let mut b = self.preview.clone();
             apply(&mut b.px, &l, &marks);
-            ui.forget_image(id(&format!("ed.shown{}", self.shown_gen)));
-            self.shown_gen += 1;
             self.shown = b;
+            // A new picture: the annotations go on again from scratch.
+            self.marked_for = None;
+            None
         } else if let Some(c) = change_between(&self.shown_marks, &marks, w, h) {
             let area = (c.work.2 - c.work.0) as u64 * (c.work.3 - c.work.1) as u64;
-            if ui.down && c.blur && area > LIVE_BLUR_PX { return; }
+            if ui.down && c.blur && area > LIVE_BLUR_PX { return None; }
             if self.scratch.len() != self.preview.px.len() { self.scratch = self.preview.px.clone(); }
-            let row = |y: u32, a: (u32, u32, u32, u32)| (y as usize * w as usize + a.0 as usize) * 4..(y as usize * w as usize + a.2 as usize) * 4;
+            let row = |y: u32, a: Area| (y as usize * w as usize + a.0 as usize) * 4..(y as usize * w as usize + a.2 as usize) * 4;
             for y in c.work.1..c.work.3 { self.scratch[row(y, c.work)].copy_from_slice(&self.preview.px[row(y, c.work)]); }
             apply_within(&mut self.scratch, &l, &marks, c.work);
             for y in c.shown.1..c.shown.3 { self.shown.px[row(y, c.shown)].copy_from_slice(&self.scratch[row(y, c.shown)]); }
-            ui.update_image(id(&format!("ed.shown{}", self.shown_gen)), &self.shown, c.shown);
-        }
+            Some(c.shown)
+        } else { None };
         self.shown_for = Some(now);
         self.shown_marks = marks;
+        changed
+    }
+
+    /// Lays the annotations over `shown` into `marked`, redoing only the pixels that changed, and sends those on.
+    fn refresh_notes(&mut self, ui: &mut Ui, covered: Option<Area>) {
+        let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).filter(|s| !self.is_cover(s)).collect();
+        if let Some(Drag::New(s)) = &self.drag { if !self.is_cover(s) { now.push(s.clone()); } }
+        let (w, h) = (self.preview.w, self.preview.h);
+        // The stroke width the saved file uses, in this picture's pixels.
+        let base = thickness(self.full.0, self.full.1) as f32 * w as f32 / self.full.0.max(1) as f32;
+        let fresh = self.marked_for.is_none() || self.marked.w != w || self.marked.h != h;
+        let mut dirty = covered;
+        if !fresh {
+            let old = self.marked_for.as_deref().unwrap_or(&[]);
+            for i in 0..old.len().max(now.len()) {
+                if old.get(i) == now.get(i) { continue; }
+                for s in [old.get(i), now.get(i)].into_iter().flatten() {
+                    let a = reach(s, w, h, base);
+                    if a.0 >= a.2 || a.1 >= a.3 { continue; }
+                    dirty = Some(dirty.map_or(a, |d: Area| (d.0.min(a.0), d.1.min(a.1), d.2.max(a.2), d.3.max(a.3))));
+                }
+            }
+        }
+        let area = if fresh { (0, 0, w, h) } else { match dirty { Some(a) => a, None => return } };
+        let row = |y: u32, a: Area| (y as usize * w as usize + a.0 as usize) * 4..(y as usize * w as usize + a.2 as usize) * 4;
+        if fresh { self.marked = self.shown.clone(); } else {
+            for y in area.1..area.3 { self.marked.px[row(y, area)].copy_from_slice(&self.shown.px[row(y, area)]); }
+        }
+        if let Ok(layer) = layer_within(w, h, base, &now, area) {
+            let cw = (area.2 - area.0) as usize;
+            for y in area.1..area.3 {
+                let src = &layer[(y - area.1) as usize * cw * 4..((y - area.1) as usize + 1) * cw * 4];
+                for (d, s) in self.marked.px[row(y, area)].chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    if s[3] == 0 { continue; }
+                    over(d, [s[0] as f32, s[1] as f32, s[2] as f32, s[3] as f32 / 255.0]);
+                }
+            }
+        }
+        if fresh {
+            ui.forget_image(id(&format!("ed.shown{}", self.shown_gen)));
+            self.shown_gen += 1;
+        } else {
+            ui.update_image(id(&format!("ed.shown{}", self.shown_gen)), &self.marked, area);
+        }
+        self.marked_for = Some(now);
     }
 
     fn paint_shape(&self, ui: &mut Ui, s: &Shape, v: R, thick: f32, selected: bool, lit: bool) {
@@ -894,36 +965,19 @@ impl Editor {
             }
             return;
         }
-        let fill = s.fx.fill.clamp(0.0, 100.0) / 100.0;
+        // The annotation itself is already in the picture, drawn at its own resolution. This only shows which it is.
+        if !(selected || lit) { return; }
         match s.tool {
-            Tool::Rect => {
-                if fill > 0.0 { ui.fill(q, 0.0, s.color, fill); }
-                ui.stroke(q, 0.0, s.color, 1.0, thick);
-                if selected || lit { ui.stroke(q.inset(-thick / 2.0 - 2.0), 0.0, ACCENT, 0.9, 1.0); }
-            }
-            Tool::Ellipse => {
-                if fill > 0.0 { ui.oval(q, s.color, fill); }
-                ui.oval_stroke(q, s.color, 1.0, thick);
-                if selected || lit { ui.stroke(q.inset(-thick / 2.0 - 2.0), 0.0, ACCENT, 0.9, 1.0); }
-            }
+            Tool::Rect | Tool::Ellipse => ui.stroke(q.inset(-thick / 2.0 - 2.0), 0.0, ACCENT, 0.9, 1.0),
             Tool::Arrow => {
                 let path: Vec<(f32, f32)> = s.path(48).into_iter().map(at).collect();
-                if lit { for w in path.windows(2) { ui.line(w[0], w[1], ACCENT, 0.5, thick + 4.0); } }
-                for w in path.windows(2) { ui.line(w[0], w[1], s.color, 1.0, thick); }
-                let f = at(s.tip_from());
-                let ang = (f.1 - b.1).atan2(f.0 - b.0);
-                for d in [-0.45f32, 0.45] {
-                    ui.line(b, (b.0 + (ang + d).cos() * thick * 5.0, b.1 + (ang + d).sin() * thick * 5.0), s.color, 1.0, thick);
-                }
-                let _ = a;
+                for w in path.windows(2) { ui.line(w[0], w[1], ACCENT, 0.9, 1.0); }
+                let _ = (a, b);
             }
             Tool::Text => {
                 let em = thick * 8.0;
                 let w = ui.measure(&s.text, em, 600) + 4.0;
-                let tq = r(a.0, a.1, w, em * 1.35);
-                if fill > 0.0 { ui.fill(r(a.0 - em * TEXT_PAD, a.1, w + em * TEXT_PAD * 2.0, em * 1.35), 0.0, backing(s.color), fill); }
-                ui.text(&s.text, tq, em, 600, s.color, Align::Left);
-                if selected || lit { ui.stroke(tq.inset(-3.0), 2.0, ACCENT, 0.9, 1.0); }
+                ui.stroke(r(a.0, a.1, w, em * 1.35).inset(-3.0), 2.0, ACCENT, 0.9, 1.0);
             }
         }
     }
