@@ -114,7 +114,7 @@ fn camcorder_footage_comes_out_whole_frames_at_the_right_shape() {
     let d = Dir::new();
     // An interlaced MPEG-2 file with non-square pixels and AC-3, as a tape camcorder writes one.
     let src = d.p("MOV001.vob");
-    ffs(&["-f", "lavfi", "-i", "testsrc2=s=720x480:r=60000/1001:d=1", "-f", "lavfi", "-i", "sine=d=1", "-vf", "setsar=8/9,tinterlace=interleave_top", "-c:v", "mpeg2video", "-flags", "+ildct+ilme", "-top", "1", "-b:v", "6M", "-c:a", "ac3", "-f", "vob", src.to_str().unwrap()]);
+    ffs(&["-f", "lavfi", "-i", "testsrc2=s=720x480:r=60000/1001:d=1", "-f", "lavfi", "-i", "sine=d=1", "-vf", "setsar=8/9,tinterlace=interleave_top,setfield=tff", "-c:v", "mpeg2video", "-flags", "+ildct+ilme", "-b:v", "6M", "-c:a", "ac3", "-f", "vob", src.to_str().unwrap()]);
     let info = probe(&src);
     let v = info.video.clone().unwrap();
     assert!(v.interlaced, "{v:?}");
