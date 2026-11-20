@@ -1015,21 +1015,34 @@ impl<P: Page> Page for Shared<P> {
     }
 }
 
+/// Modal windows open on any thread. The updater waits for none, so it never closes one under the user.
+static MODALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn modal_open() -> bool { MODALS.load(std::sync::atomic::Ordering::SeqCst) > 0 }
+
 /// Shows a page and blocks, pumping messages, until it says it is done.
 pub fn run_modal<P: Page + 'static>(page: P, title: &str, at: Option<POINT>) -> Option<P> {
+    use std::sync::atomic::Ordering;
     let shared = Rc::new(RefCell::new(page));
     let hwnd = create(Box::new(Shared(shared.clone())), title, at, WS_EX_TOPMOST, true)?;
+    MODALS.fetch_add(1, Ordering::SeqCst);
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(Some(hwnd));
         let mut m = MSG::default();
-        while !shared.try_borrow().map(|p| p.done()).unwrap_or(false) && GetMessageW(&mut m, None, 0, 0).0 > 0 {
+        while !shared.try_borrow().map(|p| p.done()).unwrap_or(false) {
+            let r = GetMessageW(&mut m, None, 0, 0).0;
+            if r == -1 { break; }
+            // WM_QUIT belongs to the thread's own loop. Taking it here and not passing it on left Tau's main loop
+            // waiting forever: the process stayed alive with its window, tray icon and hotkey already gone.
+            if r == 0 { PostQuitMessage(m.wParam.0 as i32); break; }
             let _ = TranslateMessage(&m);
             DispatchMessageW(&m);
         }
         let _ = DestroyWindow(hwnd);
     }
+    MODALS.fetch_sub(1, Ordering::SeqCst);
     Rc::try_unwrap(shared).ok().map(RefCell::into_inner)
 }
 

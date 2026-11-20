@@ -338,13 +338,23 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                 LRESULT(1)
             }
             WM_APP_QUIT => { let _ = DestroyWindow(hwnd); LRESULT(0) }
-            WM_DESTROY => { tray(hwnd, false); PostQuitMessage(0); LRESULT(0) }
+            WM_DESTROY => {
+                tray(hwnd, false);
+                PostQuitMessage(0);
+                // Past this point Tau has no window, icon or hotkey, but would still hold the single-instance mutex.
+                // If anything holds up the exit, end the process rather than leave that half-alive copy behind.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), 0);
+                });
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
 }
 
-fn run_app(paths: Vec<PathBuf>) -> Result<()> {
+fn run_app(paths: Vec<PathBuf>, updated: bool) -> Result<()> {
     unsafe {
         OleInitialize(None)?;
         settings::migrate();
@@ -361,6 +371,7 @@ fn run_app(paths: Vec<PathBuf>) -> Result<()> {
         tray(hwnd, true);
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_hook), Some(inst.into()), 0)?;
         update::start_background();
+        if updated { update::announce(); }
         open_wheel_for(paths);
         let mut m = MSG::default();
         while GetMessageW(&mut m, None, 0, 0).0 > 0 {
@@ -373,16 +384,27 @@ fn run_app(paths: Vec<PathBuf>) -> Result<()> {
 }
 
 /// Hands paths to a copy already running. Returns false if this is the first instance.
+/// A copy that holds the mutex but has no window is on its way out (an update, a quit). Rather than give up and leave
+/// nothing running, wait for it to go and then become the running copy.
 fn forward_to_running(paths: &[PathBuf]) -> bool {
     unsafe {
-        let m = CreateMutexW(None, false, w!("Local\\TauRunning"));
-        if GetLastError() != ERROR_ALREADY_EXISTS { std::mem::forget(m); return false; }
-        if let Ok(h) = FindWindowW(w!("TauMain"), None) {
-            let text: Vec<u16> = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
-            let cd = COPYDATASTRUCT { dwData: COPYDATA_PATHS, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-            SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cd as *const _ as isize)));
+        for _ in 0..50 {
+            let m = CreateMutexW(None, false, w!("Local\\TauRunning"));
+            if GetLastError() != ERROR_ALREADY_EXISTS { std::mem::forget(m); return false; }
+            if let Ok(h) = FindWindowW(w!("TauMain"), None) {
+                let text: Vec<u16> = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
+                let cd = COPYDATASTRUCT { dwData: COPYDATA_PATHS, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+                SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cd as *const _ as isize)));
+                if let Ok(m) = m { let _ = CloseHandle(m); }
+                return true;
+            }
+            if let Ok(m) = m { let _ = CloseHandle(m); }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        true
+        // Still no window after ten seconds: the other copy is stuck. Start anyway so Tau is usable.
+        let m = CreateMutexW(None, false, w!("Local\\TauRunning"));
+        std::mem::forget(m);
+        false
     }
 }
 
@@ -481,10 +503,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A windows-subsystem exe has no console of its own; borrow the caller's so CLI output is visible.
     unsafe { let _ = AttachConsole(ATTACH_PARENT_PROCESS); }
+    // The updater's helper comes first: it must never take the single-instance mutex.
+    if let Some(code) = update::apply_from_cli(&args) { std::process::exit(code); }
     if let Some(code) = cli(&args) { std::process::exit(code); }
+    let updated = args.iter().any(|a| a == update::UPDATED_FLAG);
     let paths: Vec<PathBuf> = args.iter().filter(|a| !a.starts_with("--")).map(|a| absolute(a)).collect();
     if forward_to_running(&paths) { return; }
-    if let Err(e) = run_app(paths) {
+    if let Err(e) = run_app(paths, updated) {
         let m = gfx::wz(&format!("Tau could not start: {e}"));
         unsafe { MessageBoxW(None, PCWSTR(m.as_ptr()), w!("Tau"), MB_ICONERROR); }
     }
