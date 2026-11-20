@@ -1,5 +1,5 @@
-//! Shared image editor window: crop, redact and annotate. Coordinates are fractions of the image,
-//! so one result can apply across a batch or to a video of any resolution.
+//! Shared image editor window: crop, and mark up, which redacts and annotates in one place. Coordinates are fractions
+//! of the image, so one result can apply across a batch or to a video of any resolution.
 use crate::form;
 use crate::gfx::{cursor_pos, dpi_scale_at, work_area_at, ACCENT, BORDER, MUTED, ON_ACCENT, RAISED, SURFACE, TEXT};
 use crate::image::Bmp;
@@ -13,7 +13,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Mode { Crop, Redact, Annotate }
+pub enum Mode {
+    Crop,
+    /// Redaction alone, for documents, whose pages are flattened to pictures.
+    Redact,
+    /// Redactions and annotations together. Redactions are painted first, so annotations always sit on top of them.
+    Markup,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tool { Rect, Arrow, Text, Ellipse }
@@ -39,6 +45,8 @@ pub struct Shape {
     pub tool: Tool, pub a: (f64, f64), pub b: (f64, f64), pub color: u32, pub text: String, pub fx: Fx,
     /// The point a curved arrow passes through halfway along. A straight arrow has none.
     pub bend: Option<(f64, f64)>,
+    /// A redaction: a box or ellipse that covers what is under it with a colour or a blur. Otherwise an annotation.
+    pub cover: bool,
 }
 
 /// Marks in pixels for a picture of this size. Strength and feather scale with the picture, so the preview, a video
@@ -62,7 +70,9 @@ pub fn marks_for(shapes: &[Shape], w: u32, h: u32, even: bool) -> Vec<crate::red
 
 impl Shape {
     pub fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Shape { Shape::new(Tool::Rect, (x0, y0), (x1, y1), 0) }
-    pub fn new(tool: Tool, a: (f64, f64), b: (f64, f64), color: u32) -> Shape { Shape { tool, a, b, color, text: String::new(), fx: Fx::default(), bend: None } }
+    pub fn new(tool: Tool, a: (f64, f64), b: (f64, f64), color: u32) -> Shape { Shape { tool, a, b, color, text: String::new(), fx: Fx::default(), bend: None, cover: false } }
+    /// A redaction mark over this box.
+    pub fn cover_rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Shape { Shape { cover: true, ..Shape::rect(x0, y0, x1, y1) } }
     /// The quadratic control point of a curved arrow, worked out from the point it passes through halfway.
     pub fn control(&self) -> Option<(f64, f64)> {
         self.bend.map(|m| (2.0 * m.0 - (self.a.0 + self.b.0) / 2.0, 2.0 * m.1 - (self.a.1 + self.b.1) / 2.0))
@@ -89,8 +99,8 @@ impl Shape {
     pub fn encode(&self) -> String {
         let t = match self.tool { Tool::Rect => "rect", Tool::Arrow => "arrow", Tool::Text => "text", Tool::Ellipse => "ellipse" };
         let bend = self.bend.map(|m| format!("{}\t{}", m.0, m.1)).unwrap_or_else(|| "\t".into());
-        format!("{t}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\t{}\t{}\t{}\t{}\t{bend}", self.a.0, self.a.1, self.b.0, self.b.1, self.color, self.text.replace(['\t', '\n'], " "),
-            self.fx.blur as u8, self.fx.strength, self.fx.feather, self.fx.width, self.fx.fill)
+        format!("{t}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\t{}\t{}\t{}\t{}\t{bend}\t{}", self.a.0, self.a.1, self.b.0, self.b.1, self.color, self.text.replace(['\t', '\n'], " "),
+            self.fx.blur as u8, self.fx.strength, self.fx.feather, self.fx.width, self.fx.fill, self.cover as u8)
     }
     pub fn decode(s: &str) -> Option<Shape> {
         let f: Vec<&str> = s.split('\t').collect();
@@ -106,6 +116,7 @@ impl Shape {
                 Fx { blur: f.get(7) == Some(&"1"), strength: v(8, d.strength), feather: v(9, d.feather), width: v(10, d.width), fill: v(11, d.fill) }
             },
             bend: n(12).zip(n(13)),
+            cover: f.get(14) == Some(&"1"),
         })
     }
 }
@@ -113,8 +124,29 @@ impl Shape {
 pub fn encode_all(v: &[Shape]) -> String { v.iter().map(Shape::encode).collect::<Vec<_>>().join("\n") }
 pub fn decode_all(s: &str) -> Vec<Shape> { s.lines().filter_map(Shape::decode).collect() }
 
+/// Splits marks into redactions and annotations, each in the order drawn.
+pub fn split(shapes: &[Shape]) -> (Vec<Shape>, Vec<Shape>) {
+    let (c, a): (Vec<&Shape>, Vec<&Shape>) = shapes.iter().partition(|s| s.cover);
+    (c.into_iter().cloned().collect(), a.into_iter().cloned().collect())
+}
+
+/// Every shape marked as a redaction, or every one as an annotation, for the tool ids that only ever made one kind.
+pub fn all_as(mut shapes: Vec<Shape>, cover: bool) -> Vec<Shape> {
+    for s in &mut shapes { s.cover = cover; }
+    shapes
+}
+
 const COLORS: [u32; 5] = [0xFF3B30, 0xFFCC00, 0x34C759, 0x0A84FF, 0xFFFFFF];
 const REDACT_COLORS: [u32; 5] = [0x000000, 0xFFFFFF, 0xFF3B30, 0x34C759, 0x0A84FF];
+
+/// What a press on the picture does in the mark-up editor.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pick { Select, Redact, Box, Oval, Arrow, Text }
+/// In picker order, with the key that picks each.
+const PICKS: [(Pick, &str, VIRTUAL_KEY); 6] = [
+    (Pick::Select, "Select", VK_V), (Pick::Redact, "Redact", VK_R), (Pick::Box, "Box", VK_B),
+    (Pick::Oval, "Oval", VK_O), (Pick::Arrow, "Arrow", VK_A), (Pick::Text, "Text", VK_T),
+];
 
 fn colorref(c: u32) -> COLORREF { COLORREF(((c >> 16) & 255) | (c & 0xFF00) | ((c & 255) << 16)) }
 
@@ -459,7 +491,7 @@ fn shape_at(items: &[Item], p: P, vw: f64, vh: f64, em: f64) -> Option<usize> {
 
 // ---- the window ----
 
-const SIDE: f32 = 272.0;
+const SIDE: f32 = 312.0;
 const SCRUB_H: f32 = 56.0;
 const ROW: f32 = 46.0;
 const GRAB: f32 = 10.0;
@@ -541,10 +573,16 @@ struct Editor {
     tool: usize,
     /// Colour and look of the next shape. Changing them also changes the selected one.
     pen: u32,
+    /// Colour of the next redaction. Marks already drawn keep theirs.
+    cover_pen: u32,
     fx: Fx,
     oval: bool,
     pending_text: Option<P>,
-    pending_color: bool,
+    /// A custom colour is to be asked for: for the redaction pen when true, the annotation pen otherwise.
+    pending_color: Option<bool>,
+    /// Faces and words found in the picture, offered as redactions with one click.
+    found: Vec<Shape>,
+    found_used: bool,
     /// A slider is being dragged and its undo step is already taken.
     slider_open: bool,
     /// The picture with the redactions painted in, by the code that paints the saved file.
@@ -567,7 +605,7 @@ struct Editor {
 
 fn shrink(b: Bmp, mode: Mode) -> Bmp {
     let long = b.w.max(b.h);
-    let max = if mode == Mode::Redact { REDACT_PREVIEW_MAX } else { PREVIEW_MAX };
+    let max = if mode == Mode::Crop { PREVIEW_MAX } else { REDACT_PREVIEW_MAX };
     if long <= max { return b; }
     let f = max as f64 / long as f64;
     let (w, h) = (((b.w as f64 * f) as u32).max(1), ((b.h as f64 * f) as u32).max(1));
@@ -598,10 +636,16 @@ impl Editor {
         Editor {
             title: title.into(), sub: form::context(), mode, ok: ok.into(), preview: preview.clone(), full, items,
             undo: vec![], redo: vec![], before: None, sel, hover_row: None, drag: None, tool: 0,
-            pen: if mode == Mode::Redact { 0 } else { COLORS[0] }, fx: Fx::default(), oval: false, aspect: 0,
-            pending_text: None, pending_color: false, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, pages, page: 0, start_size, result: None,
+            pen: COLORS[0], cover_pen: REDACT_COLORS[0], fx: Fx::default(), oval: false, aspect: 0, found: vec![], found_used: false,
+            pending_text: None, pending_color: None, slider_open: false, shown: preview, shown_for: None, shown_marks: vec![], scratch: vec![], shown_gen: 0, list_sel: None, scrub, pages, page: 0, start_size, result: None,
         }
     }
+
+    /// The tool in hand. A document only redacts.
+    fn pick(&self) -> Pick { if self.mode == Mode::Redact { Pick::Redact } else { PICKS[self.tool.min(PICKS.len() - 1)].0 } }
+
+    /// Whether a shape is painted into the picture as a redaction rather than drawn over it.
+    fn is_cover(&self, s: &Shape) -> bool { self.mode == Mode::Redact || s.cover }
 
     fn aspect_info(&self) -> Option<(f64, f64, f64)> { ASPECTS[self.aspect].map(|ratio| (ratio, self.full.0 as f64, self.full.1 as f64)) }
 
@@ -681,7 +725,8 @@ impl Editor {
             }).map(|(w, _)| (i, w))
         });
         let under = shape_at(&self.items, p, v.w as f64, v.h as f64, em);
-        let selecting = self.mode == Mode::Redact || (self.mode == Mode::Annotate && self.tool == 0);
+        let pick = self.pick();
+        let selecting = matches!(pick, Pick::Select | Pick::Redact);
 
         if hover && ui.pressed {
             self.before = Some(self.items.clone());
@@ -700,14 +745,14 @@ impl Editor {
                         self.sel = under;
                         if let Some(i) = under {
                             self.drag = Some(Drag::Move { i, start: p, orig: self.items[i].shape.clone() });
-                        } else if self.mode == Mode::Redact {
+                        } else if pick == Pick::Redact {
                             let tool = if self.oval { Tool::Ellipse } else { Tool::Rect };
-                            self.drag = Some(Drag::New(Shape { fx: self.fx, ..Shape::new(tool, p, p, self.pen) }));
+                            self.drag = Some(Drag::New(Shape { fx: Fx { width: 1.0, fill: 0.0, ..self.fx }, cover: true, ..Shape::new(tool, p, p, self.cover_pen) }));
                         }
                     }
-                    _ if self.tool == 3 => { self.pending_text = Some(p); self.before = None; }
+                    _ if pick == Pick::Text => { self.pending_text = Some(p); self.before = None; }
                     _ => {
-                        let tool = match self.tool { 1 => Tool::Rect, 4 => Tool::Ellipse, _ => Tool::Arrow };
+                        let tool = match pick { Pick::Box => Tool::Rect, Pick::Oval => Tool::Ellipse, _ => Tool::Arrow };
                         self.sel = None;
                         self.drag = Some(Drag::New(Shape { fx: self.next_fx(tool), ..Shape::new(tool, p, p, self.pen) }));
                     }
@@ -737,13 +782,13 @@ impl Editor {
                 (Some(_), _) => IDC_SIZEALL,
                 (None, true) => IDC_CROSS,
                 (None, false) if under.is_some() && (selecting || self.mode == Mode::Crop) => IDC_SIZEALL,
-                (None, false) if self.mode == Mode::Annotate && self.tool == 0 => IDC_ARROW,
+                (None, false) if pick == Pick::Select => IDC_ARROW,
                 (None, false) => IDC_CROSS,
             };
         }
 
         // Paint.
-        if self.mode == Mode::Redact {
+        if self.mode != Mode::Crop {
             self.refresh_shown(ui);
             ui.image(id(&format!("ed.shown{}", self.shown_gen)), &self.shown, v);
         } else {
@@ -810,8 +855,8 @@ impl Editor {
     /// pixel of a drag; the outline follows meanwhile.
     fn refresh_shown(&mut self, ui: &mut Ui) {
         use crate::redact::{apply, apply_within, change_between, Layout};
-        let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).collect();
-        if let Some(Drag::New(s)) = &self.drag { now.push(s.clone()); }
+        let mut now: Vec<Shape> = self.items.iter().map(|i| i.shape.clone()).filter(|s| self.is_cover(s)).collect();
+        if let Some(Drag::New(s)) = &self.drag { if self.is_cover(s) { now.push(s.clone()); } }
         if self.shown_for.as_ref() == Some(&now) { return; }
         let (w, h) = (self.preview.w, self.preview.h);
         let marks = marks_for(&now, w, h, false);
@@ -842,7 +887,7 @@ impl Editor {
         let (a, b) = (at(s.a), at(s.b));
         let (bx, by, bw, bh) = s.bounds();
         let q = r(v.x + bx as f32 * v.w, v.y + by as f32 * v.h, bw as f32 * v.w, bh as f32 * v.h);
-        if self.mode == Mode::Redact {
+        if self.is_cover(s) {
             // The fill itself is already in the picture. This only shows where the mark is.
             if selected || lit || self.drag.is_some() {
                 if s.tool == Tool::Ellipse { ui.oval_stroke(q, ACCENT, 1.0, 1.5); } else { ui.stroke(q, 0.0, ACCENT, 1.0, 1.5); }
@@ -919,7 +964,8 @@ impl Editor {
             Mode::Crop => "Crop".to_string(),
             Mode::Redact if self.items.is_empty() => "Redactions".to_string(),
             Mode::Redact => format!("Redactions  ·  {}", self.items.len()),
-            Mode::Annotate => "Markup".to_string(),
+            Mode::Markup if self.items.is_empty() => "Mark up".to_string(),
+            Mode::Markup => format!("Mark up  ·  {}", self.items.len()),
         };
         ui.text(&heading, r(x, y, w - 64.0, 30.0), 13.0, 600, TEXT, Align::Left);
         let (can_undo, can_redo) = (!self.undo.is_empty(), !self.redo.is_empty());
@@ -951,18 +997,24 @@ impl Editor {
                     self.items[0].shape = Shape::rect(0.0, 0.0, 1.0, 1.0);
                 }
             }
-            Mode::Annotate => {
-                let names: Vec<String> = ["Select", "Box", "Arrow", "Text", "Oval"].iter().map(|s| s.to_string()).collect();
-                ui.segmented("ed.tool", r(x, y, w, 34.0), &names, &mut self.tool);
+            Mode::Markup => {
+                let names: Vec<String> = PICKS.iter().map(|p| p.1.to_string()).collect();
+                ui.segmented("ed.tool", r(x - 6.0, y, w + 12.0, 34.0), &names, &mut self.tool);
                 y += 46.0;
-                self.swatches(ui, x, y, &COLORS);
-                y += 40.0;
+                if self.pick() == Pick::Redact {
+                    y = self.redact_controls(ui, x, w, y);
+                } else {
+                    self.swatches(ui, x, y, &COLORS, false);
+                    y += 40.0;
+                }
+                y = self.found_button(ui, x, w, y);
                 if !ui.down { self.slider_open = false; }
                 self.list(ui, r(q.x, y, q.w - 1.0, q.bottom() - y - 58.0));
                 self.clear_button(ui, x, w, q);
             }
             Mode::Redact => {
                 y = self.redact_controls(ui, x, w, y);
+                y = self.found_button(ui, x, w, y);
                 self.list(ui, r(q.x, y, q.w - 1.0, q.bottom() - y - 58.0));
                 self.clear_button(ui, x, w, q);
             }
@@ -976,10 +1028,23 @@ impl Editor {
         Fx { width: self.fx.width, fill, ..Fx::default() }
     }
 
-    fn recolor(&mut self, c: u32) {
+    /// Offers what was found in the picture as redactions, once.
+    fn found_button(&mut self, ui: &mut Ui, x: f32, w: f32, y: f32) -> f32 {
+        if self.found.is_empty() { return y; }
+        let label = if self.found_used { "Faces and text covered".to_string() } else { format!("Cover faces and text found  ·  {}", self.found.len()) };
+        if ui.button("ed.found", &label, r(x, y, w, 34.0), Style::Secondary, !self.found_used) {
+            self.checkpoint();
+            self.found_used = true;
+            for s in self.found.clone() { self.items.push(Item { shape: Shape { cover: true, fx: self.fx, color: self.cover_pen, ..s }, detected: true }); }
+        }
+        y + 46.0
+    }
+
+    /// A redaction colour only sets up the next mark. An annotation colour also changes the selected annotation.
+    fn recolor(&mut self, c: u32, cover: bool) {
+        if cover { self.cover_pen = c; return; }
         self.pen = c;
-        if self.mode == Mode::Redact { return; }
-        if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
+        if let Some(i) = self.sel.filter(|i| *i < self.items.len() && !self.items[*i].shape.cover) {
             if self.items[i].shape.color != c {
                 self.checkpoint();
                 self.items[i].shape.color = c;
@@ -988,12 +1053,12 @@ impl Editor {
     }
 
     /// A row of colours and a button for any other. Shows the selected shape's colour when there is one.
-    fn swatches(&mut self, ui: &mut Ui, x: f32, y: f32, colors: &[u32]) {
-        let current = if self.mode == Mode::Redact { self.pen } else { self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen) };
+    fn swatches(&mut self, ui: &mut Ui, x: f32, y: f32, colors: &[u32], cover: bool) {
+        let current = self.current_color(cover);
         for (i, c) in colors.iter().enumerate() {
             let cx = x + 14.0 + i as f32 * 36.0;
             let (hov, _, clicked) = ui.hit(id(&format!("ed.col{i}")), r(cx - 14.0, y, 28.0, 28.0));
-            if clicked { self.recolor(*c); }
+            if clicked { self.recolor(*c, cover); }
             if current == *c { ui.ring(cx, y + 14.0, 13.0, ACCENT, 1.0, 2.0); }
             else if hov { ui.ring(cx, y + 14.0, 13.0, TEXT, 0.3, 1.5); }
             ui.dot(cx, y + 14.0, 9.0, *c, 1.0);
@@ -1002,7 +1067,13 @@ impl Editor {
         let cx = x + 14.0 + colors.len() as f32 * 36.0;
         let custom = !colors.contains(&current);
         if custom { ui.dot(cx, y + 14.0, 9.0, current, 1.0); }
-        if ui.icon_button("ed.custom", if custom { glyph::CHECK } else { glyph::ADD }, r(cx - 14.0, y, 28.0, 28.0), 11.0, false) { self.pending_color = true; }
+        if ui.icon_button("ed.custom", if custom { glyph::CHECK } else { glyph::ADD }, r(cx - 14.0, y, 28.0, 28.0), 11.0, false) { self.pending_color = Some(cover); }
+    }
+
+    /// The colour the swatches show as chosen: the redaction pen, or the selected annotation's colour.
+    fn current_color(&self, cover: bool) -> u32 {
+        if cover { return self.cover_pen; }
+        self.sel.and_then(|i| self.items.get(i)).filter(|i| !i.shape.cover).map(|i| i.shape.color).unwrap_or(self.pen)
     }
 
     /// Shape, fill and colour here set up the next mark only; marks already drawn keep theirs.
@@ -1023,7 +1094,7 @@ impl Editor {
 
         // Strength belongs to each blur, so it sits in that mark's row.
         if !fx.blur {
-            self.swatches(ui, x, y, &REDACT_COLORS);
+            self.swatches(ui, x, y, &REDACT_COLORS, true);
             y += 38.0;
         }
 
@@ -1059,15 +1130,15 @@ impl Editor {
     fn list(&mut self, ui: &mut Ui, q: R) {
         self.hover_row = None;
         if self.items.is_empty() {
-            let msg = if self.mode == Mode::Redact { "Nothing marked yet. Drag across the picture to cover an area." } else { "Pick Box, Arrow or Text, then draw on the picture." };
+            let msg = if self.mode == Mode::Redact { "Nothing marked yet. Drag across the picture to cover an area." } else { "Pick Redact to cover an area, or Box, Oval, Arrow or Text to draw on the picture." };
             ui.wrapped(msg, r(q.x + PAD, q.y + 4.0, q.w - PAD * 2.0, 60.0), 12.5, 400, MUTED);
             return;
         }
         // The selected row opens to hold the settings that belong to that mark alone. A redaction has feather, and
         // strength when it blurs. An annotation has its size, and a fill or, for an arrow, a curve.
-        let redact = self.mode == Mode::Redact;
+        let covers: Vec<bool> = self.items.iter().map(|it| self.is_cover(&it.shape)).collect();
         let blurred: Vec<bool> = self.items.iter().map(|it| it.shape.fx.blur).collect();
-        let own: Vec<f32> = self.items.iter().map(|it| if redact { if it.shape.fx.blur { 2.0 } else { 1.0 } } else { 2.0 }).collect();
+        let own: Vec<f32> = self.items.iter().zip(&covers).map(|(it, c)| if *c { if it.shape.fx.blur { 2.0 } else { 1.0 } } else { 2.0 }).collect();
         let extra = |sel: Option<usize>, i: usize| if sel == Some(i) { ROW_SLIDER * own[i] } else { 0.0 };
         let top_of = |sel: Option<usize>, i: usize| (0..i).map(|n| ROW + extra(sel, n)).sum::<f32>();
         let content = top_of(self.sel, self.items.len());
@@ -1099,9 +1170,9 @@ impl Editor {
             if selected { ui.stroke(row, 10.0, ACCENT, 0.7, 1.0); }
 
             let it = &self.items[i];
-            let (name, detail) = match (self.mode, it.shape.tool) {
-                (Mode::Redact, t) => {
-                    let what = if it.detected { "Detected area" } else if t == Tool::Ellipse { "Ellipse" } else { "Box" };
+            let (name, detail) = match (covers[i], it.shape.tool) {
+                (true, t) => {
+                    let what = if it.detected { "Detected area" } else if self.mode == Mode::Redact { if t == Tool::Ellipse { "Ellipse" } else { "Box" } } else if t == Tool::Ellipse { "Redacted ellipse" } else { "Redacted box" };
                     (if it.shape.fx.blur { format!("{what}, blurred") } else { what.to_string() }, size_label(&it.shape, self.full))
                 }
                 (_, Tool::Rect) => ("Box".to_string(), size_label(&it.shape, self.full)),
@@ -1109,7 +1180,7 @@ impl Editor {
                 (_, Tool::Arrow) => ("Arrow".to_string(), if it.shape.bend.is_some() { "Curved".to_string() } else { String::new() }),
                 (_, Tool::Text) => (it.shape.text.clone(), "Text".to_string()),
             };
-            if self.mode == Mode::Redact {
+            if covers[i] {
                 let sw = r(row.x + 10.0, row.y + 12.0, 18.0, 18.0);
                 let (ink, alpha) = if it.shape.fx.blur { (TEXT, 0.35) } else { (it.shape.color, 1.0) };
                 if it.shape.tool == Tool::Ellipse {
@@ -1129,7 +1200,7 @@ impl Editor {
                 ui.text(&name, r(row.x + 38.0, row.y + 4.0, tw, 18.0), 12.5, 500, TEXT, Align::Left);
                 ui.text(&detail, r(row.x + 38.0, row.y + 21.0, tw, 16.0), 11.0, 400, MUTED, Align::Left);
             }
-            if extra(self.sel, i) > 0.0 && !redact {
+            if extra(self.sel, i) > 0.0 && !covers[i] {
                 let (fx, fw, mut fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
                 // Size runs in half steps, so the slider works in doubles.
                 let was = self.items[i].shape.fx.width * 2.0;
@@ -1155,7 +1226,7 @@ impl Editor {
                     }
                 }
             }
-            if extra(self.sel, i) > 0.0 && redact {
+            if extra(self.sel, i) > 0.0 && covers[i] {
                 let (fx, fw, mut fy) = (row.x + 12.0, row.w - 24.0, row.y + ROW - 4.0);
                 if blurred[i] {
                     let was = self.items[i].shape.fx.strength;
@@ -1323,11 +1394,12 @@ impl Editor {
             Mode::Crop => "Drag the handles, or drag outside the box to start over.",
             Mode::Redact if video => "Applies to the whole video. Click a mark to select and restyle it, right-click to remove it.",
             Mode::Redact => "Click a mark to select and restyle it, right-click to remove it. Delete works too.",
-            Mode::Annotate if video && self.tool != 3 => "Applies to the whole video. Drag to draw, click to select, right-click to remove.",
-            Mode::Annotate => match self.tool {
-                0 => "Click to select, drag to move, right-click to remove. Drag an arrow's middle dot to curve it.",
-                3 => "Click where the text should start.",
-                _ => "Drag on the picture to draw.",
+            Mode::Markup if video && self.pick() != Pick::Text => "Applies to the whole video. Drag to draw, click to select, right-click to remove. V R B O A T pick tools.",
+            Mode::Markup => match self.pick() {
+                Pick::Select => "Click to select, drag to move, right-click to remove. Drag an arrow's middle dot to curve it.",
+                Pick::Redact => "Drag across the picture to cover an area. Click a mark to select and restyle it.",
+                Pick::Text => "Click where the text should start.",
+                _ => "Drag on the picture to draw. Redactions always sit under drawings.",
             },
         });
         ui.text(hint, r(PAD, fy, w - 300.0, FOOT_H), 12.5, 400, if err.is_some() { crate::gfx::DANGER } else { MUTED }, Align::Left);
@@ -1349,6 +1421,9 @@ impl Editor {
         match ui.ctrl_key(VK_Z) { Some(true) => self.step_redo(), Some(false) => self.step_undo(), None => {} }
         if ui.ctrl_key(VK_Y).is_some() { self.step_redo(); }
         if ui.key(VK_SPACE) { self.toggle_play(); }
+        if self.mode == Mode::Markup && self.drag.is_none() {
+            if let Some(i) = PICKS.iter().position(|p| ui.key(p.2)) { self.tool = i; }
+        }
         if ui.key(VK_PRIOR) { self.turn_page(-1); }
         if ui.key(VK_NEXT) { self.turn_page(1); }
     }
@@ -1374,11 +1449,11 @@ impl Page for Editor {
         self.keys(ui);
     }
     fn after(&mut self) -> bool {
-        if std::mem::take(&mut self.pending_color) {
-            let current = if self.mode == Mode::Redact { self.pen } else { self.sel.and_then(|i| self.items.get(i)).map(|i| i.shape.color).unwrap_or(self.pen) };
+        if let Some(cover) = self.pending_color.take() {
+            let current = self.current_color(cover);
             if let Some(v) = form::show("Custom colour", &[form::Field::Color("Colour", format!("#{current:06X}"))], "Use") {
                 let c = crate::image::parse_color(&v[0]);
-                self.recolor(((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32);
+                self.recolor(((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32, cover);
             }
             return true;
         }
@@ -1420,13 +1495,24 @@ pub fn edit_video(title: &str, first: Bmp, mode: Mode, save_label: &str, source:
     run(title, first, mode, vec![], save_label, Some(source))
 }
 
+/// Redacts and annotates a picture. `found` is offered as redactions with one click; `initial` is what was drawn
+/// before, which comes back for more changes. A video passes its frames as `source`.
+pub fn markup(title: &str, bmp: Bmp, initial: Vec<Shape>, found: Vec<Shape>, save_label: &str, source: Option<FrameSource>) -> Option<Vec<Shape>> {
+    let mut e = Editor::new(title, bmp, Mode::Markup, initial, save_label, source);
+    for it in &mut e.items { it.detected = false; }
+    e.found = found;
+    let e = ui::run_modal(e, title, None)?;
+    (e.result == Some(true)).then(|| e.output())
+}
+
 /// The editor as a PNG with sample shapes, for design review.
 pub fn render(mode: Mode, bmp: Bmp, shapes: Vec<Shape>, sel: usize, video: Option<f64>, out: &std::path::Path) -> std::result::Result<(), String> {
     let title = match (mode, video.is_some()) {
         (Mode::Crop, _) => "Crop",
         (Mode::Redact, false) => "Redact",
         (Mode::Redact, true) => "Redact video",
-        (Mode::Annotate, _) => "Annotate",
+        (Mode::Markup, false) => "Mark up",
+        (Mode::Markup, true) => "Mark up video",
     };
     let source = video.map(|dur| FrameSource { dur, fps: 30.0, pages: 0, load: Arc::new(|_| Err(String::new())), play: None });
     let mut e = Editor::new(title, bmp, mode, shapes, title, source);
@@ -1434,6 +1520,7 @@ pub fn render(mode: Mode, bmp: Bmp, shapes: Vec<Shape>, sel: usize, video: Optio
     e.start_size = (1180.0, 720.0);
     e.sel = Some(sel);
     if mode == Mode::Redact && e.items.len() > 1 { e.items[0].detected = false; }
+    if mode == Mode::Markup { for it in &mut e.items { it.detected = false; } }
     ui::render_png(&mut e, 1.0, None, out)
 }
 
@@ -1442,7 +1529,7 @@ mod tests {
     use super::*;
     #[test]
     fn shapes_round_trip() {
-        let v = vec![Shape::rect(0.1, 0.2, 0.3, 0.4), Shape { tool: Tool::Text, a: (0.5, 0.5), b: (0.5, 0.5), color: 0xFF3B30, text: "hi\tthere".into(), fx: Fx { blur: true, strength: 12.0, feather: 7.0, width: 2.5, fill: 30.0 }, bend: None },
+        let v = vec![Shape::rect(0.1, 0.2, 0.3, 0.4), Shape { tool: Tool::Text, a: (0.5, 0.5), b: (0.5, 0.5), color: 0xFF3B30, text: "hi\tthere".into(), fx: Fx { blur: true, strength: 12.0, feather: 7.0, width: 2.5, fill: 30.0 }, bend: None, cover: true },
             Shape { bend: Some((0.4, 0.2)), ..Shape::new(Tool::Arrow, (0.1, 0.1), (0.9, 0.9), 0xFFCC00) }];
         let back = decode_all(&encode_all(&v));
         assert_eq!(back[0], v[0]);
@@ -1450,6 +1537,9 @@ mod tests {
         assert_eq!(back[1].fx, v[1].fx, "per-shape look survives");
         assert_eq!(back[1].bend, None);
         assert_eq!(back[2], v[2], "a curve survives");
+        assert!(back[1].cover && !back[2].cover, "redactions stay apart from annotations");
+        let (c, n) = split(&back);
+        assert_eq!((c.len(), n.len()), (1, 2));
         assert_eq!(Shape::decode("rect\t0.1\t0.2\t0.3\t0.4\t000000\t").unwrap().fx, Fx::default(), "older lines still read");
     }
     #[test]

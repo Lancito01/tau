@@ -56,10 +56,10 @@ pub fn fail(title: &str, msg: String) {
 
 // ---- preview material for the editors ----
 
-fn frame_at(input: &Path, t: f64) -> Result<Bmp, String> { still_at(input, t, None) }
+pub(crate) fn frame_at(input: &Path, t: f64) -> Result<Bmp, String> { still_at(input, t, None) }
 
 /// A frame, through a filter when it would not look right as a picture without one.
-fn still_at(input: &Path, t: f64, filter: Option<&str>) -> Result<Bmp, String> {
+pub(crate) fn still_at(input: &Path, t: f64, filter: Option<&str>) -> Result<Bmp, String> {
     // A file's length can run past its last picture when the sound goes on longer. The last picture is the nearest then.
     still_exactly(input, t, filter).or_else(|e| if t > 0.0 { still_exactly(input, (t - END_MARGIN).max(0.0), filter) } else { Err(e) })
 }
@@ -137,6 +137,27 @@ fn pick_shapes(title: &str, bmp: Result<Bmp, String>, mode: canvas::Mode, init: 
     }
 }
 
+/// What the canvas needs to move through a video: its length, and a frame at any time.
+pub fn frame_source(input: &Path, dur: f64, video: Option<&quality::VideoInfo>) -> canvas::FrameSource {
+    let fps = video.map(|v| v.fps).unwrap_or(0.0);
+    let play = Some(crate::player::Source { path: input.to_path_buf(), filter: video.and_then(quality::still_filter), fps });
+    let p = input.to_path_buf();
+    canvas::FrameSource { dur, fps, pages: 0, load: Arc::new(move |t| frame_at(&p, t)), play }
+}
+
+/// Redactions and annotations over a video, on one frame with a scrubber to find the right one.
+fn pick_markup_video(input: &Path) -> Option<String> {
+    let title = "Mark up video";
+    let p = input.to_path_buf();
+    let loaded = pump_job("Reading file", move |_| {
+        let pr = media::probe(&p);
+        Ok((frame_at(&p, 1f64.min(pr.duration / 2.0))?, pr.duration, pr.video))
+    });
+    let (first, dur, video) = match loaded { Ok(v) => v, Err(e) => { fail(title, e); return None; } };
+    let source = frame_source(input, dur, video.as_ref());
+    canvas::markup(title, first, vec![], vec![], "Save", Some(source)).map(|v| canvas::encode_all(&v))
+}
+
 /// The video editors look at one frame, with a scrubber to find the right one.
 fn pick_shapes_video(title: &str, input: &Path, mode: canvas::Mode, ok: &str) -> Option<String> {
     let p = input.to_path_buf();
@@ -177,7 +198,7 @@ fn decode_pages(s: &str) -> Vec<(u32, Vec<Shape>)> {
 
 /// Faces and words found in the picture, offered as starting redactions the user can remove one by one.
 fn suggest(p: &Path, b: &Bmp) -> Vec<Shape> {
-    crate::detect::regions(p, b.w, b.h).unwrap_or_default().into_iter().map(|(x, y, w, h)| Shape::rect(x, y, x + w, y + h)).collect()
+    crate::detect::regions(p, b.w, b.h).unwrap_or_default().into_iter().map(|(x, y, w, h)| Shape::cover_rect(x, y, x + w, y + h)).collect()
 }
 
 // ---- what each compress level would give ----
@@ -298,7 +319,7 @@ const IMAGE_LEVELS: [(&str, i32, u32); 5] = [
 ];
 
 /// The picture no longer than `max` on its longest side. Zero, or a picture already within it, stays as it is.
-fn shrink_to(b: &Bmp, max: u32) -> Result<Bmp, String> {
+pub(crate) fn shrink_to(b: &Bmp, max: u32) -> Result<Bmp, String> {
     let long = b.w.max(b.h);
     if max == 0 || long <= max { return Ok(b.clone()); }
     let f = max as f64 / long as f64;
@@ -462,14 +483,7 @@ fn ask(id: &str, paths: &[PathBuf]) -> Option<Opts> {
             let sh = pick_shapes_video("Crop video", first, canvas::Mode::Crop, "Crop")?;
             opts(&[("shapes", sh)])
         }
-        "vid.redact" => {
-            let sh = pick_shapes_video("Redact video", first, canvas::Mode::Redact, "Redact")?;
-            opts(&[("shapes", sh)])
-        }
-        "vid.annotate" => {
-            let sh = pick_shapes_video("Annotate video", first, canvas::Mode::Annotate, "Save")?;
-            opts(&[("shapes", sh)])
-        }
+        "vid.markup" | "vid.redact" | "vid.annotate" => opts(&[("shapes", pick_markup_video(first)?)]),
         "vid.compress" => {
             let v = compress_choice("Compress video", first, video_spec)?;
             opts(&[("quality", v[0].to_string()), ("height", v[1].to_string()), ("audio", v[2].to_string()), ("fps", v[3].to_string())])
@@ -549,20 +563,19 @@ pub fn run_ui(id: &str, paths: Vec<PathBuf>) {
         }
         return;
     }
-    if matches!(id, "img.annotate" | "img.redact") {
+    if matches!(id, "vid.editor" | "aud.editor") {
+        crate::editor::open(paths);
+        return;
+    }
+    if matches!(id, "img.markup" | "img.annotate" | "img.redact") {
         // Each picture needs its own marks, so these open one editor per file.
         for p in paths {
             let pp = p.clone();
             let loaded = pump_job("Reading file", move |_| { let b = image::load(&pp)?; let s = suggest(&pp, &b); Ok((b, s)) });
-            let (bmp, found) = match loaded { Ok((b, f)) => (Ok(b), f), Err(e) => (Err(e), vec![]) };
+            let (bmp, found) = match loaded { Ok(v) => v, Err(e) => { fail("Mark up", e); return; } };
             form::set_context(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-            let (mode, init, title, ok) = if id == "img.redact" {
-                (canvas::Mode::Redact, found, "Redact", "Redact")
-            } else {
-                (canvas::Mode::Annotate, vec![], "Annotate", "Save")
-            };
-            let Some(sh) = pick_shapes(title, bmp, mode, init, ok) else { return };
-            exec(id, vec![p], opts(&[("shapes", sh)]));
+            let Some(sh) = canvas::markup("Mark up", bmp, vec![], found, "Save", None) else { return };
+            exec("img.markup", vec![p], opts(&[("shapes", canvas::encode_all(&sh))]));
         }
         return;
     }
@@ -774,6 +787,98 @@ fn lossless_edit(j: &Job, p: &Path, suffix: &str, filter: Option<&str>, audio: O
     media::transform(j, p, suffix, Some(&l.ext), l.args)
 }
 
+/// The marks from a tool id that only ever made one kind keep meaning what they meant: Redact covered, Annotate drew.
+fn legacy_kind(id: &str, shapes: Vec<Shape>) -> Vec<Shape> {
+    match id.rsplit('.').next() {
+        Some("redact") => canvas::all_as(shapes, true),
+        Some("annotate") => canvas::all_as(shapes, false),
+        _ => shapes,
+    }
+}
+
+/// Redactions go in first and annotations over them. Redacted pictures save losslessly, so nothing else changes;
+/// metadata does not carry over, and with it goes any embedded thumbnail of the unredacted picture.
+fn markup_image(j: &Job, p: &Path, shapes: &[Shape]) -> Result<PathBuf, String> {
+    let (covers, notes) = canvas::split(shapes);
+    if covers.is_empty() && notes.is_empty() { return Err("Nothing marked".into()); }
+    let e = ext_of(p);
+    let keep = quality::lossless_image_ext(&e);
+    if !covers.is_empty() && keep != e { tell(j, format!("Saved as {} so nothing else changes", keep.to_ascii_uppercase())); }
+    if notes.is_empty() {
+        // In the picture's own format, so its depth and colour profile stay.
+        let n = image::load_native(p)?;
+        let (fw, fh) = n.size();
+        n.apply(&canvas::marks_for(&covers, fw, fh, false))?;
+        let out = sibling(p, " redacted", keep);
+        return atomically(&out, |tmp| image::save_native(&n, tmp, &SaveOpts::default()));
+    }
+    let mut b = image::load(p)?;
+    if !covers.is_empty() {
+        let l = crate::redact::Layout { w: b.w, h: b.h, stride: b.w as usize * 4, sample_bytes: 1, channels: 4, rgb: [2, 1, 0], alpha: Some(3) };
+        crate::redact::apply(&mut b.px, &l, &canvas::marks_for(&covers, b.w, b.h, false));
+    }
+    canvas::apply_annotations(&mut b, &notes)?;
+    let (suffix, ext) = if covers.is_empty() { (" annotated", e.as_str()) } else { (" marked up", keep) };
+    save_new(&b, sibling(p, suffix, ext), &SaveOpts::default())
+}
+
+/// The annotations drawn once, at the size the video shows at, into a clear picture laid over every frame.
+fn annotation_png(t: &TempDir, w: u32, h: u32, notes: &[Shape]) -> Result<PathBuf, String> {
+    let layer = Bmp { w, h, px: canvas::annotation_layer(w, h, notes)? };
+    let png = t.file("annotations.png");
+    image::save(&layer, &png, &SaveOpts::default())?;
+    Ok(png)
+}
+
+/// Redactions, then annotations over them, with every other pixel kept exactly.
+fn markup_video(j: &Job, p: &Path, shapes: &[Shape]) -> Result<PathBuf, String> {
+    let (covers, notes) = canvas::split(shapes);
+    if covers.is_empty() && notes.is_empty() { return Err("Nothing marked".into()); }
+    let e = ext_of(p);
+    let total = media::duration(p);
+    if e == "gif" {
+        let bytes = std::fs::read(p).map_err(|x| x.to_string())?;
+        let (w, h) = crate::gif::screen_size(&bytes).ok_or("Could not read this GIF")?;
+        let marks = canvas::marks_for(&covers, w, h, false);
+        if notes.is_empty() {
+            // Hard solid marks go in place, so palettes, timing and everything outside them stay as they are.
+            if marks.iter().all(|m| m.is_hard_solid()) {
+                let clean = crate::gif::redact(&bytes, &marks)?;
+                let out = sibling(p, " redacted", "gif");
+                return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|x| x.to_string()));
+            }
+            // A blur or feather needs colours the palette may not have, so each frame gets a new one.
+            let g = quality::redact_graph("bgra", "", true, w, h, &marks).ok_or(NO_LOSSLESS)?;
+            return media::transform(j, p, " redacted", None, quality::gif_edit_args(Some(&format!("format=gbrap,{g}"))));
+        }
+        let t = TempDir::new()?;
+        let png = annotation_png(&t, w, h, &notes)?;
+        let args = if covers.is_empty() { quality::overlay_args(&quality::gif_edit_args(None)) } else {
+            let g = quality::redact_graph("bgra", "", true, w, h, &marks).ok_or(NO_LOSSLESS)?;
+            quality::overlay_after_args(&quality::gif_edit_args(Some(&format!("format=gbrap,{g}"))))
+        }.ok_or(NO_LOSSLESS)?;
+        let suffix = if covers.is_empty() { " annotated" } else { " marked up" };
+        return atomically(&sibling(p, suffix, "gif"), |tmp| media::ffmpeg(j, &[p, png.as_path()], &args, tmp, total));
+    }
+    let pr = media::probe(p);
+    let v = pr.video.as_ref().ok_or(NO_LOSSLESS)?;
+    let (w, h) = v.display_size();
+    let l = if covers.is_empty() {
+        quality::lossless_args(&pr, &e, None, None, false)
+    } else {
+        let marks = canvas::marks_for(&covers, w, h, true);
+        let f = quality::redact_graph(&v.pix_fmt, &v.color_space, v.full_range, w, h, &marks).ok_or(NO_LOSSLESS)?;
+        quality::redact_args(&pr, &e, &f)
+    }.ok_or(NO_LOSSLESS)?;
+    if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
+    if notes.is_empty() { return media::transform(j, p, " redacted", Some(&l.ext), l.args); }
+    let t = TempDir::new()?;
+    let png = annotation_png(&t, w, h, &notes)?;
+    let args = quality::overlay_after_args(&l.args).ok_or(NO_LOSSLESS)?;
+    let suffix = if covers.is_empty() { " annotated" } else { " marked up" };
+    atomically(&sibling(p, suffix, &l.ext), |tmp| media::ffmpeg(j, &[p, png.as_path()], &args, tmp, total))
+}
+
 /// Cuts a range of video exactly. Copies the original bits when the range allows that, otherwise encodes losslessly.
 fn cut_video(j: &Job, p: &Path, a: f64, b: f64, out: impl Fn(&str) -> PathBuf) -> Result<PathBuf, String> {
     let e = ext_of(p);
@@ -886,23 +991,10 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let out = sibling(p, " cropped", &ext_of(p));
             atomically(&out, |tmp| image::save_native(&c, tmp, &SaveOpts::default()))
         }),
-        "img.redact" => each("Redacting", paths, move |j, p| {
-            let n = image::load_native(p)?;
-            let (fw, fh) = n.size();
-            n.apply(&canvas::marks_for(&shapes, fw, fh, false))?;
-            // Saving a JPEG again would change every pixel, so anything lossy becomes PNG. Metadata does not
-            // carry over, and with it goes any embedded thumbnail of the unredacted picture.
-            let e = ext_of(p);
-            let keep = quality::lossless_image_ext(&e);
-            if keep != e { tell(j, format!("Saved as {} so nothing else changes", keep.to_ascii_uppercase())); }
-            let out = sibling(p, " redacted", keep);
-            atomically(&out, |tmp| image::save_native(&n, tmp, &SaveOpts::default()))
-        }),
-        "img.annotate" => each("Annotating", paths, move |_, p| {
-            let mut b = image::load(p)?;
-            canvas::apply_annotations(&mut b, &shapes)?;
-            save_new(&b, sibling(p, " annotated", &ext_of(p)), &SaveOpts::default())
-        }),
+        "img.markup" | "img.redact" | "img.annotate" => {
+            let shapes = legacy_kind(id, shapes);
+            each("Marking up", paths, move |j, p| markup_image(j, p, &shapes))
+        }
         "img.collage" => together("Creating collage", paths, move |j, ps| {
             let mut imgs = vec![];
             for (i, p) in ps.iter().enumerate() {
@@ -946,50 +1038,11 @@ pub fn exec(id: &str, paths: Vec<PathBuf>, o: Opts) -> Arc<Job> {
             let (x, y, cw, ch) = crop_px(sh, w, h, true);
             lossless_edit(j, p, " cropped", Some(&format!("crop={cw}:{ch}:{x}:{y}")), None, false)
         }),
-        "vid.redact" => each("Redacting", paths, move |j, p| {
-            if shapes.is_empty() { return Err("Nothing marked to redact".into()); }
-            if ext_of(p) == "gif" {
-                let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
-                let (w, h) = crate::gif::screen_size(&bytes).ok_or("Could not read this GIF")?;
-                let marks = canvas::marks_for(&shapes, w, h, false);
-                // Hard solid marks go in place, so palettes, timing and everything outside them stay as they are.
-                if marks.iter().all(|m| m.is_hard_solid()) {
-                    let clean = crate::gif::redact(&bytes, &marks)?;
-                    let out = sibling(p, " redacted", "gif");
-                    return atomically(&out, |tmp| std::fs::write(tmp, &clean).map_err(|e| e.to_string()));
-                }
-                // A blur or feather needs colours the palette may not have, so each frame gets a new one.
-                let g = quality::redact_graph("bgra", "", true, w, h, &marks).ok_or(NO_LOSSLESS)?;
-                return media::transform(j, p, " redacted", None, quality::gif_edit_args(Some(&format!("format=gbrap,{g}"))));
-            }
-            let pr = media::probe(p);
-            let v = pr.video.as_ref().ok_or(NO_LOSSLESS)?;
-            let (w, h) = v.display_size();
-            let marks = canvas::marks_for(&shapes, w, h, true);
-            let f = quality::redact_graph(&v.pix_fmt, &v.color_space, v.full_range, w, h, &marks).ok_or(NO_LOSSLESS)?;
-            let e = ext_of(p);
-            let l = quality::redact_args(&pr, &e, &f).ok_or(NO_LOSSLESS)?;
-            if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
-            media::transform(j, p, " redacted", Some(&l.ext), l.args)
-        }),
-        "vid.annotate" => each("Annotating", paths, move |j, p| {
-            if shapes.is_empty() { return Err("Nothing drawn to add".into()); }
-            // The annotations are drawn once, at the size the video shows at, into a clear picture laid over every frame.
-            let (w, h) = media::size(p).ok_or("Could not read the video size")?;
-            let layer = Bmp { w, h, px: canvas::annotation_layer(w, h, &shapes)? };
-            let t = TempDir::new()?;
-            let png = t.file("annotations.png");
-            image::save(&layer, &png, &SaveOpts::default())?;
-            let e = ext_of(p);
-            let (ext, args) = if e == "gif" { (e.clone(), quality::gif_edit_args(None)) } else {
-                let l = quality::lossless_args(&media::probe(p), &e, None, None, false).ok_or(NO_LOSSLESS)?;
-                if l.ext != e { tell(j, format!("Saved as {} to keep it lossless", l.ext.to_ascii_uppercase())); }
-                (l.ext, l.args)
-            };
-            let args = quality::overlay_args(&args).ok_or(NO_LOSSLESS)?;
-            let total = media::duration(p);
-            atomically(&sibling(p, " annotated", &ext), |tmp| media::ffmpeg(j, &[p, png.as_path()], &args, tmp, total))
-        }),
+        "vid.markup" | "vid.redact" | "vid.annotate" => {
+            let shapes = legacy_kind(id, shapes);
+            each("Marking up", paths, move |j, p| markup_video(j, p, &shapes))
+        }
+
         "vid.trim" | "aud.trim" => each("Trimming", paths, move |j, p| {
             let (a, b) = match marks[..] { [a, b, ..] => (a, b), _ => return Err("Needs a start and an end".into()) };
             if classify(p) == Cat::Audio {
