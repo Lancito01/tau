@@ -152,9 +152,8 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
         Cat::Image => {
             let mut v = vec![
                 tool("img.compress", "COMPRESS", 0xE73F), tool("img.metadata", "METADATA", 0xE8EC),
-                ff(tool("img.edit", "EDIT", 0xE790)), tool("img.annotate", "ANNOTATE", 0xE70F),
+                ff(tool("img.edit", "EDIT", 0xE790)), tool("img.markup", "MARK UP", 0xE70F),
                 tool("img.background", "ADD BG", 0xE8A9), tool("img.crop", "CROP", 0xE7A8),
-                tool("img.redact", "REDACT", 0xED1A),
             ];
             if count > 1 { v.push(tool("img.collage", "COLLAGE", 0xECA5)); }
             v
@@ -165,7 +164,7 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
                 ff(tool("vid.mute", "MUTE", 0xE74F)), ff(tool("vid.trim", "TRIM", 0xE8C6)),
                 ff(tool("vid.crop", "CROP", 0xE7A8)), ff(tool("vid.speed", "SPEED", 0xEC4A)),
                 ff(tool("vid.snapshot", "SNAPSHOT", 0xE722)), ff(tool("vid.split", "SPLIT", 0xE8A4)),
-                ff(tool("vid.redact", "REDACT", 0xED1A)), ff(tool("vid.annotate", "ANNOTATE", 0xE70F)),
+                ff(tool("vid.markup", "MARK UP", 0xE70F)), ff(tool("vid.editor", "EDITOR", 0xE786)),
             ];
             // Ten nodes is the limit that stays readable, so JOIN replaces SPLIT for a selection.
             if count > 1 { v[7] = ff(tool("vid.join", "JOIN", 0xE71B)); }
@@ -175,7 +174,7 @@ fn tool_entries(cat: Cat, count: usize, e: &Engines) -> Vec<Entry> {
             ff(tool("aud.compress", "COMPRESS", 0xE73F)), ff(tool("aud.metadata", "METADATA", 0xE8EC)),
             ff(tool("aud.normalize", "NORMALIZE", 0xE9E9)), ff(tool("aud.visualize", "VISUALIZE", 0xE714)),
             ff(tool("aud.trim", "TRIM", 0xE8C6)), ff(tool("aud.channels", "CHANNELS", 0xE767)),
-            ff(tool("aud.bleep", "BLEEP", 0xE720)),
+            ff(tool("aud.bleep", "BLEEP", 0xE720)), ff(tool("aud.editor", "EDITOR", 0xE786)),
         ],
         Cat::Pdf => {
             let mut v = vec![
@@ -242,6 +241,15 @@ mod tests {
         let two = vec![PathBuf::from("a.pdf"), PathBuf::from("b.pdf")];
         assert!(entries(Kind::Tools, &two, &all()).iter().any(|e| e.id == "pdf.merge"));
         assert!(!entries(Kind::Tools, &p("a.pdf"), &all()).iter().any(|e| e.id == "pdf.merge"));
+    }
+    #[test]
+    fn redaction_and_annotation_are_one_tool() {
+        for f in ["a.jpg", "a.mp4"] {
+            let ids: Vec<_> = entries(Kind::Tools, &p(f), &all()).iter().map(|e| e.id).collect();
+            assert!(ids.iter().any(|i| i.ends_with(".markup")), "{f}");
+            assert!(!ids.iter().any(|i| i.ends_with(".redact") || i.ends_with(".annotate")), "{f}");
+        }
+        assert!(entries(Kind::Tools, &p("a.mp4"), &all()).iter().any(|e| e.id == "vid.editor"));
     }
     #[test]
     fn no_wheel_exceeds_ten_nodes() {

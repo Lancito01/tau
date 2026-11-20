@@ -269,7 +269,10 @@ impl Ui {
     }
 
     /// Draws a picture, keeping one GPU copy per `key`.
-    pub fn image(&mut self, key: u64, bmp: &Bmp, dest: R) {
+    pub fn image(&mut self, key: u64, bmp: &Bmp, dest: R) { self.image_part(key, bmp, None, dest, 1.0); }
+
+    /// Draws part of a picture, given in its own pixels, or all of it, at some opacity.
+    pub fn image_part(&mut self, key: u64, bmp: &Bmp, src: Option<R>, dest: R, opacity: f32) {
         if !self.bitmaps.contains_key(&key) {
             let mut px = bmp.px.clone();
             for p in px.chunks_exact_mut(4) {
@@ -283,7 +286,8 @@ impl Ui {
             if let Ok(b) = made { self.bitmaps.insert(key, b); }
         }
         if let Some(b) = self.bitmaps.get(&key) {
-            unsafe { self.rt().DrawBitmap(b, Some(&dest.d2()), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None); }
+            let s = src.map(|q| q.d2());
+            unsafe { self.rt().DrawBitmap(b, Some(&dest.d2()), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, s.as_ref().map(|q| q as *const _)); }
         }
     }
     pub fn forget_image(&mut self, key: u64) { self.bitmaps.remove(&key); }

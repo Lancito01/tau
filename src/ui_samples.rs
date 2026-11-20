@@ -112,25 +112,28 @@ pub fn render(name: &str, out: &Path) -> Result<(), String> {
         "hud" => crate::hud::render(out),
         "shelf" => crate::shelf::render(["C:\\a\\holiday.jpg", "C:\\a\\interview take 3.mp4", "C:\\a\\voice note.m4a", "C:\\a\\contract.pdf", "C:\\a\\Reports"].iter().map(PathBuf::from).collect(), out),
         "shelf-empty" => crate::shelf::render(vec![], out),
-        "redact" => canvas::render(Mode::Redact, photo(), vec![
-            Shape::rect(0.12, 0.2, 0.3, 0.32),
-            Shape { fx: Fx { feather: 12.0, ..Fx::default() }, ..Shape::new(Tool::Ellipse, (0.55, 0.62), (0.8, 0.8), 0xFF3B30) },
-            Shape { fx: Fx { blur: true, strength: 50.0, feather: 20.0, ..Fx::default() }, ..Shape::new(Tool::Ellipse, (0.4, 0.1), (0.56, 0.3), 0) },
+        "redact" => canvas::render(Mode::Markup, photo(), vec![
+            Shape::cover_rect(0.12, 0.2, 0.3, 0.32),
+            Shape { fx: Fx { feather: 12.0, ..Fx::default() }, cover: true, ..Shape::new(Tool::Ellipse, (0.55, 0.62), (0.8, 0.8), 0xFF3B30) },
+            Shape { fx: Fx { blur: true, strength: 50.0, feather: 20.0, ..Fx::default() }, cover: true, ..Shape::new(Tool::Ellipse, (0.4, 0.1), (0.56, 0.3), 0) },
         ], 2, None, out),
-        "redact-video" => canvas::render(Mode::Redact, photo(), vec![Shape::rect(0.55, 0.62, 0.8, 0.7)], 0, Some(192.0), out),
+        "redact-video" => canvas::render(Mode::Markup, photo(), vec![Shape::cover_rect(0.55, 0.62, 0.8, 0.7)], 0, Some(192.0), out),
+        "redact-pdf" => canvas::render(Mode::Redact, photo(), vec![Shape::cover_rect(0.55, 0.62, 0.8, 0.7)], 0, None, out),
         "crop" => canvas::render(Mode::Crop, photo(), vec![Shape::rect(0.15, 0.1, 0.85, 0.8)], 0, None, out),
-        "annotate" => canvas::render(Mode::Annotate, photo(), vec![
+        "markup" | "annotate" => canvas::render(Mode::Markup, photo(), vec![
+            Shape { fx: Fx { blur: true, strength: 60.0, ..Fx::default() }, ..Shape::cover_rect(0.6, 0.62, 0.82, 0.76) },
             Shape { fx: Fx { fill: 25.0, ..Fx::default() }, ..Shape::new(Tool::Rect, (0.1, 0.15), (0.42, 0.5), 0xFF3B30) },
             Shape { bend: Some((0.68, 0.52)), ..Shape::new(Tool::Arrow, (0.75, 0.8), (0.5, 0.45), 0xFFCC00) },
             Shape { text: "Sunset here".into(), fx: Fx { fill: 60.0, ..Fx::default() }, ..Shape::new(Tool::Text, (0.5, 0.2), (0.5, 0.2), 0xFFFFFF) },
         ], 1, None, out),
-        "annotate-video" => canvas::render(Mode::Annotate, photo(), vec![
+        "markup-video" | "annotate-video" => canvas::render(Mode::Markup, photo(), vec![
             Shape { fx: Fx { width: 1.5, ..Fx::default() }, ..Shape::new(Tool::Ellipse, (0.62, 0.15), (0.84, 0.42), 0xFFCC00) },
         ], 0, Some(192.0), out),
         "timeline-range" => timeline::render(timeline::Mode::Range, Some(sample_strip()), vec![24.0, 140.0], 30.0, Some(sample_photo(800, 450)), out),
         "timeline-points" => timeline::render(timeline::Mode::Points, Some(sample_strip()), vec![30.0, 95.0, 150.0], 29.97, Some(sample_photo(800, 450)), out),
         "timeline-ranges" => timeline::render(timeline::Mode::Ranges, Some(sample_strip()), vec![12.0, 30.0, 70.0, 88.0, 150.0], 0.0, None, out),
         "photo" => crate::photo::render(photo(), out),
+        "editor" => crate::editor::render(sample_photo(1600, 900), out),
         "compress" | "compress-custom" => {
             use crate::preview::{Control, Preset};
             let base = photo();

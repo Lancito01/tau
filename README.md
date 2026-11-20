@@ -16,7 +16,8 @@ Tau is a small Windows utility for converting and working with files without ope
 ## What it does
 
 - **Convert** images, audio, video, PDFs, documents, spreadsheets, slides, EPUBs, subtitles, and archives.
-- **Use file tools** to compress, crop, redact, annotate, trim, merge, split, and edit supported files.
+- **Use file tools** to compress, crop, mark up (redact and annotate), trim, merge, split, and edit supported files.
+- **Edit video** in a small timeline editor: cut, move and trim clips, add sound tracks, change speed, volume and fades, and redact or annotate any clip.
 - **Run file actions** to copy, move, copy a path, open a terminal, or collect files on a shelf.
 - **Work with batches** where an operation supports multiple selected files.
 - **Stay in control:** conversions run locally, a progress window supports cancellation, and existing files are never overwritten.
@@ -51,9 +52,17 @@ Only **Compress** gives quality away, by the amount you choose. Its window shows
 
 Lossless H.264 uses a profile that the default Windows player and many editors and phones cannot decode, so redacted, cropped and trimmed videos may need VLC or mpv, and they are much larger than the original. AVI, WMV and sources H.264 cannot store exactly are saved as MKV with FFV1 instead. Lossless editing also needs `ffprobe.exe`, which comes with ffmpeg, next to `ffmpeg.exe`, and ffmpeg 5.1 or newer.
 
-## Redaction
+## Mark up
 
-Each mark has its own shape (box or ellipse), fill (any colour, or Gaussian blur at a chosen strength) and feather. Feather reaches outward, so everything marked stays fully covered. Pixels past a mark and its feather do not change. A weak blur can sometimes be reversed, so use a solid colour for anything sensitive.
+Redaction and annotation are one tool, **Mark up**, for pictures and video. Pick **Redact** to cover an area, or **Box**, **Oval**, **Arrow** or **Text** to draw (keys V, R, B, O, A, T switch tools). Redactions are always applied first, so drawings sit on top of them. On a picture, Tau offers the faces and text it finds as redactions with one click. PDFs keep a redaction-only editor, since redacted pages are flattened to pictures.
+
+Each redaction has its own shape (box or ellipse), fill (any colour, or Gaussian blur at a chosen strength) and feather. Feather reaches outward, so everything marked stays fully covered. Pixels past a mark and its feather do not change. A weak blur can sometimes be reversed, so use a solid colour for anything sensitive.
+
+## Editor
+
+**Editor** on the Tools wheel opens the selected videos, pictures and sound files on a timeline. The picture track holds video and pictures, each clip with its own sound beneath it; any number of sound tracks hold music or voice. Drag clips to move them (into a gap they stay put, over another clip they go before or after it and push the rest along), drag their edges to trim, press **S** to split at the playhead, **Delete** to remove and **Shift+Delete** to close the gap. Each clip has speed, volume, mute and fades, and video clips can be redacted and annotated; tracks can be muted. Add more clips with **Add clips** or by dropping files on a track. Playback has sound, and every picture shown is rendered by the same ffmpeg graph the export uses.
+
+**Export** writes MP4 (H.264 and AAC), a GIF, or sound only (M4A). A quality preset sets picture quality, resolution and sound bitrate together; each can then be changed on its own, along with frame rate and encoding speed. The result is saved beside the first clip as `<name> edit.<ext>`. The edit itself is not saved, so export before closing.
 
 ## Install
 

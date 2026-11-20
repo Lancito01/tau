@@ -582,6 +582,31 @@ pub fn overlay_args(args: &[String]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The same, with the picture laid over the filter's result instead, so it sits above whatever the filter drew, such
+/// as redactions. A GIF's palette stage stays last. The format the filter ends in is restored after the overlay.
+pub fn overlay_after_args(args: &[String]) -> Option<Vec<String>> {
+    let i = args.iter().position(|a| a == "-vf")?;
+    let chain = args.get(i + 1)?;
+    let (head, palette) = match chain.find(GIF_EDIT_PALETTE) {
+        Some(at) => (chain[..at].trim_end_matches(','), &chain[at..]),
+        None => (chain.as_str(), ""),
+    };
+    let restore = head.split([',', ';']).next().filter(|f| f.starts_with("format=")).map(|f| format!(",{f}")).unwrap_or_default();
+    let under = if head.is_empty() { "[0:V:0]null".to_string() } else { format!("[0:V:0]{head}") };
+    let over = format!("[under][1:v]overlay=format=auto:eof_action=repeat{restore}");
+    let mut out = args.to_vec();
+    out[i] = "-filter_complex".into();
+    out[i + 1] = if palette.is_empty() { format!("{under}[under];{over}[annotated]") } else { format!("{under}[under];{over},{palette}[annotated]") };
+    match out.windows(2).position(|w| w[0] == "-map" && w[1] == "0:V:0") {
+        Some(m) => out[m + 1] = "[annotated]".into(),
+        None => out.splice(0..0, ["-map".to_string(), "[annotated]".to_string()]).for_each(drop),
+    }
+    Some(out)
+}
+
+/// Where `gif_edit_args` starts its palette stage.
+const GIF_EDIT_PALETTE: &str = "split[a][b];[a]palettegen=stats_mode=single[p]";
+
 // ---- redaction ----
 
 /// Grows a box to even edges, so it covers whole chroma samples and no colour leaks out at its border.
@@ -1264,6 +1289,20 @@ pub fn collage_tile(sizes: &[(u32, u32)], cols: u32, rows: u32, gap: u32) -> (u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn annotations_go_over_redactions() {
+        let a = sv(&["-map", "0:V:0", "-vf", "format=yuv420p,null[c0];x[l0];[c0][l0]maskedmerge", "-c:v", "libx264"]);
+        let o = overlay_after_args(&a).unwrap();
+        assert_eq!(o[1], "[annotated]");
+        assert_eq!(o[2], "-filter_complex");
+        let g = &o[3];
+        assert!(g.find("maskedmerge").unwrap() < g.find("overlay").unwrap(), "{g}");
+        assert!(g.ends_with("overlay=format=auto:eof_action=repeat,format=yuv420p[annotated]"), "{g}");
+        let gif = overlay_after_args(&gif_edit_args(Some("format=gbrap,null"))).unwrap();
+        let g = gif.iter().find(|x| x.contains("overlay")).unwrap();
+        assert!(g.find("overlay").unwrap() < g.find("palettegen").unwrap(), "palette comes last: {g}");
+        assert_eq!(&gif[..2], &sv(&["-map", "[annotated]"])[..]);
+    }
     #[test]
     fn compress_leaves_audio_alone_until_it_is_over_the_allowance() {
         let ac3 = AudioInfo { codec: "ac3".into(), channels: 2, rate: 48000, bitrate: 192_000, ..Default::default() };
