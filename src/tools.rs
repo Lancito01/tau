@@ -35,16 +35,20 @@ pub fn pump_job<T: Send + 'static>(title: &str, f: impl FnOnce(&Job) -> Result<T
         if let Some(f) = once.lock().unwrap().take() { *out.lock().unwrap() = Some(f(j)); }
         Ok(PathBuf::new())
     });
+    // A quit that arrives meanwhile is held and passed on, or the thread's own loop would never see it.
+    let mut quit = None;
     while !job.finished.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe {
             let mut m = MSG::default();
             while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+                if m.message == WM_QUIT { quit = Some(m.wParam.0 as i32); continue; }
                 let _ = TranslateMessage(&m);
                 DispatchMessageW(&m);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(12));
     }
+    if let Some(code) = quit { unsafe { PostQuitMessage(code); } }
     crate::hud::remove(&job);
     let r = slot.lock().unwrap().take();
     r.unwrap_or_else(|| Err("Cancelled".into()))
